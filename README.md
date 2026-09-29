@@ -8,6 +8,7 @@ windows float in mid-air, ready to be grabbed, dragged and resized.
 
 > Experimental, pinned to Hyprland 0.56.2.
 
+> It's kinda buggy, but I'm working on it.
 ## Installation
 ### Hyprpm
 

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.27)
 
-project(hypr3d9 LANGUAGES CXX)
+project(hypr3d17 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -66,7 +66,7 @@ pkg_check_modules(LIBDRM REQUIRED IMPORTED_TARGET libdrm)
 pkg_check_modules(XKBCOMMON REQUIRED IMPORTED_TARGET xkbcommon)
 pkg_check_modules(HYPRGRAPHICS REQUIRED IMPORTED_TARGET hyprgraphics)
 
-add_library(hypr3d9 SHARED
+add_library(hypr3d17 SHARED
     src/main.cpp
     src/Render/GLScene.cpp
     src/World/Camera.cpp
@@ -79,7 +79,7 @@ add_library(hypr3d9 SHARED
     src/HyprlandCompat/PointerHook.cpp
 )
 
-target_include_directories(hypr3d9
+target_include_directories(hypr3d17
     BEFORE PRIVATE
         "${HYPRLAND_INCLUDE}"
         "${HYPRLAND_ROOT}"
@@ -88,7 +88,7 @@ target_include_directories(hypr3d9
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
 
-target_link_libraries(hypr3d9 PRIVATE
+target_link_libraries(hypr3d17 PRIVATE
     PkgConfig::HYPRGRAPHICS
     PkgConfig::PIXMAN
     PkgConfig::LIBDRM
@@ -98,7 +98,7 @@ target_link_libraries(hypr3d9 PRIVATE
     dl
 )
 
-set_target_properties(hypr3d9 PROPERTIES
+set_target_properties(hypr3d17 PROPERTIES
     PREFIX ""
-    OUTPUT_NAME "hypr3d9"
+    OUTPUT_NAME "hypr3d17"
 )

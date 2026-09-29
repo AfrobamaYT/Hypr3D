@@ -10,6 +10,7 @@
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
 #include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
 #include <hyprland/src/config/values/ConfigValues.hpp>
+#include <hyprland/src/desktop/state/WindowState.hpp>
 #include <hyprland/src/config/ConfigValue.hpp>
 #include <hyprland/src/devices/IKeyboard.hpp>
 #include <hyprland/src/devices/IPointer.hpp>
@@ -38,6 +39,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace H3D {
@@ -166,12 +168,21 @@ static float g_fsEndYaw = 0.f, g_fsEndPitch = 0.f;
 static float g_fsStartRoll = 0.f;
 static std::chrono::steady_clock::time_point g_fsPhaseStart{};
 static bool  g_fsWasOn = false; // a fullscreen window existed since the last poll
+static PHLWINDOWREF g_fsLastFSWindow; // the most recent fullscreen window
+static std::uintptr_t g_fsCurrentId = 0; // the id of the CURRENT fullscreen window, 0 = none
 static float g_fsAlpha = 1.0f;  // composite alpha during the transition
 static float g_fsRawP   = 0.0f;  // raw (pre-smoothstep) transition progress
 static float g_fsSavedRoll   = 0.0f; // the window's roll before the fullscreen
 static float g_fsRollAtStart = 0.0f; // roll at the To3D start (aborts may differ)
-static int   g_fsAssertFrames = 0;   // re-assert the restored box for N frames
+static int   g_fsAssertFrames = 0;   // re-assert the restored box...
 static CBox  g_fsAssertBox{};
+static int   g_fsStableCount  = 0;   // consecutive frames the box matched
+
+// Last known real box of every window OUTSIDE any fullscreen transition,
+// refreshed each frame. The pre-fullscreen box must come from here: by the
+// time the pump detects the fullscreen, Hyprland has already resized the
+// window to the monitor, so the live geometry is NOT the pre-FS box.
+static std::unordered_map<std::uintptr_t, CBox> g_fsStableBoxes;
 static bool  g_captureReleasePending = false;
 static constexpr float kFsAnimDuration = 0.6f;
 
@@ -621,6 +632,17 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
     ENTITIES.reserve(INFOS.size());
 
     for (const auto& info : INFOS) {
+        // Track each window's last stable (non-transition) box -- see
+        // g_fsStableBoxes. Skipped while the exit re-assert is running: a
+        // late Hyprland-side restore could pollute the memory with the
+        // monitor-sized box, and the NEXT fullscreen cycle would then
+        // restore the giant size (the intermittent bug).
+        if (!info.isLayer && info.window &&
+            g_fsPhase == EFullscreenPhase::None && g_fsAssertFrames == 0 &&
+            info.id != g_fsCurrentId) // a fullscreened window's box is the
+                                      // monitor -- transient, never "stable"
+            g_fsStableBoxes[info.id] = Compat::currentWindowBox(info.window);
+
         // Not captured yet means not on screen, and something that is not on
         // screen must not be aimable -- otherwise focus could land on an
         // invisible window.
@@ -951,16 +973,27 @@ static void startTo2D(const PHLWINDOW& window, bool captureRestoreBox) {
 
     g_fsWindow = window;
 
-    // The floating box is captured once (on the FS event). A rapid exit+reenter
-    // re-grabs from the To3D completion with the box still monitor-sized --
-    // the original floating box must survive for the next restore.
-    if (captureRestoreBox)
-        g_fsRestoreBox = Compat::currentWindowBox(window);
+    // The floating box is captured once (on the FS event) from the STABLE
+    // memory, not the live geometry: Hyprland has already resized the window
+    // to the monitor by the time we see the event. A rapid exit+reenter
+    // keeps the original -- the live box is monitor-sized mid-transition.
+    if (captureRestoreBox) {
+        const auto IT = g_fsStableBoxes.find(ID);
+        g_fsRestoreBox = IT != g_fsStableBoxes.end() ?
+            IT->second : Compat::currentWindowBox(window);
+    }
 
     // The fullscreen TARGET box (the animation moves the real box there
     // gradually -- see applyFullscreenAnimation).
     g_fsMonitorBox = CBox{
         MON->m_position.x, MON->m_position.y, MON->m_size.x, MON->m_size.y};
+
+    // Pin Hyprland's remembered floating size to the SPAWN size: the
+    // transition's per-frame setWindowBox calls would otherwise re-member
+    // intermediate (up to monitor-sized) values, and Hyprland's own FS-exit
+    // applies that memory. The spawn size is the room's ground truth.
+    if (window->m_target)
+        window->m_target->rememberFloatingSize({kSpawnWidth, kSpawnHeight});
 
     // The screen-covering distance derives from the vertical FOV and the
     // monitor's NATURAL world size (logical px / 100):
@@ -1038,11 +1071,36 @@ static void pollFullscreen() {
 
     const auto FSW = Fullscreen::controller()->getFullscreenWindow(MON);
 
+    g_fsCurrentId = FSW ? Compat::windowId(FSW) : 0;
+
     if (g_fsPhase == EFullscreenPhase::None) {
         if (FSW && !g_fsWasOn && ownsInput())
             startTo2D(FSW);
-        else
+        else {
             g_fsWasOn = FSW != nullptr;
+
+            // A fullscreen EXITED while the room is plain 3D (no transition
+            // was running -- e.g. the FS predated the 3D entry): make the
+            // window a spawn-sized floating panel AND hold it with the same
+            // condition-driven assert the To3D completion uses -- Hyprland's
+            // floating layout re-applies ITS remembered size (possibly
+            // monitor-sized from an old cycle), and a one-shot set loses to
+            // it.
+            if (!FSW && g_fsWasOn) {
+                if (auto OLDW = g_fsLastFSWindow.lock()) {
+                    const auto CUR = Compat::currentWindowBox(OLDW);
+
+                    g_fsAssertBox    = CBox{CUR.x, CUR.y, kSpawnWidth,
+                                            kSpawnHeight};
+                    g_fsAssertFrames = 1;
+                    g_fsStableCount  = 0;
+
+                    Compat::setWindowBox(OLDW, g_fsAssertBox);
+                }
+            }
+        }
+
+        g_fsLastFSWindow = FSW;
     } else if (g_fsPhase == EFullscreenPhase::In2D) {
         // Exit passthrough when OUR window is no longer the fullscreen one
         // (toggled off, or fullscreen moved to another window entirely).
@@ -1122,9 +1180,13 @@ static void applyFullscreenAnimation() {
     // The REAL box animates between the floating box and the fullscreen box.
     // The client's buffer is stretched to this box by the compositor, so the
     // content scale inside the quad stays constant through the whole
-    // transition -- no zoom flashes at either boundary.
+    // transition. On the way back the box lands at the SPAWN size (960x540):
+    // the post-FS size is deterministic and never inherits garbage from
+    // earlier broken cycles.
     const CBox B0 = A ? g_fsRestoreBox : g_fsMonitorBox;
-    const CBox B1 = A ? g_fsMonitorBox : g_fsRestoreBox;
+    const CBox B1 = A ? g_fsMonitorBox
+                      : CBox{g_fsRestoreBox.x, g_fsRestoreBox.y, kSpawnWidth,
+                             kSpawnHeight};
 
     const CBox BOX{
         B0.x + (B1.x - B0.x) * p,
@@ -1162,6 +1224,14 @@ static void applyFullscreenAnimation() {
 
             Compat::setPointerCapture(false);
 
+            // Our transition's per-frame setWindowBox calls polluted
+            // Hyprland's remembered floating size with intermediate (up to
+            // monitor-sized) values. Pin it to the SPAWN size: this is what
+            // Hyprland's own FS-exit applies, and what the quad lands at.
+            if (auto W2 = g_fsWindow.lock())
+                W2->m_target->rememberFloatingSize(
+                    {kSpawnWidth, kSpawnHeight});
+
             if (Compat::setCursorHidden(false) && g_pHyprRenderer)
                 g_pHyprRenderer->setCursorFromName("default", true);
         } else {
@@ -1177,15 +1247,45 @@ static void applyFullscreenAnimation() {
                 startTo2D(W2, /*captureRestoreBox*/ false);
             } else {
                 if (W2) {
-                    Compat::setWindowBox(W2, g_fsRestoreBox);
+                    // The original position, the spawn size: after ANY
+                    // fullscreen exit the window is a standard panel -- no
+                    // path leaves it monitor-sized (a tiled-origin window's
+                    // "original" box IS the monitor, and older cycles may
+                    // have left the stable memory polluted anyway).
+                    Compat::setWindowBox(
+                        W2,
+                        CBox{g_fsRestoreBox.x, g_fsRestoreBox.y, kSpawnWidth,
+                             kSpawnHeight});
 
                     // Hyprland's own fullscreen-exit restore animates the
                     // window toward ITS remembered floating size -- which our
                     // transition kept updating -- and can retarget the box
                     // AFTER this point. Re-assert the restore box for a few
                     // frames so the final size is ours.
-                    g_fsAssertBox    = g_fsRestoreBox;
-                    g_fsAssertFrames = 12;
+                    // The SAME box the quad just landed at (the spawn
+                    // size) -- asserting the raw g_fsRestoreBox here made
+                    // our own guard resize the window back to the polluted
+                    // monitor size right after the landing.
+                    g_fsAssertBox    = CBox{g_fsRestoreBox.x, g_fsRestoreBox.y,
+                                            kSpawnWidth, kSpawnHeight};
+                    g_fsAssertFrames = 1;    // condition-driven: runs until stable
+                    g_fsStableCount  = 0;
+
+                    // The FS fade dimmed EVERY other workspace window to
+                    // alpha 0 when the fullscreen started; our transition can
+                    // leave the OUT fade mid-flight. Reset the channel
+                    // explicitly, or windows stay barely visible.
+                    if (MON && MON->m_activeWorkspace) {
+                        for (auto const& W3 :
+                             Desktop::windowState()->windows()) {
+                            if (W3 && W3->m_workspace ==
+                                          MON->m_activeWorkspace &&
+                                !W3->m_pinned)
+                                *W3->alpha(
+                                     Desktop::View::WINDOW_ALPHA_FULLSCREEN) =
+                                    1.F;
+                        }
+                    }
                 }
 
                 g_fsPhase = EFullscreenPhase::None;
@@ -1369,9 +1469,13 @@ static void deactivate3D() {
 
     // Fullscreen passthrough state: back to plain 3D-off. Restore the real
     // box if a transition was mid-flight (the window would otherwise stay
-    // monitor-sized).
+    // monitor-sized). The SIZE is the spawn size -- never the possibly
+    // polluted restore box.
     if (auto W = g_fsWindow.lock())
-        Compat::setWindowBox(W, g_fsRestoreBox);
+        Compat::setWindowBox(
+            W,
+            CBox{g_fsRestoreBox.x, g_fsRestoreBox.y, kSpawnWidth,
+                 kSpawnHeight});
 
     g_fsPhase        = EFullscreenPhase::None;
     g_fsWindow       = {};
@@ -1435,13 +1539,28 @@ static void enter3D() {
     g_altHeld      = false;
     s_zoomId       = 0;
 
-    // A fullscreen window that already exists is just a room entity; the
-    // passthrough triggers only on the fullscreen EVENT.
-    if (const auto MON = targetMonitor())
+    // A fullscreen window that already exists: it joins the room as a
+    // standard spawn-sized floating panel (a fullscreened/tiled box would
+    // otherwise enter the room monitor-sized AND pollute the stable-box
+    // memory). The passthrough still triggers on the fullscreen EVENT.
+    if (const auto MON = targetMonitor()) {
+        if (const auto FSW =
+                Fullscreen::controller()->getFullscreenWindow(MON)) {
+            Compat::setWindowBox(
+                FSW,
+                CBox{MON->m_size.x * 0.5 - kSpawnWidth * 0.5,
+                     MON->m_size.y * 0.5 - kSpawnHeight * 0.5, kSpawnWidth,
+                     kSpawnHeight});
+
+            g_fsLastFSWindow = FSW;
+        }
+
         g_fsWasOn =
             Fullscreen::controller()->getFullscreenWindow(MON) != nullptr;
-    else
+    } else
         g_fsWasOn = false;
+
+    g_fsStableBoxes.clear();
 
     g_renderedOnce = false;
     g_captureFrames = 0;
@@ -1588,16 +1707,27 @@ static void update3D(float dt) {
     if (g_transition <= 0.0f)
         return;
 
-    // Fullscreen-exit box re-assertion: outlasts Hyprland's exit-restore
-    // animation (see the To3D completion).
+    // Fullscreen-exit box re-assertion: CONDITION-driven, not frame-count --
+    // keep re-asserting until the window's box matches ours for 15
+    // consecutive frames, outlasting ANY late Hyprland-side restore.
     if (g_fsAssertFrames > 0) {
-        --g_fsAssertFrames;
-
-        if (auto W = g_fsWindow.lock())
+        if (auto W = g_fsWindow.lock()) {
             Compat::setWindowBox(W, g_fsAssertBox);
 
-        if (g_fsAssertFrames == 0)
-            g_fsWindow = {};
+            const auto CUR = Compat::currentWindowBox(W);
+
+            if (CUR.x == g_fsAssertBox.x && CUR.y == g_fsAssertBox.y &&
+                CUR.w == g_fsAssertBox.w && CUR.h == g_fsAssertBox.h) {
+                if (++g_fsStableCount >= 15) {
+                    g_fsAssertFrames = 0;
+                    g_fsWindow       = {};
+                }
+            } else {
+                g_fsStableCount = 0;
+            }
+        } else {
+            g_fsAssertFrames = 0;
+        }
     }
 
     const auto MON = targetMonitor();
@@ -1787,7 +1917,37 @@ static void dumpStatus() {
     // the next dump -- one frame of lag on a value that is not changing.
     g_scene.requestProbe();
 
-    std::ofstream out("/tmp/hypr3d-status.txt", std::ios::trunc);
+    // History log: APPEND with a timestamp. The one-shot snapshot kept
+    // missing the bug (it self-healed before the read); the timeline catches
+    // the transition frame by frame. Bounded at ~128 KB, trimmed from the
+    // head.
+    std::ofstream out("/tmp/hypr3d-status.txt",
+                      std::ios::app | std::ios::in);
+
+    {
+        std::error_code              ec;
+        const auto                   SZ = std::filesystem::file_size(
+            "/tmp/hypr3d-status.txt", ec);
+        if (!ec && SZ > 128 * 1024) {
+            std::ifstream  in("/tmp/hypr3d-status.txt");
+            std::string    data((std::istreambuf_iterator<char>(in)),
+                                std::istreambuf_iterator<char>());
+            in.close();
+
+            const auto CUT = data.find('\n', data.size() / 2);
+            if (CUT != std::string::npos) {
+                std::ofstream trim("/tmp/hypr3d-status.txt",
+                                   std::ios::trunc);
+                trim << data.substr(CUT + 1);
+            }
+        }
+    }
+
+    out << "--- frame " << g_diagFrames << " t="
+        << std::chrono::duration<float>(std::chrono::steady_clock::now() -
+                                        g_inputClockStart)
+               .count()
+        << "s\n";
 
     if (!out)
         return;
@@ -1843,6 +2003,53 @@ static void dumpStatus() {
         out << "scenePixel=unavailable\n";
 
     out << "renderWindows=" << g_renderWindows.size() << "\n";
+
+    out << "fsPhase=" << static_cast<int>(g_fsPhase)
+        << " fsWasOn=" << (g_fsWasOn ? 1 : 0)
+        << " fsAlpha=" << g_fsAlpha << "\n";
+
+    if (const auto FSW = Fullscreen::controller()->getFullscreenWindow(
+            targetMonitor())) {
+        const auto BOX = Compat::currentWindowBox(FSW);
+        float fsRoll = 0.0f;
+        if (auto* E = g_world.find(Compat::windowId(FSW)))
+            fsRoll = E->roll;
+
+        out << "fsWindow=" << Compat::windowId(FSW)
+            << " box=" << BOX.x << "," << BOX.y << "," << BOX.w << "," << BOX.h
+            << " restore=" << g_fsRestoreBox.w << "x" << g_fsRestoreBox.h
+            << " roll=" << fsRoll << "\n";
+
+    } else {
+        out << "fsWindow=none\n";
+    }
+    // Per-window channel alphas + Hyprland's remembered floating size:
+    // the semi-transparency and the giant-size bugs live in THESE state
+    // channels; the dump pins which one is stuck and for whom.
+    if (Desktop::windowState() && MON && MON->m_activeWorkspace) {
+        for (auto const& W3 : Desktop::windowState()->windows()) {
+            if (!W3 || W3->m_workspace != MON->m_activeWorkspace)
+                continue;
+
+            const auto WB = W3->m_target ? W3->m_target->position() :
+                                           CBox{};
+            out << "  win=" << Compat::windowId(W3)
+                << " float=" << (W3->m_isFloating ? 1 : 0)
+                << " aFull="
+                << W3->alphaValue(Desktop::View::WINDOW_ALPHA_FULLSCREEN)
+                << " aActive="
+                << W3->alphaValue(Desktop::View::WINDOW_ALPHA_ACTIVE)
+                << " aFade="
+                << W3->alphaValue(Desktop::View::WINDOW_ALPHA_FADE)
+                << " box=" << WB.x << "," << WB.y << "," << WB.w << ","
+                << WB.h << " lastFloat="
+                << (W3->m_target ? W3->m_target->lastFloatingSize().x : -1.f)
+                << "x"
+                << (W3->m_target ? W3->m_target->lastFloatingSize().y : -1.f)
+                << "\n";
+        }
+    }
+
     out << "captureFrames=" << g_captureFrames << "\n";
 }
 
@@ -2091,6 +2298,13 @@ static void onMouseButton(
                 return;
             }
             s_zoomId = 0; // the drag owns this window's distance now
+
+            // A drag on the assert window: the drag wins, stop fighting.
+            if (g_fsAssertFrames > 0 && HIT.id == Compat::windowId(TARGET.window)) {
+                g_fsAssertFrames = 0;
+                g_fsWindow = {};
+            }
+
             g_pointerGesture = EPointerGesture::Move3D;
             g_pointerButton = BTN_LEFT;
             g_pointerDown = true;
@@ -2469,6 +2683,25 @@ APICALL EXPORT void PLUGIN_EXIT() {
 
     // Put the windows back under the layout before the plugin goes away.
     unghostWindows();
+
+    // The FS fade channel: on FS-on Hyprland dims EVERY other workspace
+    // window to alpha 0 (WINDOW_ALPHA_FULLSCREEN). If our transition raced
+    // the fade, windows can be left semi-transparent after the 3D exit.
+    // Reset the channel for the active workspace unconditionally.
+    if (const auto MON = targetMonitor(); MON && MON->m_activeWorkspace) {
+        for (auto const& W3 : Desktop::windowState()->windows()) {
+            if (W3 && W3->m_workspace == MON->m_activeWorkspace &&
+                !W3->m_pinned)
+                *W3->alpha(Desktop::View::WINDOW_ALPHA_FULLSCREEN) = 1.F;
+        }
+    }
+
+    // The ghosted windows were skipped by Hyprland's main render during 3D;
+    // force a full monitor repaint so every window is re-composited from its
+    // own buffer immediately (static clients would otherwise stay invisible
+    // until their first repaint).
+    if (g_pHyprRenderer && g_monitor)
+        g_pHyprRenderer->damageMonitor(g_monitor);
 
     Compat::setPointerCapture(false);
     Compat::removePointerHook();

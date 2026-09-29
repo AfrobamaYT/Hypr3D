@@ -112,6 +112,7 @@ std::vector<SHit> CWorld::pickAll(const Vec3& origin, const Vec3& dir) const {
         quad.height  = entity.height;
         quad.yaw     = entity.yaw;
         quad.pitch   = entity.pitch;
+        quad.roll    = entity.roll;
         quad.pickable = entity.width > 0.0f && entity.height > 0.0f;
         QUADS.emplace_back(quad);
     }

@@ -24,6 +24,7 @@ struct Mat4 {
     static Mat4 lookAt(const Vec3& eye, const Vec3& center, const Vec3& up);
     static Mat4 rotationY(float r);
     static Mat4 rotationX(float r);
+    static Mat4 rotationZ(float r);
     static Mat4 translation(const Vec3& v);
     static Mat4 scale(const Vec3& v);
 };

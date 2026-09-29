@@ -27,12 +27,27 @@ static Vec3 inverseRotateY(const Vec3& v, float angle) {
     };
 }
 
+static Vec3 inverseRotateZ(const Vec3& v, float angle) {
+    // Rotation by +angle around Z -- the same convention as the X/Y helpers
+    // above (the caller passes the negated model angle to get the inverse).
+    const float c = std::cos(angle);
+    const float s = std::sin(angle);
+    return {
+        v.x * c - v.y * s,
+        v.x * s + v.y * c,
+        v.z,
+    };
+}
+
 static Vec3 toLocal(const Vec3& world, const RayQuad& quad) {
-    // Model rotation is RY(yaw) * RX(pitch). Its inverse is
-    // RX(-pitch) * RY(-yaw).
-    return inverseRotateX(
-        inverseRotateY(world, -quad.yaw),
-        -quad.pitch
+    // Model rotation is RZ(roll) * RY(yaw) * RX(pitch). Its inverse is
+    // RX(-pitch) * RY(-yaw) * RZ(-roll).
+    return inverseRotateZ(
+        inverseRotateX(
+            inverseRotateY(world, -quad.yaw),
+            -quad.pitch
+        ),
+        -quad.roll
     );
 }
 

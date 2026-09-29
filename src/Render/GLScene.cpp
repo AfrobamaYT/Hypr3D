@@ -1426,6 +1426,7 @@ void GLScene::drawWindows(
             Mat4::translation({window->x, window->y, window->z}) *
             Mat4::rotationY(window->yaw) *
             Mat4::rotationX(window->pitch) *
+            Mat4::rotationZ(window->roll) *
             Mat4::scale({window->width, window->height, 1.0f});
 
         const float uvRect[4] = {

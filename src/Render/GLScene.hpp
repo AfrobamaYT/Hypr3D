@@ -29,6 +29,7 @@ class GLScene {
         float x = 0.f, y = 0.f, z = 0.f; // world centre
         float width = 0.f, height = 0.f; // world size, independent per window
         float yaw = 0.f, pitch = 0.f;   // world orientation, radians
+        float roll = 0.f;                // in-plane rotation around the normal
 
         // Subrect of `texture` to sample: (u0,v0) at the quad's bottom-left in
         // GL convention, (u1,v1) at its top-right. Defaults cover the whole

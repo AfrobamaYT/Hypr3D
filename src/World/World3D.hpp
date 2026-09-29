@@ -34,6 +34,7 @@ struct SEntity {
     float height = 0.0f;            // world units
     float yaw    = 0.0f;             // radians
     float pitch  = 0.0f;             // radians
+    float roll   = 0.0f;             // radians, around the window normal
 
     // Visual scale applied on top of the box-to-world conversion. New windows
     // spawn fitted into a modest size; the aspect is preserved (the quad must

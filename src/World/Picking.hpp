@@ -19,6 +19,7 @@ struct RayQuad {
     float height = 0.f;
     float yaw    = 0.f;
     float pitch  = 0.f;
+    float roll   = 0.f;   // around the quad normal; keeps u/v content-aligned
 
     // False for anything that is drawn but not interactable (uncaptured
     // texture, fully transparent during the 2D->3D fade).

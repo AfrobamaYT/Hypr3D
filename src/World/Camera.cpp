@@ -83,6 +83,14 @@ Mat4 Mat4::rotationX(float r) {
     return out;
 }
 
+Mat4 Mat4::rotationZ(float r) {
+    Mat4 out = identity();
+    const float c = std::cos(r), s = std::sin(r);
+    out.m[0] = c;  out.m[1] = s;   // col 0 = (c, s, 0): +X rotates toward +Y
+    out.m[4] = -s; out.m[5] = c;   // col 1 = (-s, c, 0)
+    return out;
+}
+
 Mat4 Mat4::translation(const Vec3& v) {
     Mat4 out = identity();
     out.m[12] = v.x; out.m[13] = v.y; out.m[14] = v.z;

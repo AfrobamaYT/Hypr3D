@@ -78,7 +78,7 @@ static std::uintptr_t g_lastFocusId = 0;
 
 // 3D FPS-style mouse gestures. Super is the modifier: LMB moves the aimed
 // window in the 3D room, RMB resizes its real Hyprland/Wayland geometry.
-enum class EPointerGesture : uint8_t { None, Move3D, ResizeReal };
+enum class EPointerGesture : uint8_t { None, Move3D, ResizeReal, WheelRoll };
 
 static bool            g_pointerDown = false;
 static EPointerGesture g_pointerGesture = EPointerGesture::None;
@@ -119,6 +119,20 @@ static bool g_capturing = false;
 // a screen capture (OBS/pipewire) copies every damaged frame.
 static uint64_t g_captureFrames = 0;
 static std::uintptr_t g_lastAimedId = 0;
+
+// Super+wheel-PRESS roll: rotating the aimed window around its normal by
+// sweeping the crosshair around the window center. The swept angle is
+// measured in WORLD space around the normal, which is invariant to the roll
+// itself -- only camera rotation drives it, so the gesture never feeds back
+// into itself.
+static struct SWheelRotate {
+    bool           active     = false;
+    std::uintptr_t id         = 0;
+    Vec3           center     = {};
+    Vec3           normal     = {};
+    Vec3           reference  = {};  // crosshair point - center at grab
+    float          startRoll  = 0.0f;
+} s_wheelRot;
 
 // Super+wheel hover zoom: glides the aimed window along the ray from the
 // camera through the window toward the target distance (exponential lerp,
@@ -601,6 +615,7 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
             entity.center = EXISTING->center;
             entity.yaw = EXISTING->yaw;
             entity.pitch = EXISTING->pitch;
+            entity.roll = EXISTING->roll;
             entity.spawnScale = EXISTING->spawnScale;
         }
         else {
@@ -672,6 +687,7 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         render.z = entity.center.z;
         render.yaw = entity.yaw;
         render.pitch = entity.pitch;
+        render.roll = entity.roll;
 
         render.width  = entity.width;
         render.height = entity.height;
@@ -853,6 +869,36 @@ static CBox resizeBoxFromAim(const Vec3& point, const PHLMONITOR& mon) {
     return out;
 }
 
+// Per-frame roll gesture: rotate the window around its normal by the signed
+// angle the crosshair swept around the window center (measured in world
+// space around the normal -- invariant to the roll itself, so the gesture
+// never feeds back into its own measurement).
+static void updateWheelRoll() {
+    if (!s_wheelRot.active)
+        return;
+
+    const auto HIT = aimHit();
+
+    if (!HIT.hit || HIT.id != s_wheelRot.id) {
+        s_wheelRot.active = false; // crosshair left the window: end it
+        return;
+    }
+
+    auto* ENTITY = g_world.find(s_wheelRot.id);
+
+    if (!ENTITY) {
+        s_wheelRot.active = false;
+        return;
+    }
+
+    const Vec3 V = HIT.point - s_wheelRot.center;
+    const float ANGLE = std::atan2(
+        dot(cross(s_wheelRot.reference, V), s_wheelRot.normal),
+        dot(s_wheelRot.reference, V));
+
+    ENTITY->roll = s_wheelRot.startRoll + ANGLE;
+}
+
 static void updateRealResize() {
     if (!g_resize.active || !g_resize.window)
         return;
@@ -888,6 +934,7 @@ static void resetPointerGesture() {
     g_pointerGesture = EPointerGesture::None;
     g_pointerButton = 0;
     g_resize = {};
+    s_wheelRot.active = false;
 }
 
 static void finishClientButton(uint32_t timeMs) {
@@ -1211,6 +1258,8 @@ static void update3D(float dt) {
         );
     } else if (g_pointerGesture == EPointerGesture::ResizeReal && g_pointerDown) {
         updateRealResize();
+    } else if (g_pointerGesture == EPointerGesture::WheelRoll && g_pointerDown) {
+        updateWheelRoll();
     }
 
     syncWorld(MON, dt);
@@ -1602,6 +1651,41 @@ static void onMouseButton(
         resetPointerGesture();
         info.cancelled = true;
         damageCurrentMonitor();
+        return;
+    }
+
+    // Super + wheel-press: grab the aimed window's roll around its normal.
+    // Sweeping the crosshair around the window center then rotates the
+    // window by the swept angle; release ends it. Never reaches the client.
+    if (PRESSED && g_superHeld && event.button == BTN_MIDDLE) {
+        const World3D::SHit HIT = aimHit();
+        const auto* ENTITY = HIT.hit ? g_world.find(HIT.id) : nullptr;
+
+        if (ENTITY) {
+            const Vec3 REFERENCE = HIT.point - ENTITY->center;
+
+            // The sweep angle is undefined when the crosshair sits exactly
+            // on the center -- refuse the grab there.
+            if (dot(REFERENCE, REFERENCE) > 0.0004f) {
+                s_wheelRot.active     = true;
+                s_wheelRot.id         = HIT.id;
+                s_wheelRot.center     = ENTITY->center;
+                s_wheelRot.normal     = g_world.normalOf(HIT.id);
+                s_wheelRot.reference  = REFERENCE;
+                s_wheelRot.startRoll  = ENTITY->roll;
+
+                g_pointerGesture = EPointerGesture::WheelRoll;
+                g_pointerButton  = BTN_MIDDLE;
+                g_pointerDown    = true;
+                g_resize         = {};
+
+                info.cancelled = true;
+                damageCurrentMonitor();
+                return;
+            }
+        }
+
+        info.cancelled = true;
         return;
     }
 

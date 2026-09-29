@@ -56,6 +56,7 @@ hl.bind("SUPER + F12", hl.plugin.hypr3d.toggle)
 | Ctrl                          | Sprint                                                   |
 | Super + Left click            | Drag window                                              |
 | Super + Right click           | Resize window                                            |
+| Super + Mouse wheel click     | rotate window                                            |
 | Super + Mouse wheel scrolling | Zoom in on or zoom out from a window under the crosshair |
 | Super + Left Alt              | Toggle keyboard mode (movement / window input)           |
 

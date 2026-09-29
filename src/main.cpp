@@ -8,6 +8,7 @@
 #include <hyprland/src/desktop/view/Window.hpp>
 #include <hyprland/src/managers/SeatManager.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
+#include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
 #include <hyprland/src/config/values/ConfigValues.hpp>
 #include <hyprland/src/config/ConfigValue.hpp>
 #include <hyprland/src/devices/IKeyboard.hpp>
@@ -143,6 +144,39 @@ static Vec3           s_zoomDir    = {};
 static Vec3           s_zoomAnchor = {}; // camera position at the last wheel event
 static double         s_zoomCur    = 0.0;
 static double         s_zoomTarget = 0.0;
+
+// Fullscreen passthrough: when Hyprland fullscreens a window while the 3D
+// view is open, the window's quad animates to face the (frozen) camera and
+// stretch exactly over the frustum, then the plugin hands the screen back to
+// the 2D compositor: input is released, the cursor reappears, the 3D scene
+// stops rendering. Exiting fullscreen reverses it -- the quad is back, input
+// captured, cursor hidden. The real window is forced to the monitor box
+// during 2D so the compositor shows it truly fullscreened.
+static void resetPointerGesture();
+
+enum class EFullscreenPhase : uint8_t { None, To2D, In2D, To3D };
+static EFullscreenPhase g_fsPhase = EFullscreenPhase::None;
+static PHLWINDOWREF     g_fsWindow;
+static CBox             g_fsRestoreBox{}; // floating box before the fullscreen
+static CBox             g_fsMonitorBox{}; // the fullscreen target box
+static float            g_fsDistance = 8.0f; // fov-derived, set by startTo2D
+static Vec3             g_fsStartCenter{}, g_fsEndCenter{};
+static float g_fsStartYaw = 0.f, g_fsStartPitch = 0.f;
+static float g_fsEndYaw = 0.f, g_fsEndPitch = 0.f;
+static float g_fsStartRoll = 0.f;
+static std::chrono::steady_clock::time_point g_fsPhaseStart{};
+static bool  g_fsWasOn = false; // a fullscreen window existed since the last poll
+static float g_fsAlpha = 1.0f;  // composite alpha during the transition
+static float g_fsRawP   = 0.0f;  // raw (pre-smoothstep) transition progress
+static float g_fsSavedRoll   = 0.0f; // the window's roll before the fullscreen
+static float g_fsRollAtStart = 0.0f; // roll at the To3D start (aborts may differ)
+static int   g_fsAssertFrames = 0;   // re-assert the restored box for N frames
+static CBox  g_fsAssertBox{};
+static bool  g_captureReleasePending = false;
+static constexpr float kFsAnimDuration = 0.6f;
+
+static void pollFullscreen();
+static void startTo2D(const PHLWINDOW& window, bool captureRestoreBox = true);
 
 // Windows that appear while the view is open spawn as floating panels of
 // this logical size (see ghostWindows), and enter the room this far in front
@@ -314,7 +348,9 @@ static void resetCameraKeys() {
 
 // True while the 3D view owns the pointer and the keyboard.
 static bool ownsInput() {
-    return g_active && g_transition >= 0.9f;
+    // In2D is the fullscreen passthrough: Hyprland owns everything.
+    return g_active && g_transition >= 0.9f &&
+        g_fsPhase != EFullscreenPhase::In2D;
 }
 
 static void clearAimFocus() {
@@ -437,7 +473,21 @@ static void startFramePump() {
                     return;
                 }
 
-                damageCurrentMonitor();
+                // 2D passthrough: no damage (Hyprland renders by its own
+                // damage); the tick still polls the fullscreen state so the
+                // exit transition can fire.
+                pollFullscreen();
+
+                // Snapshot release deferred from deactivate3D: safe to
+                // destroy GL objects here, outside any render pass.
+                if (g_captureReleasePending && !g_active) {
+                    g_capture.releaseAll();
+                    g_captureReleasePending = false;
+                }
+
+                if (g_fsPhase != EFullscreenPhase::In2D)
+                    damageCurrentMonitor();
+
                 self->updateTimeout(kFramePumpInterval);
             },
             nullptr
@@ -502,6 +552,10 @@ static void refreshCaptures(
 // therefore skip all plugin rendering callbacks.
 static void serviceCapture() {
     if (!g_active || g_capturing || !g_pHyprRenderer)
+        return;
+
+    // 2D passthrough: the room is dormant, no captures needed.
+    if (g_fsPhase == EFullscreenPhase::In2D)
         return;
 
     const auto MON = targetMonitor();
@@ -711,7 +765,10 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         g_renderWindows.push_back(render);
     }
 
-    updateAimFocus(dt);
+    // Aim focus updates freeze during the fullscreen transition: the flying
+    // quad sweeps the crosshair across other windows and would thrash focus.
+    if (g_fsPhase == EFullscreenPhase::None)
+        updateAimFocus(dt);
 }
 
 // Window-local (top-left origin, logical px) point for a crosshair hit.
@@ -867,6 +924,274 @@ static CBox resizeBoxFromAim(const Vec3& point, const PHLMONITOR& mon) {
         out.y = g_resize.startBox.y;
 
     return out;
+}
+
+// --- fullscreen passthrough -------------------------------------------------
+
+static float wrapPi(float a) {
+    while (a > 3.14159265f)
+        a -= 6.28318530f;
+    while (a < -3.14159265f)
+        a += 6.28318530f;
+    return a;
+}
+
+// To2D: capture the room pose, force the real window to the monitor box and
+// aim the animation at a quad that exactly covers the frozen camera frustum.
+static void startTo2D(const PHLWINDOW& window, bool captureRestoreBox) {
+    const auto MON = targetMonitor();
+
+    if (!MON)
+        return;
+
+    const auto ID = Compat::windowId(window);
+
+    if (!g_world.find(ID))
+        return; // not in the room: nothing to animate
+
+    g_fsWindow = window;
+
+    // The floating box is captured once (on the FS event). A rapid exit+reenter
+    // re-grabs from the To3D completion with the box still monitor-sized --
+    // the original floating box must survive for the next restore.
+    if (captureRestoreBox)
+        g_fsRestoreBox = Compat::currentWindowBox(window);
+
+    // The fullscreen TARGET box (the animation moves the real box there
+    // gradually -- see applyFullscreenAnimation).
+    g_fsMonitorBox = CBox{
+        MON->m_position.x, MON->m_position.y, MON->m_size.x, MON->m_size.y};
+
+    // The screen-covering distance derives from the vertical FOV and the
+    // monitor's NATURAL world size (logical px / 100):
+    // d = (worldHeight / 2) / tan(vfov / 2). At that distance a
+    // monitor-sized quad subtends exactly the full frustum.
+    const float MON_H_WORLD =
+        static_cast<float>(MON->m_size.y) / World3D::LOGICAL_PX_PER_UNIT;
+    g_fsDistance = (MON_H_WORLD * 0.5f) /
+        std::tan(kFovDeg * 3.14159265f / 360.0f);
+
+    if (const auto* E = g_world.find(ID)) {
+        g_fsStartCenter = E->center;
+        g_fsStartYaw    = E->yaw;
+        g_fsStartPitch  = E->pitch;
+        g_fsStartRoll   = E->roll;
+        g_fsSavedRoll   = E->roll; // restored when the fullscreen exits
+
+    }
+
+    const auto& CAM = g_scene.camera();
+    const Vec3 FWD = CAM.forward();
+
+    g_fsEndCenter = CAM.position + FWD * g_fsDistance;
+
+    // Face the FROZEN camera: with the model convention (normal Y is
+    // -sin(pitch)) facing the camera means yaw = -camYaw, pitch = +camPitch.
+    // The content lands unmirrored: the quad's local +X maps exactly onto
+    // the camera's right vector.
+    g_fsEndYaw    = -CAM.yaw;
+    g_fsEndPitch  = CAM.pitch;
+
+    resetPointerGesture(); // no gestures on the animating window
+    g_input.reset();       // no look jump when look resumes
+
+    g_fsPhase        = EFullscreenPhase::To2D;
+    g_fsPhaseStart   = std::chrono::steady_clock::now();
+    g_fsWasOn        = true;
+    g_fsAssertFrames = 0;
+    damageCurrentMonitor();
+}
+
+// In2D -> To3D: restore the real floating box, capture input, hide the
+// cursor; the animation runs the quad back to its room pose.
+static void startTo3D() {
+    if (auto W = g_fsWindow.lock()) {
+        // The To3D start is the window's CURRENT pose: the tracked fullscreen
+        // pose after a normal exit, or wherever the aborted To2D got to. The
+        // real floating box is restored when the animation COMPLETES (restoring
+        // it here would make the quad show magnified small-window content).
+        if (auto* E = g_world.find(Compat::windowId(W))) {
+            g_fsEndCenter = E->center;
+            g_fsEndYaw    = E->yaw;
+            g_fsEndPitch  = E->pitch;
+            g_fsRollAtStart = E->roll;
+        }
+
+        if (Compat::setCursorHidden(true))
+            Pointer::mgr()->resetCursorImage();
+
+        Compat::setPointerCapture(g_hookInstalled);
+
+        g_fsPhase      = EFullscreenPhase::To3D;
+        g_fsPhaseStart = std::chrono::steady_clock::now();
+        g_input.reset();
+        damageCurrentMonitor();
+    }
+}
+
+// None -> To2D when a fullscreen window appears; In2D -> To3D when it goes.
+static void pollFullscreen() {
+    const auto MON = targetMonitor();
+
+    if (!MON)
+        return;
+
+    const auto FSW = Fullscreen::controller()->getFullscreenWindow(MON);
+
+    if (g_fsPhase == EFullscreenPhase::None) {
+        if (FSW && !g_fsWasOn && ownsInput())
+            startTo2D(FSW);
+        else
+            g_fsWasOn = FSW != nullptr;
+    } else if (g_fsPhase == EFullscreenPhase::In2D) {
+        // Exit passthrough when OUR window is no longer the fullscreen one
+        // (toggled off, or fullscreen moved to another window entirely).
+        const auto W = g_fsWindow.lock();
+
+        if (!FSW || (W && FSW != W))
+            startTo3D();
+        else
+            g_fsWasOn = true;
+    } else if (g_fsPhase == EFullscreenPhase::To2D) {
+        // Fullscreen was toggled off MID-ANIMATION: hand back to 3D from the
+        // current animated pose instead of finishing onto a stale screen.
+        if (!FSW)
+            startTo3D();
+    } else if (g_fsPhase == EFullscreenPhase::To3D) {
+        g_fsWasOn = FSW != nullptr; // remembered for after the animation
+    }
+}
+
+// To2D/To3D: pose the fullscreening window between its room pose and the
+// screen-covering pose (smoothstep). Runs AFTER syncWorld, overriding the
+// per-frame reseed.
+static void applyFullscreenAnimation() {
+    if (g_fsPhase != EFullscreenPhase::To2D && g_fsPhase != EFullscreenPhase::To3D)
+        return;
+
+    const auto W = g_fsWindow.lock();
+    auto* E = W ? g_world.find(Compat::windowId(W)) : nullptr;
+
+    if (!E) {
+        // the window closed mid-transition: land the phase
+        g_fsPhase  = EFullscreenPhase::None;
+        g_fsWindow = {};
+        return;
+    }
+
+    const float RAWP = std::clamp(
+        std::chrono::duration<float>(std::chrono::steady_clock::now() -
+                                     g_fsPhaseStart).count() /
+            kFsAnimDuration,
+        0.0f, 1.0f);
+    g_fsRawP = RAWP; // feeds the composite alpha below
+    float p = RAWP * RAWP * (3.0f - 2.0f * RAWP); // smoothstep
+
+    // To2D: the SCREEN pose tracks the LIVE camera -- looking around during
+    // the transition keeps the quad converging onto the current view, so the
+    // handoff never pops.
+    if (g_fsPhase == EFullscreenPhase::To2D) {
+        const auto& CAM = g_scene.camera();
+        const Vec3 FWD = CAM.forward();
+
+        g_fsEndCenter = CAM.position + FWD * g_fsDistance;
+        g_fsEndYaw    = -CAM.yaw;
+        g_fsEndPitch  = CAM.pitch;
+    }
+
+    // To2D: room -> screen; To3D: screen -> room
+    const auto  A = g_fsPhase == EFullscreenPhase::To2D;
+    const Vec3  C0 = A ? g_fsStartCenter : g_fsEndCenter;
+    const Vec3  C1 = A ? g_fsEndCenter : g_fsStartCenter;
+    const float Y0 = A ? g_fsStartYaw : g_fsEndYaw;
+    const float Y1 = A ? g_fsEndYaw : g_fsStartYaw;
+    const float P0 = A ? g_fsStartPitch : g_fsEndPitch;
+    const float P1 = A ? g_fsEndPitch : g_fsStartPitch;
+
+    E->center = C0 + (C1 - C0) * p;
+    E->yaw    = Y0 + wrapPi(Y1 - Y0) * p;
+    E->pitch  = P0 + (P1 - P0) * p;
+
+    // The roll fades out on the way to 2D (the compositor renders windows
+    // unrolled) and fades back to the saved value on the way to the room.
+    if (A)
+        E->roll = g_fsSavedRoll * (1.0f - p);
+    else
+        E->roll = g_fsRollAtStart + (g_fsSavedRoll - g_fsRollAtStart) * p;
+
+    // The REAL box animates between the floating box and the fullscreen box.
+    // The client's buffer is stretched to this box by the compositor, so the
+    // content scale inside the quad stays constant through the whole
+    // transition -- no zoom flashes at either boundary.
+    const CBox B0 = A ? g_fsRestoreBox : g_fsMonitorBox;
+    const CBox B1 = A ? g_fsMonitorBox : g_fsRestoreBox;
+
+    const CBox BOX{
+        B0.x + (B1.x - B0.x) * p,
+        B0.y + (B1.y - B0.y) * p,
+        B0.w + (B1.w - B0.w) * p,
+        B0.h + (B1.h - B0.h) * p,
+    };
+
+    if (auto W = g_fsWindow.lock())
+        Compat::setWindowBox(W, BOX);
+
+    // The quad follows the animated box at the room's pixel density.
+    E->width  = World3D::toWorld(BOX.w) * E->spawnScale;
+    E->height = World3D::toWorld(BOX.h) * E->spawnScale;
+
+    // The roll decays to zero: the 2D fullscreen view has no roll, and the
+    // quad must land matching what the compositor will render.
+
+    // Composite alpha: minimal fades at the handoffs (a couple of frames).
+    // The snapshot and the live 2D render can be a frame apart, and a long
+    // fade makes that desync visible; a 2-frame crossfade hides it.
+    g_fsAlpha = A ?
+        std::clamp(1.0f - (g_fsRawP - 0.96f) / 0.04f, 0.0f, 1.0f) :
+        std::clamp(g_fsRawP / 0.04f, 0.0f, 1.0f);
+
+    // Phase completion:
+    //   To2D done -> hand the screen to the 2D compositor (In2D): input is
+    //   released, the cursor reappears, the 3D scene stops rendering (the
+    //   onRenderStage gate) and the pump polls for the fullscreen exit.
+    //   To3D done -> restore the floating box (the client re-renders at its
+    //   room size) and return to the plain 3D room.
+    if (p >= 1.0f) {
+        if (g_fsPhase == EFullscreenPhase::To2D) {
+            g_fsPhase = EFullscreenPhase::In2D;
+
+            Compat::setPointerCapture(false);
+
+            if (Compat::setCursorHidden(false) && g_pHyprRenderer)
+                g_pHyprRenderer->setCursorFromName("default", true);
+        } else {
+            // Rapid exit+reenter: the FS state may already be ON again for
+            // this window -- fly it back to the screen (real 2D) instead of
+            // dropping it into the room small while fullscreened.
+            const auto MON = targetMonitor();
+            const auto W2 = g_fsWindow.lock();
+
+            if (W2 && MON &&
+                Fullscreen::controller()->getFullscreenWindow(MON) == W2) {
+                g_fsPhaseStart = std::chrono::steady_clock::now();
+                startTo2D(W2, /*captureRestoreBox*/ false);
+            } else {
+                if (W2) {
+                    Compat::setWindowBox(W2, g_fsRestoreBox);
+
+                    // Hyprland's own fullscreen-exit restore animates the
+                    // window toward ITS remembered floating size -- which our
+                    // transition kept updating -- and can retarget the box
+                    // AFTER this point. Re-assert the restore box for a few
+                    // frames so the final size is ours.
+                    g_fsAssertBox    = g_fsRestoreBox;
+                    g_fsAssertFrames = 12;
+                }
+
+                g_fsPhase = EFullscreenPhase::None;
+            }
+        }
+    }
 }
 
 // Per-frame roll gesture: rotate the window around its normal by the signed
@@ -1042,6 +1367,18 @@ static void deactivate3D() {
     g_active = false;
     stopFramePump();
 
+    // Fullscreen passthrough state: back to plain 3D-off. Restore the real
+    // box if a transition was mid-flight (the window would otherwise stay
+    // monitor-sized).
+    if (auto W = g_fsWindow.lock())
+        Compat::setWindowBox(W, g_fsRestoreBox);
+
+    g_fsPhase        = EFullscreenPhase::None;
+    g_fsWindow       = {};
+    g_fsWasOn        = false;
+    g_fsAlpha        = 1.0f;
+    g_fsAssertFrames = 0;
+
     // Restore the host cursor before anything else touches focus: removing
     // pointer focus makes the client re-apply its own cursor image on the
     // next pointer enter, and the default shape shows immediately.
@@ -1097,6 +1434,14 @@ static void enter3D() {
     g_keyboardMode = EKeyboardMode::Space;
     g_altHeld      = false;
     s_zoomId       = 0;
+
+    // A fullscreen window that already exists is just a room entity; the
+    // passthrough triggers only on the fullscreen EVENT.
+    if (const auto MON = targetMonitor())
+        g_fsWasOn =
+            Fullscreen::controller()->getFullscreenWindow(MON) != nullptr;
+    else
+        g_fsWasOn = false;
 
     g_renderedOnce = false;
     g_captureFrames = 0;
@@ -1192,6 +1537,8 @@ static void update3D(float dt) {
     float yawDelta = 0.0f;
     float pitchDelta = 0.0f;
 
+    // Look/movement stay live during the fullscreen transition: the To2D end
+    // pose tracks the camera, so the quad keeps converging onto the view.
     if (g_input.consumeLook(yawDelta, pitchDelta)) {
         g_scene.rotateView(yawDelta, pitchDelta);
         damageCurrentMonitor();
@@ -1216,8 +1563,9 @@ static void update3D(float dt) {
     }
 
     // Super+wheel hover zoom: glide the window along its ray toward the
-    // target distance.
-    if (s_zoomId != 0) {
+    // target distance. Paused while a fullscreen transition animates (its
+    // own glide is one-shot and completes separately).
+    if (s_zoomId != 0 && g_fsPhase == EFullscreenPhase::None) {
         if (auto* ZOOMED = g_world.find(s_zoomId)) {
             s_zoomCur += (s_zoomTarget - s_zoomCur) *
                 (1.0 - std::exp(-8.0 * dt));
@@ -1239,6 +1587,18 @@ static void update3D(float dt) {
 
     if (g_transition <= 0.0f)
         return;
+
+    // Fullscreen-exit box re-assertion: outlasts Hyprland's exit-restore
+    // animation (see the To3D completion).
+    if (g_fsAssertFrames > 0) {
+        --g_fsAssertFrames;
+
+        if (auto W = g_fsWindow.lock())
+            Compat::setWindowBox(W, g_fsAssertBox);
+
+        if (g_fsAssertFrames == 0)
+            g_fsWindow = {};
+    }
 
     const auto MON = targetMonitor();
 
@@ -1264,10 +1624,12 @@ static void update3D(float dt) {
 
     syncWorld(MON, dt);
 
+    applyFullscreenAnimation();
+
     // Normal client interaction is a virtual pointer located exactly at the
     // crosshair. It is updated every frame after camera motion, so buttons,
     // text fields, scrollbars, etc. receive ordinary Wayland pointer motion.
-    if (!g_pointerDown)
+    if (!g_pointerDown && g_fsPhase == EFullscreenPhase::None)
         forwardPointerToAim(inputTimeMs());
 }
 
@@ -1512,9 +1874,17 @@ static void onRenderStage(eRenderStage stage) {
     if (g_pHyprRenderer->type() != Render::IHyprRenderer::RT_GL)
         return;
 
+    // 2D passthrough: Hyprland renders the fullscreen window; the room and
+    // its input are dormant. The frame pump polls for the fullscreen exit.
+    if (g_fsPhase == EFullscreenPhase::In2D)
+        return;
+
     update3D(dt);
 
     g_diagAlpha = std::clamp(g_transition, 0.0f, 1.0f);
+
+    if (g_fsPhase == EFullscreenPhase::To2D || g_fsPhase == EFullscreenPhase::To3D)
+        g_diagAlpha = g_fsAlpha;
 
     g_pHyprRenderer->addPassElement(
         makeUnique<CHypr3DPassElement>(
@@ -1657,7 +2027,8 @@ static void onMouseButton(
     // Super + wheel-press: grab the aimed window's roll around its normal.
     // Sweeping the crosshair around the window center then rotates the
     // window by the swept angle; release ends it. Never reaches the client.
-    if (PRESSED && g_superHeld && event.button == BTN_MIDDLE) {
+    if (PRESSED && g_superHeld && g_fsPhase == EFullscreenPhase::None &&
+        event.button == BTN_MIDDLE) {
         const World3D::SHit HIT = aimHit();
         const auto* ENTITY = HIT.hit ? g_world.find(HIT.id) : nullptr;
 
@@ -1693,7 +2064,7 @@ static void onMouseButton(
     // to the client for these physical button events. Layer surfaces can be
     // dragged like windows, but not resized -- their real geometry is owned
     // by the shell that anchored them.
-    if (PRESSED && g_superHeld &&
+    if (PRESSED && g_superHeld && g_fsPhase == EFullscreenPhase::None &&
         (event.button == BTN_LEFT || event.button == BTN_RIGHT)) {
         const World3D::SHit HIT = aimHit();
         const auto TARGET = HIT.hit ? targetFromHit(HIT.id) : SHitTarget{};
@@ -2089,7 +2460,12 @@ APICALL EXPORT void PLUGIN_EXIT() {
 
     g_world.clear();
     g_renderWindows.clear();
-    g_capture.releaseAll();
+
+    // Defer the snapshot release to the event loop: this runs INSIDE
+    // Hyprland's render pass, and destroying framebuffers/textures here
+    // breaks the frame that is still being composed (windows left
+    // transparent until their next repaint).
+    g_captureReleasePending = true;
 
     // Put the windows back under the layout before the plugin goes away.
     unghostWindows();

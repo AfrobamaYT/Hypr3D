@@ -10,6 +10,10 @@
 
 namespace H3D {
 
+// The vertical field of view of the 3D view, in degrees. Shared with
+// main.cpp (fullscreen transition computes the screen-filling quad from it).
+static constexpr float kFovDeg = 65.0f;
+
 // The 3D view: a first-person room containing the windows of the active
 // workspace. It deliberately knows nothing about Hyprland -- main.cpp feeds it
 // WindowRender entries and reads back what the crosshair hit.

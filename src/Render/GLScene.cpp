@@ -1183,7 +1183,7 @@ void GLScene::drawPanorama(float aspect) {
     const Vec3 FWD   = m_camera.forward();
     const Vec3 RIGHT = m_camera.right();
     const Vec3 UP    = cross(RIGHT, FWD);
-    const float TANY = std::tan(65.0f * PI / 360.0f);
+    const float TANY = std::tan(kFovDeg * PI / 360.0f);
 
     // Analytic mip level: texels per screen pixel at the view centre. The
     // panorama is W texels around 2*pi radians; one screen pixel spans about
@@ -1644,7 +1644,7 @@ bool GLScene::render(
         static_cast<float>(width) / static_cast<float>(height);
 
     const Mat4 projection =
-        Mat4::perspective(65.0f * PI / 180.0f, aspect, 0.05f, 200.0f);
+        Mat4::perspective(kFovDeg * PI / 180.0f, aspect, 0.05f, 200.0f);
 
     m_width  = width;
     m_height = height;

@@ -1,0 +1,8 @@
+tests
+build
+shaders
+build-tests
+build-warn
+docs
+r.sh
+.zcodeignore

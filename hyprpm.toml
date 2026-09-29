@@ -1,0 +1,10 @@
+[repository]
+name = "Hypr3D"
+authors = ["Samine825"]
+
+[hypr3d]
+description = "A new perspective on window management for Hyprland"
+authors = ["Samine825"]
+output = "build/hypr3d.so"
+build = ["cmake -S . -B build -DHYPRLAND_HEADERS=\"$HYPRLAND_HEADERS\"", "cmake --build build -j$(nproc)"]
+

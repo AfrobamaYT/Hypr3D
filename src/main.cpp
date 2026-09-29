@@ -973,14 +973,26 @@ static void startTo2D(const PHLWINDOW& window, bool captureRestoreBox) {
 
     g_fsWindow = window;
 
-    // The floating box is captured once (on the FS event) from the STABLE
-    // memory, not the live geometry: Hyprland has already resized the window
-    // to the monitor by the time we see the event. A rapid exit+reenter
-    // keeps the original -- the live box is monitor-sized mid-transition.
+    // The floating box: the POSITION from the stable memory (where the
+    // window lived), the SIZE from Hyprland's own remembered floating size.
+    // When the FS was engaged, Hyprland remembered the pre-fullscreen size
+    // there (setTargetFullscreenModeInternal does it BEFORE stretching the
+    // window to the monitor) -- exactly the size the 2D FS-exit restores.
+    // The stable memory is the fallback (e.g. a tiled window has no
+    // floating history: its tile size is the honest original).
     if (captureRestoreBox) {
         const auto IT = g_fsStableBoxes.find(ID);
-        g_fsRestoreBox = IT != g_fsStableBoxes.end() ?
+        CBox RESTORE = IT != g_fsStableBoxes.end() ?
             IT->second : Compat::currentWindowBox(window);
+
+        if (window->m_target) {
+            const auto LF = window->m_target->lastFloatingSize();
+
+            if (LF.x > 5.0 && LF.y > 5.0)
+                RESTORE = CBox{RESTORE.x, RESTORE.y, LF.x, LF.y};
+        }
+
+        g_fsRestoreBox = RESTORE;
     }
 
     // The fullscreen TARGET box (the animation moves the real box there
@@ -988,12 +1000,13 @@ static void startTo2D(const PHLWINDOW& window, bool captureRestoreBox) {
     g_fsMonitorBox = CBox{
         MON->m_position.x, MON->m_position.y, MON->m_size.x, MON->m_size.y};
 
-    // Pin Hyprland's remembered floating size to the SPAWN size: the
-    // transition's per-frame setWindowBox calls would otherwise re-member
-    // intermediate (up to monitor-sized) values, and Hyprland's own FS-exit
-    // applies that memory. The spawn size is the room's ground truth.
+    // Pin Hyprland's remembered floating size to the captured PRE-FS size:
+    // the transition's per-frame setWindowBox calls would otherwise
+    // re-member intermediate (up to monitor-sized) values, and Hyprland's
+    // own FS-exit applies that memory.
     if (window->m_target)
-        window->m_target->rememberFloatingSize({kSpawnWidth, kSpawnHeight});
+        window->m_target->rememberFloatingSize(
+            {g_fsRestoreBox.w, g_fsRestoreBox.h});
 
     // The screen-covering distance derives from the vertical FOV and the
     // monitor's NATURAL world size (logical px / 100):
@@ -1184,9 +1197,7 @@ static void applyFullscreenAnimation() {
     // the post-FS size is deterministic and never inherits garbage from
     // earlier broken cycles.
     const CBox B0 = A ? g_fsRestoreBox : g_fsMonitorBox;
-    const CBox B1 = A ? g_fsMonitorBox
-                      : CBox{g_fsRestoreBox.x, g_fsRestoreBox.y, kSpawnWidth,
-                             kSpawnHeight};
+    const CBox B1 = A ? g_fsMonitorBox : g_fsRestoreBox;
 
     const CBox BOX{
         B0.x + (B1.x - B0.x) * p,
@@ -1226,11 +1237,10 @@ static void applyFullscreenAnimation() {
 
             // Our transition's per-frame setWindowBox calls polluted
             // Hyprland's remembered floating size with intermediate (up to
-            // monitor-sized) values. Pin it to the SPAWN size: this is what
-            // Hyprland's own FS-exit applies, and what the quad lands at.
+            // monitor-sized) values. Re-pin the captured PRE-FS size.
             if (auto W2 = g_fsWindow.lock())
                 W2->m_target->rememberFloatingSize(
-                    {kSpawnWidth, kSpawnHeight});
+                    {g_fsRestoreBox.w, g_fsRestoreBox.h});
 
             if (Compat::setCursorHidden(false) && g_pHyprRenderer)
                 g_pHyprRenderer->setCursorFromName("default", true);
@@ -1247,15 +1257,10 @@ static void applyFullscreenAnimation() {
                 startTo2D(W2, /*captureRestoreBox*/ false);
             } else {
                 if (W2) {
-                    // The original position, the spawn size: after ANY
-                    // fullscreen exit the window is a standard panel -- no
-                    // path leaves it monitor-sized (a tiled-origin window's
-                    // "original" box IS the monitor, and older cycles may
-                    // have left the stable memory polluted anyway).
-                    Compat::setWindowBox(
-                        W2,
-                        CBox{g_fsRestoreBox.x, g_fsRestoreBox.y, kSpawnWidth,
-                             kSpawnHeight});
+                    // The original position AND the pre-fullscreen size:
+                    // Hyprland remembered the size when the FS was engaged,
+                    // the box lerp above already animated the real box there.
+                    Compat::setWindowBox(W2, g_fsRestoreBox);
 
                     // Hyprland's own fullscreen-exit restore animates the
                     // window toward ITS remembered floating size -- which our
@@ -1266,8 +1271,7 @@ static void applyFullscreenAnimation() {
                     // size) -- asserting the raw g_fsRestoreBox here made
                     // our own guard resize the window back to the polluted
                     // monitor size right after the landing.
-                    g_fsAssertBox    = CBox{g_fsRestoreBox.x, g_fsRestoreBox.y,
-                                            kSpawnWidth, kSpawnHeight};
+                    g_fsAssertBox    = g_fsRestoreBox;
                     g_fsAssertFrames = 1;    // condition-driven: runs until stable
                     g_fsStableCount  = 0;
 

@@ -27,12 +27,35 @@ static Vec3 rotateY(const Vec3& v, float angle) {
     };
 }
 
-static Vec3 rotateLocal(const Vec3& v, float yaw, float pitch) {
-    return rotateY(rotateX(v, pitch), yaw);
+static Vec3 rotateZ(const Vec3& v, float angle) {
+    const float c = std::cos(angle);
+    const float s = std::sin(angle);
+    return {
+        v.x * c - v.y * s,
+        v.x * s + v.y * c,
+        v.z,
+    };
 }
 
-static Vec3 inverseRotate(const Vec3& v, float yaw, float pitch) {
-    return rotateX(rotateY(v, -yaw), -pitch);
+static Vec3 inverseRotateZ(const Vec3& v, float angle) {
+    const float c = std::cos(angle);
+    const float s = std::sin(angle);
+    return {
+        v.x * c + v.y * s,
+        -v.x * s + v.y * c,
+        v.z,
+    };
+}
+
+// Full window orientation: RY(yaw) * RX(pitch) * RZ(roll). The roll rotates
+// the content around the window normal and MUST be part of every axis
+// computation, or resize/plane math lands on the unrolled frame.
+static Vec3 rotateLocal(const Vec3& v, float yaw, float pitch, float roll) {
+    return rotateY(rotateX(rotateZ(v, roll), pitch), yaw);
+}
+
+static Vec3 inverseRotate(const Vec3& v, float yaw, float pitch, float roll) {
+    return rotateZ(rotateX(rotateY(v, -yaw), -pitch), -roll);
 }
 
 static float wrapPi(float a) {
@@ -167,7 +190,8 @@ bool CWorld::startDrag(
     m_drag.grabLocal = inverseRotate(
         hit.point - ENTITY->center,
         ENTITY->yaw,
-        ENTITY->pitch
+        ENTITY->pitch,
+        ENTITY->roll
     ) * ENTITY->spawnScale;
 
     return true;
@@ -218,7 +242,7 @@ void CWorld::updateDrag(
     ENTITY->pitch = std::clamp(ENTITY->pitch, -1.5f, 1.5f);
 
     const Vec3 GRAB_WORLD = rotateLocal(
-        m_drag.grabLocal, ENTITY->yaw, ENTITY->pitch
+        m_drag.grabLocal, ENTITY->yaw, ENTITY->pitch, ENTITY->roll
     );
 
     ENTITY->center = TARGET_POINT - GRAB_WORLD;
@@ -227,7 +251,8 @@ void CWorld::updateDrag(
 Vec3 CWorld::localPoint(std::uintptr_t id, const Vec3& worldPoint) const {
     for (const auto& entity : m_entities) {
         if (entity.id == id)
-            return inverseRotate(worldPoint - entity.center, entity.yaw, entity.pitch);
+            return inverseRotate(worldPoint - entity.center, entity.yaw,
+                                 entity.pitch, entity.roll);
     }
     return {};
 }
@@ -235,7 +260,8 @@ Vec3 CWorld::localPoint(std::uintptr_t id, const Vec3& worldPoint) const {
 Vec3 CWorld::normalOf(std::uintptr_t id) const {
     for (const auto& entity : m_entities) {
         if (entity.id == id)
-            return rotateLocal({0.0f, 0.0f, 1.0f}, entity.yaw, entity.pitch);
+            return rotateLocal({0.0f, 0.0f, 1.0f}, entity.yaw, entity.pitch,
+                               entity.roll);
     }
     return {0.0f, 0.0f, 1.0f};
 }
@@ -243,7 +269,8 @@ Vec3 CWorld::normalOf(std::uintptr_t id) const {
 Vec3 CWorld::rightOf(std::uintptr_t id) const {
     for (const auto& entity : m_entities) {
         if (entity.id == id)
-            return rotateLocal({1.0f, 0.0f, 0.0f}, entity.yaw, entity.pitch);
+            return rotateLocal({1.0f, 0.0f, 0.0f}, entity.yaw, entity.pitch,
+                               entity.roll);
     }
     return {1.0f, 0.0f, 0.0f};
 }
@@ -251,7 +278,8 @@ Vec3 CWorld::rightOf(std::uintptr_t id) const {
 Vec3 CWorld::upOf(std::uintptr_t id) const {
     for (const auto& entity : m_entities) {
         if (entity.id == id)
-            return rotateLocal({0.0f, 1.0f, 0.0f}, entity.yaw, entity.pitch);
+            return rotateLocal({0.0f, 1.0f, 0.0f}, entity.yaw, entity.pitch,
+                               entity.roll);
     }
     return {0.0f, 1.0f, 0.0f};
 }

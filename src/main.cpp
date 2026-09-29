@@ -104,6 +104,10 @@ struct SResizeGesture {
     float         startWorldHeight = 0.0f;
     Vec3          planePoint{};
     Vec3          planeNormal{0.0f, 0.0f, 1.0f};
+    // Crosshair position on the real window at grab time, in surface px. The
+    // resize is driven by the aim's DELTA from this point, so the grabbed
+    // corner never snaps to the crosshair when the gesture starts.
+    Vector2D      grabPx{};
     int           edgeX = 0; // -1 left, +1 right
     int           edgeY = 0; // +1 top, -1 bottom
 };
@@ -905,28 +909,33 @@ static Vector2D worldPointToGlobalPx(
 }
 
 static CBox resizeBoxFromAim(const Vec3& point, const PHLMONITOR& mon) {
-    const double X = worldPointToGlobalPx(mon, point).x;
-    const double Y = worldPointToGlobalPx(mon, point).y;
+    // The grabbed edge moves by the crosshair's travel since the grab, not
+    // to its absolute position: the box starts identical to the window, so
+    // starting a resize never snaps the nearest corner under the crosshair.
+    const Vector2D PX = worldPointToGlobalPx(mon, point);
+    const double DX = PX.x - g_resize.grabPx.x;
+    const double DY = PX.y - g_resize.grabPx.y;
 
-    const double RIGHT = g_resize.startBox.x + g_resize.startBox.w;
-    const double BOTTOM = g_resize.startBox.y + g_resize.startBox.h;
+    const CBox& start = g_resize.startBox;
+    const double RIGHT = start.x + start.w;
+    const double BOTTOM = start.y + start.h;
 
-    CBox out = g_resize.startBox;
+    CBox out = start;
 
     if (g_resize.edgeX > 0) {
-        out.x = g_resize.startBox.x;
-        out.w = X - out.x;
+        out.x = start.x;
+        out.w = start.w + DX;
     } else {
-        out.x = X;
-        out.w = RIGHT - out.x;
+        out.x = start.x + DX;
+        out.w = start.w - DX;
     }
 
     if (g_resize.edgeY > 0) {
-        out.y = Y;
-        out.h = BOTTOM - out.y;
+        out.y = start.y + DY;
+        out.h = start.h - DY;
     } else {
-        out.y = g_resize.startBox.y;
-        out.h = Y - out.y;
+        out.y = start.y;
+        out.h = start.h + DY;
     }
 
     const auto MIN = g_resize.window->minSize().value_or(Vector2D{1.0, 1.0});
@@ -936,14 +945,14 @@ static CBox resizeBoxFromAim(const Vec3& point, const PHLMONITOR& mon) {
     out.h = std::clamp(out.h, MIN.y, MAX.y);
 
     if (g_resize.edgeX > 0)
-        out.x = g_resize.startBox.x;
+        out.x = start.x;
     else
         out.x = RIGHT - out.w;
 
     if (g_resize.edgeY > 0)
         out.y = BOTTOM - out.h;
     else
-        out.y = g_resize.startBox.y;
+        out.y = start.y;
 
     return out;
 }
@@ -2332,15 +2341,18 @@ static void onMouseButton(
             g_resize.planePoint = ENTITY->center;
             g_resize.planeNormal = g_world.normalOf(HIT.id);
 
-            // The point currently under the crosshair chooses the corner that
-            // will follow it. The opposite corner is fixed. As the camera
-            // turns, the current centre ray is intersected with this same
-            // window plane, so the real window stretches exactly toward the
-            // point being aimed at.
+            // The grab point only seeds which edge follows the crosshair;
+            // updateRealResize re-evaluates that every frame from the aim's
+            // side relative to the window centre, so the grab lands anywhere
+            // on the window and the pull direction decides the rest. As the
+            // camera turns, the current centre ray is intersected with this
+            // same window plane, so the real window stretches exactly toward
+            // the point being aimed at.
             // RayHit::v is already top-to-bottom. Top half follows +1,
             // bottom half follows -1 in the CBox edge convention below.
             g_resize.edgeX = HIT.u < 0.5f ? -1 : 1;
             g_resize.edgeY = HIT.v < 0.5f ? 1 : -1;
+            g_resize.grabPx = worldPointToGlobalPx(targetMonitor(), HIT.point);
 
             g_pointerGesture = EPointerGesture::ResizeReal;
             g_pointerButton = BTN_RIGHT;

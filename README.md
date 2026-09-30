@@ -65,22 +65,19 @@ hl.bind("SUPER + F12", hl.plugin.hypr3d.toggle)
 
 ```lua
 if hl.plugin.hypr3d then
-hl.bind("SUPER + F12", hl.plugin.hypr3d.toggle)
-hl.config({
-    plugin = {
-        hypr3d = {
-            -- U can set a panorama pic:
-            panorama = "/home/samine/Downloads/Qwen_image_2.1_00048.png",
-            -- And other world parameters:
-            look_inertia = 0.03,
-            move_inertia = 0.05,
-            move_speed = 4.0, -- Walking speed, world m/s (default 8.0, range 0.5–50). Sprinting is ×2.5 this value
-            sensitivity = 0.0025, -- Mouse sensitivity, radians per pointer count (default 0.0025, range 0.0001–0.05)
-            window_scale = 0.5, -- Window scale relative to the world: a multiplier applied to their actual pixel size at a base density of 100 px/m (default 1.0, range 0.1–8)
-            spawn_distance = 5, -- distance from the camera to the spawn point for the new window (default 10.0, range 1–100)
-            -- That's all for now :p
-        },
-    },
-})
+    -- binds
+    hl.bind("SUPER + F12", hl.plugin.hypr3d.toggle)
+    -- parameters
+    hl.plugin.hypr3d.config({
+        panorama = "/home/samine/Downloads/Qwen_image_2.1_00048.png", -- 360° room background image (equirectangular)
+        look_inertia = 0.03, -- mouse-look glide after the mouse stops, seconds (0 = off)
+        move_inertia = 0.05, -- WASD glide after the keys are released, seconds (0 = off)
+        move_speed = 4.0, -- walking speed, world m/s (sprint is ×2.5 this value)
+        sensitivity = 0.0025, -- mouse look sensitivity, radians per pointer count
+        window_scale = 0.5, -- window size multiplier: real pixel size at a base density of 100 px/m, times this
+        spawn_distance = 5, -- distance from the camera where new windows spawn
+        player_spawn = { x = 0, y = 0, z = 0 }, -- player spawn point in the room
+        -- That's all for now :p
+    })
 end
 ```

@@ -121,13 +121,8 @@ struct SResizeGesture {
     int           edgeY = 0; // +1 top, -1 bottom
 };
 
-// Player spawn point in the room, set from lua via playerSpawnPoint().
-// Defaults to the classic spawn: X=0 Z=11 at standing eye height.
-static Vec3 g_playerSpawn{
-    0.0f,
-    Camera::kFloorY + Camera::kEyeHeight, // standing eye level
-    11.0f,
-};
+// Player spawn point in the room, set via hl.plugin.hypr3d.config().
+static Vec3 g_playerSpawn{0.0f, 0.0f, 0.0f};
 
 static SResizeGesture g_resize{};
 
@@ -248,10 +243,10 @@ static bool g_hookInstalled = false;
 // names; wrong-typed keys raise a lua error. Everything is clamped on set.
 static float       g_cfgLookInertia   = 0.03f;   // seconds, 0 = off
 static float       g_cfgMoveInertia   = 0.05f;   // seconds, 0 = off
-static float       g_cfgMoveSpeed     = 8.0f;    // world units / second
+static float       g_cfgMoveSpeed     = 4.0f;    // world units / second
 static float       g_cfgSensitivity   = 0.0025f; // radians per pointer count
-static float       g_cfgWindowScale   = 1.0f;    // room multiplier on window size
-static float       g_cfgSpawnDistance = 10.0f;   // units in front of the camera
+static float       g_cfgWindowScale   = 0.5f;    // room multiplier on window size
+static float       g_cfgSpawnDistance = 5.0f;    // units in front of the camera
 static std::string g_cfgPanorama;                // panorama image path
 
 static void notify(const std::string& text, const CHyprColor& color);
@@ -2660,11 +2655,11 @@ static int luaConfig(lua_State* L) {
     //     panorama = "/path/to/image.png",
     //     look_inertia = 0.03,   -- seconds, 0 = off
     //     move_inertia = 0.05,   -- seconds, 0 = off
-    //     move_speed = 8.0,      -- world units / second
+    //     move_speed = 4.0,      -- world units / second
     //     sensitivity = 0.0025,  -- radians per pointer count
-    //     window_scale = 1.0,    -- room multiplier on window size
-    //     spawn_distance = 10.0, -- units in front of the camera
-    //     player_spawn = { x = 0, y = -4.13, z = 11 },
+    //     window_scale = 0.5,    -- room multiplier on window size
+    //     spawn_distance = 5.0,  -- units in front of the camera
+    //     player_spawn = { x = 0, y = 0, z = 0 },
     // })
     //
     // Missing keys keep their current value; wrong-typed keys raise a lua

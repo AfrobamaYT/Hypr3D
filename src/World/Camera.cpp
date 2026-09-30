@@ -146,12 +146,25 @@ void Camera::move(float forward, float right, float vertical, float dt) {
 
     // Strafe along the ground plane rather than into the floor/ceiling, which
     // is what makes WASD feel like walking instead of like a flying camera.
-    const Vec3 flat = normalize({std::sin(yaw), 0.f, -std::cos(yaw)});
-    position += flat * (forward * moveSpeed * dt);
+    position += flatForward() * (forward * moveSpeed * dt);
 
     // The 3D room has a real floor. Q/E (and now Shift/Space) can move the
     // camera vertically, but the body's feet never sink through the floor
     // plane: the eye stops at eye height above it.
+    position.y = std::max(position.y, kFloorY + kEyeHeight);
+}
+
+Vec3 Camera::flatForward() const {
+    return normalize({std::sin(yaw), 0.f, -std::cos(yaw)});
+}
+
+void Camera::displace(const Vec3& worldVelocity, float dt) {
+    if (!std::isfinite(dt) || dt <= 0.f)
+        return;
+
+    position += worldVelocity * dt;
+
+    // Same floor rule as move(): the feet never sink through the floor plane.
     position.y = std::max(position.y, kFloorY + kEyeHeight);
 }
 

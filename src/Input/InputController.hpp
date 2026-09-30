@@ -23,7 +23,14 @@ class InputController {
     // pointer units with Y growing DOWN (libinput convention -- the same delta
     // that moves the real cursor), so pitch is driven by -pendingY: pushing
     // the mouse up looks up, like in every FPS.
-    bool consumeLook(float& yawDelta, float& pitchDelta);
+    //
+    // dt > 0 with look smoothing enabled hands out only a per-frame fraction
+    // of the accumulated motion (exponential in dt), so a stopped mouse coasts
+    // to a halt instead of cutting dead. dt == 0 drains everything at once.
+    bool consumeLook(float& yawDelta, float& pitchDelta, float dt = 0.0f);
+
+    // Glide time constant in seconds after input stops. 0 disables.
+    void setLookSmoothing(float seconds);
 
     // Non-positive / non-finite values fall back to the default.
     void setSensitivity(float radiansPerCount);
@@ -35,6 +42,7 @@ class InputController {
     double m_pendingX    = 0.0;
     double m_pendingY    = 0.0;
     float  m_sensitivity = kDefaultRadiansPerCount;
+    float  m_lookSmoothing = 0.0f;
 };
 
 } // namespace H3D

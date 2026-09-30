@@ -70,6 +70,14 @@ class Camera {
 
     void move(float forward, float right, float vertical, float dt);
 
+    // Forward direction projected onto the ground plane (walking axis).
+    Vec3 flatForward() const;
+
+    // Apply an already-computed world-space velocity (units/second) with the
+    // same floor clamp as move(). The inertia layer in main.cpp integrates
+    // its own glide toward the key-driven velocity and lands here.
+    void displace(const Vec3& worldVelocity, float dt);
+
     // Unit look direction.
     Vec3 forward() const;
 

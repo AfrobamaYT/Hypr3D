@@ -1030,8 +1030,8 @@ static void startTo2D(const PHLWINDOW& window, bool captureRestoreBox) {
         g_fsStartCenter = E->center;
         g_fsStartYaw    = E->yaw;
         g_fsStartPitch  = E->pitch;
-        g_fsStartRoll   = E->roll;
-        g_fsSavedRoll   = E->roll; // restored when the fullscreen exits
+        g_fsStartRoll   = wrapPi(E->roll);
+        g_fsSavedRoll   = wrapPi(E->roll); // restored when the FS exits
 
     }
 
@@ -1069,7 +1069,7 @@ static void startTo3D() {
             g_fsEndCenter = E->center;
             g_fsEndYaw    = E->yaw;
             g_fsEndPitch  = E->pitch;
-            g_fsRollAtStart = E->roll;
+            g_fsRollAtStart = wrapPi(E->roll);
         }
 
         if (Compat::setCursorHidden(true))
@@ -1334,7 +1334,10 @@ static void updateWheelRoll() {
         dot(cross(s_wheelRot.reference, V), s_wheelRot.normal),
         dot(s_wheelRot.reference, V));
 
-    ENTITY->roll = s_wheelRot.startRoll + ANGLE;
+    // Wrapped to [-pi, pi]: the angle is 2pi-periodic, so the visual is
+    // identical, but the fullscreen transition interpolates this value
+    // linearly -- an unwrapped 700-degree roll would unwind like a top.
+    ENTITY->roll = wrapPi(s_wheelRot.startRoll + ANGLE);
 }
 
 static void updateRealResize() {
@@ -1641,6 +1644,10 @@ static float updateTransition() {
 
 // --- frame ------------------------------------------------------------------
 
+// World-space glide velocity for the WASD inertia (units/second). Lives
+// across frames so releasing the keys coasts down instead of cutting dead.
+static Vec3 s_moveVel{};
+
 static void applyCameraMovement(float dt) {
     const float FORWARD  = (g_keyFwd ? 1.f : 0.f) - (g_keyBack ? 1.f : 0.f);
     const float STRAFE   = (g_keyRight ? 1.f : 0.f) - (g_keyLeft ? 1.f : 0.f);
@@ -1648,16 +1655,50 @@ static void applyCameraMovement(float dt) {
 
     auto& CAM = g_scene.camera();
 
-    if (FORWARD == 0.f && STRAFE == 0.f && VERTICAL == 0.f)
+    static const CConfigValue<Config::FLOAT> PMOVEINERTIA(
+        "plugin:hypr3d:move_inertia");
+    const float tau = std::clamp(static_cast<float>(*PMOVEINERTIA), 0.0f, 1.0f);
+
+    const bool MOVING = FORWARD != 0.f || STRAFE != 0.f || VERTICAL != 0.f;
+
+    if (tau <= 0.0f || dt <= 0.0f) {
+        s_moveVel = {};
+
+        if (!MOVING)
+            return;
+
+        const float BASE = CAM.moveSpeed;
+        CAM.moveSpeed = BASE * (g_keySprint ? 2.5f : 1.0f);
+        CAM.move(FORWARD, STRAFE, VERTICAL, dt);
+        CAM.moveSpeed = BASE;
+
+        damageCurrentMonitor();
         return;
+    }
 
-    const float BASE = CAM.moveSpeed;
+    // Glide toward the key-driven velocity with tau as the time constant;
+    // with the keys released the target is zero, so motion decays smoothly.
+    const float SPEED =
+        CAM.moveSpeed * (g_keySprint ? 2.5f : 1.0f) * (MOVING ? 1.0f : 0.0f);
+    const Vec3 TARGET =
+        CAM.flatForward() * (FORWARD * SPEED) +
+        CAM.right() * (STRAFE * SPEED) +
+        Vec3{0.f, 1.f, 0.f} * (VERTICAL * SPEED);
 
-    CAM.moveSpeed = BASE * (g_keySprint ? 2.5f : 1.0f);
-    CAM.move(FORWARD, STRAFE, VERTICAL, dt);
-    CAM.moveSpeed = BASE;
+    s_moveVel += (TARGET - s_moveVel) *
+        (1.0f - std::exp(-dt / tau));
 
-    damageCurrentMonitor();
+    // Snap the decay tail off once it is far below a frame of movement, so
+    // the glide always terminates.
+    if (!MOVING &&
+        std::fabs(s_moveVel.x) + std::fabs(s_moveVel.y) +
+            std::fabs(s_moveVel.z) < 0.01f)
+        s_moveVel = {};
+
+    if (s_moveVel.x != 0.f || s_moveVel.y != 0.f || s_moveVel.z != 0.f) {
+        CAM.displace(s_moveVel, dt);
+        damageCurrentMonitor();
+    }
 }
 
 static void update3D(float dt) {
@@ -1671,7 +1712,14 @@ static void update3D(float dt) {
 
     // Look/movement stay live during the fullscreen transition: the To2D end
     // pose tracks the camera, so the quad keeps converging onto the view.
-    if (g_input.consumeLook(yawDelta, pitchDelta)) {
+    {
+        static const CConfigValue<Config::FLOAT> PLOOKINERTIA(
+            "plugin:hypr3d:look_inertia");
+        g_input.setLookSmoothing(
+            std::clamp(static_cast<float>(*PLOOKINERTIA), 0.0f, 1.0f));
+    }
+
+    if (g_input.consumeLook(yawDelta, pitchDelta, dt)) {
         g_scene.rotateView(yawDelta, pitchDelta);
         damageCurrentMonitor();
     }
@@ -2614,6 +2662,32 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     if (!HyprlandAPI::addConfigValueV2(PHANDLE, g_panoramaValue))
         notify(
             "[hypr3d] failed to register plugin:hypr3d:panorama",
+            CHyprColor{1.0f, 0.6f, 0.2f, 1.0f}
+        );
+
+    static auto SPHlookInertia = makeShared<Config::Values::CFloatValue>(
+        "plugin:hypr3d:look_inertia",
+        "Mouse-look glide after the mouse stops, seconds (0 = off)",
+        0.03f,
+        Config::Values::SFloatValueOptions{.min = 0.0f, .max = 1.0f}
+    );
+
+    if (!HyprlandAPI::addConfigValueV2(PHANDLE, SPHlookInertia))
+        notify(
+            "[hypr3d] failed to register plugin:hypr3d:look_inertia",
+            CHyprColor{1.0f, 0.6f, 0.2f, 1.0f}
+        );
+
+    static auto SPHmoveInertia = makeShared<Config::Values::CFloatValue>(
+        "plugin:hypr3d:move_inertia",
+        "WASD glide after the keys are released, seconds (0 = off)",
+        0.05f,
+        Config::Values::SFloatValueOptions{.min = 0.0f, .max = 1.0f}
+    );
+
+    if (!HyprlandAPI::addConfigValueV2(PHANDLE, SPHmoveInertia))
+        notify(
+            "[hypr3d] failed to register plugin:hypr3d:move_inertia",
             CHyprColor{1.0f, 0.6f, 0.2f, 1.0f}
         );
 

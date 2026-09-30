@@ -1,0 +1,657 @@
+#define CGLTF_IMPLEMENTATION
+#include "../../third_party/cgltf.h"
+
+#include <GLES3/gl32.h>
+
+#include "Render/MapModel.hpp"
+
+#include <hyprgraphics/image/Image.hpp>
+#include <hyprutils/memory/SharedPtr.hpp>
+
+#include <algorithm>
+#include <cmath>
+#include <filesystem>
+#include <memory>
+#include <string_view>
+
+namespace H3D {
+
+namespace {
+
+constexpr const char* MAP_VERTEX = R"GLSL(
+#version 300 es
+
+layout(location = 0) in vec3 aPosition;
+layout(location = 1) in vec3 aNormal;
+layout(location = 2) in vec2 aUV;
+
+uniform mat4 uMVP;
+uniform mat4 uModel;
+
+out vec3 vNormal;
+out vec2 vUV;
+
+void main() {
+    gl_Position = uMVP * vec4(aPosition, 1.0);
+    // Uniform scale only, so the rotated basis is a valid normal basis.
+    vNormal = mat3(uModel) * aNormal;
+    vUV = aUV;
+}
+)GLSL";
+
+constexpr const char* DEBUG_VERTEX = R"GLSL(
+#version 300 es
+
+layout(location = 0) in vec3 aPosition;
+
+uniform mat4 uMVP;
+
+void main() {
+    gl_Position = uMVP * vec4(aPosition, 1.0);
+}
+)GLSL";
+
+constexpr const char* DEBUG_FRAGMENT = R"GLSL(
+#version 300 es
+
+precision mediump float;
+
+out vec4 fragColor;
+
+void main() {
+    fragColor = vec4(1.0, 0.1, 0.1, 1.0);
+}
+)GLSL";
+
+constexpr const char* MAP_FRAGMENT = R"GLSL(
+#version 300 es
+
+precision mediump float;
+
+in vec3 vNormal;
+in vec2 vUV;
+
+uniform sampler2D uTex;
+uniform vec4 uColor;
+
+out vec4 fragColor;
+
+void main() {
+    // Fixed lambert: one light from above and a flat ambient floor. Real PBR
+    // is not the point of a map in a room of window quads.
+    vec3 N = normalize(vNormal);
+    float diffuse = max(dot(N, normalize(vec3(0.4, 0.8, 0.45))), 0.0);
+
+    vec3 base = uColor.rgb * texture(uTex, vUV).rgb;
+    fragColor = vec4(base * (0.35 + 0.65 * diffuse), uColor.a);
+}
+)GLSL";
+
+GLuint compileMapShader(GLenum type, const char* src) {
+    const GLuint SH = glCreateShader(type);
+    glShaderSource(SH, 1, &src, nullptr);
+    glCompileShader(SH);
+
+    GLint ok = GL_FALSE;
+    glGetShaderiv(SH, GL_COMPILE_STATUS, &ok);
+    if (ok != GL_TRUE) {
+        glDeleteShader(SH);
+        return 0;
+    }
+
+    return SH;
+}
+
+Mat4 composeModel(const Vec3& position, const Vec3& rotationDeg, float scale) {
+    constexpr float DEG = 3.14159265358979f / 180.0f;
+
+    const Mat4 T  = Mat4::translation(position);
+    const Mat4 RY = Mat4::rotationY(rotationDeg.y * DEG);
+    const Mat4 RX = Mat4::rotationX(rotationDeg.x * DEG);
+    const Mat4 RZ = Mat4::rotationZ(rotationDeg.z * DEG);
+    const Mat4 S  = Mat4::scale(Vec3{scale, scale, scale});
+
+    // Same convention as the window model: RY * RX * RZ.
+    return T * RY * (RX * (RZ * S));
+}
+
+Vec3 transformPoint(const Mat4& m, const Vec3& p) {
+    return {
+        m.m[0] * p.x + m.m[4] * p.y + m.m[8] * p.z + m.m[12],
+        m.m[1] * p.x + m.m[5] * p.y + m.m[9] * p.z + m.m[13],
+        m.m[2] * p.x + m.m[6] * p.y + m.m[10] * p.z + m.m[14],
+    };
+}
+
+} // namespace
+
+// --- textures ---------------------------------------------------------------
+
+unsigned int CMapModel::uploadTexture(const std::string& modelDir,
+                                      const void* imagePtr,
+                                      bool embedded, const void* data, size_t size) {
+    auto* image = static_cast<const cgltf_image*>(imagePtr);
+
+    std::unique_ptr<Hyprgraphics::CImage> img;
+
+    if (embedded) {
+        img = std::make_unique<Hyprgraphics::CImage>(
+            std::span<const uint8_t>{static_cast<const uint8_t*>(data), size},
+            Hyprgraphics::IMAGE_FORMAT_AUTO);
+    } else if (image && image->uri &&
+               !std::string_view{image->uri}.starts_with("data:")) {
+        img = std::make_unique<Hyprgraphics::CImage>(modelDir + "/" + image->uri);
+    } else {
+        return 0; // data URIs are rare in maps; skip rather than fail
+    }
+
+    auto surface = (img && img->success()) ? img->cairoSurface() : nullptr;
+
+    if (!surface || surface->status() != CAIRO_STATUS_SUCCESS)
+        return 0;
+
+    const int W      = static_cast<int>(surface->size().x);
+    const int H      = static_cast<int>(surface->size().y);
+    const int STRIDE = surface->stride();
+    const auto* SRC  = surface->data();
+
+    if (W <= 0 || H <= 0 || !SRC)
+        return 0;
+
+    // Cairo ARGB32 is premultiplied BGRA; textures want RGBA. NO row flip:
+    // glTF's UV origin is the image TOP-LEFT with v growing down, and GL's
+    // v = 0 samples the first uploaded row -- so cairo row 0 (the top) must
+    // land in the first texel row. Flipping here mirrors every texture.
+    std::vector<unsigned char> pixels(static_cast<size_t>(W) * H * 4);
+
+    for (int y = 0; y < H; ++y) {
+        const auto* row = SRC + static_cast<size_t>(y) * STRIDE;
+        auto*       dst = pixels.data() + static_cast<size_t>(y) * W * 4;
+
+        for (int x = 0; x < W; ++x) {
+            dst[x * 4 + 0] = row[x * 4 + 2];
+            dst[x * 4 + 1] = row[x * 4 + 1];
+            dst[x * 4 + 2] = row[x * 4 + 0];
+            dst[x * 4 + 3] = row[x * 4 + 3];
+        }
+    }
+
+    unsigned int tex = 0;
+    glGenTextures(1, &tex);
+
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                 pixels.data());
+    glGenerateMipmap(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, 0);
+
+    return tex;
+}
+
+// --- load / destroy ---------------------------------------------------------
+
+bool CMapModel::load(const std::string& path, const Vec3& position,
+                     const Vec3& rotationDeg, float scale) {
+    destroy();
+
+    setTransform(position, rotationDeg, scale);
+    m_path = path;
+
+    cgltf_options options{};
+    cgltf_data*   data = nullptr;
+
+    if (cgltf_parse_file(&options, path.c_str(), &data) != cgltf_result_success)
+        return false;
+
+    // Relative .bin / image URIs resolve against the model file's directory
+    // only when the model file's own path is passed here.
+    if (cgltf_load_buffers(&options, data, path.c_str()) != cgltf_result_success) {
+        cgltf_free(data);
+        return false;
+    }
+
+    if (cgltf_validate(data) != cgltf_result_success) {
+        cgltf_free(data);
+        return false;
+    }
+
+    {
+        const GLuint VS = compileMapShader(GL_VERTEX_SHADER, MAP_VERTEX);
+        const GLuint FS = compileMapShader(GL_FRAGMENT_SHADER, MAP_FRAGMENT);
+
+        if (VS && FS) {
+            const GLuint P = glCreateProgram();
+            glAttachShader(P, VS);
+            glAttachShader(P, FS);
+            glLinkProgram(P);
+
+            GLint ok = GL_FALSE;
+            glGetProgramiv(P, GL_LINK_STATUS, &ok);
+            if (ok == GL_TRUE) {
+                m_program = P;
+                m_uMVP    = glGetUniformLocation(P, "uMVP");
+                m_uModel  = glGetUniformLocation(P, "uModel");
+                m_uColor  = glGetUniformLocation(P, "uColor");
+                m_uTex    = glGetUniformLocation(P, "uTex");
+            }
+        }
+
+        if (VS)
+            glDeleteShader(VS);
+        if (FS)
+            glDeleteShader(FS);
+    }
+
+    const std::string MODEL_DIR =
+        std::filesystem::path{path}.parent_path().string();
+
+    std::vector<unsigned int> imageTextures(data->images_count, 0);
+
+    // Depth-first over the scene graph so nested meshes keep their world
+    // placement.
+    std::vector<const cgltf_node*> stack;
+    if (data->scene)
+        for (cgltf_size i = 0; i < data->scene->nodes_count; ++i)
+            stack.push_back(data->scene->nodes[i]);
+
+    while (!stack.empty()) {
+        const cgltf_node* node = stack.back();
+        stack.pop_back();
+
+        for (cgltf_size i = 0; i < node->children_count; ++i)
+            stack.push_back(node->children[i]);
+
+        if (!node->mesh)
+            continue;
+
+        // Nodes named "nocol*" render but never collide (decor convention).
+        const bool NOCOL =
+            node->name && std::string_view{node->name}.starts_with("nocol");
+
+        cgltf_float nodeWorld[16];
+        cgltf_node_transform_world(node, nodeWorld);
+        const Mat4 NODE = Mat4::fromColumnMajor(nodeWorld);
+
+        for (cgltf_size p = 0; p < node->mesh->primitives_count; ++p) {
+            const cgltf_primitive* prim = &node->mesh->primitives[p];
+
+            const cgltf_accessor* POS = nullptr;
+            const cgltf_accessor* NRM = nullptr;
+            const cgltf_accessor* TEX = nullptr;
+
+            for (cgltf_size a = 0; a < prim->attributes_count; ++a) {
+                const auto* ATTR = &prim->attributes[a];
+                if (ATTR->type == cgltf_attribute_type_position)
+                    POS = ATTR->data;
+                else if (ATTR->type == cgltf_attribute_type_normal)
+                    NRM = ATTR->data;
+                else if (ATTR->type == cgltf_attribute_type_texcoord &&
+                         ATTR->index == 0)
+                    TEX = ATTR->data;
+            }
+
+            if (!POS || POS->count == 0)
+                continue;
+
+            SPrimitive out{};
+
+            if (prim->material) {
+                const auto& PBR = prim->material->pbr_metallic_roughness;
+                for (int c = 0; c < 4; ++c)
+                    out.color[c] = static_cast<float>(PBR.base_color_factor[c]);
+
+                if (PBR.base_color_texture.texture &&
+                    PBR.base_color_texture.texture->image) {
+                    const auto* IMG = PBR.base_color_texture.texture->image;
+                    const auto  IDX = static_cast<size_t>(IMG - data->images);
+
+                    if (IDX < imageTextures.size()) {
+                        if (imageTextures[IDX] != 0) {
+                            out.texture = imageTextures[IDX];
+                        } else {
+                            std::vector<uint8_t> bytes;
+                            bool                 embedded = false;
+
+                            if (IMG->buffer_view) {
+                                const auto* BV   = IMG->buffer_view;
+                                const auto* BASE = cgltf_buffer_view_data(BV);
+                                if (BASE) {
+                                    bytes.assign(BASE, BASE + BV->size);
+                                    embedded = true;
+                                }
+                            }
+
+                            out.texture = uploadTexture(MODEL_DIR, IMG, embedded,
+                                                        bytes.data(), bytes.size());
+                            imageTextures[IDX] = out.texture;
+                        }
+                    }
+                }
+            }
+
+            // Interleaved attribute stream for the GPU: pos(3) normal(3)
+            // uv(2). The glTF NODE transform is baked in here -- the shader
+            // only knows the map's config transform (uModel), so without the
+            // bake the mesh renders in raw accessor orientation (Sketchfab
+            // roots are rotated; the model shows up on its side) while the
+            // collision triangles land correctly.
+            std::vector<float> verts;
+            verts.reserve(static_cast<size_t>(POS->count) * 8);
+
+            float cpos[3] = {0, 0, 0}, cnrm[3] = {0, 0, 1}, cuv[2] = {0, 0};
+
+            for (cgltf_size i = 0; i < POS->count; ++i) {
+                cgltf_accessor_read_float(POS, i, cpos, 3);
+                if (NRM)
+                    cgltf_accessor_read_float(NRM, i, cnrm, 3);
+                if (TEX)
+                    cgltf_accessor_read_float(TEX, i, cuv, 2);
+
+                const Vec3 P = transformPoint(NODE, {cpos[0], cpos[1], cpos[2]});
+                Vec3 N = {
+                    NODE.m[0] * cnrm[0] + NODE.m[4] * cnrm[1] + NODE.m[8] * cnrm[2],
+                    NODE.m[1] * cnrm[0] + NODE.m[5] * cnrm[1] + NODE.m[9] * cnrm[2],
+                    NODE.m[2] * cnrm[0] + NODE.m[6] * cnrm[1] + NODE.m[10] * cnrm[2],
+                };
+                const float LEN = std::sqrt(N.x * N.x + N.y * N.y + N.z * N.z);
+                if (LEN > 1e-9f) {
+                    N.x /= LEN;
+                    N.y /= LEN;
+                    N.z /= LEN;
+                }
+
+                verts.push_back(P.x);
+                verts.push_back(P.y);
+                verts.push_back(P.z);
+                verts.push_back(N.x);
+                verts.push_back(N.y);
+                verts.push_back(N.z);
+                verts.push_back(cuv[0]);
+                verts.push_back(cuv[1]);
+            }
+
+            std::vector<uint32_t> indices;
+            if (prim->indices) {
+                indices.resize(prim->indices->count);
+                for (cgltf_size i = 0; i < prim->indices->count; ++i) {
+                    cgltf_uint idx = 0;
+                    cgltf_accessor_read_uint(prim->indices, i, &idx, 1);
+                    indices[i] = idx;
+                }
+            } else {
+                indices.resize(POS->count);
+                for (cgltf_size i = 0; i < POS->count; ++i)
+                    indices[i] = static_cast<uint32_t>(i);
+            }
+
+            // Collision triangles in NODE space (the map's config transform
+            // is NOT applied here). The vertices are already node-transformed
+            // (baked above), so the triangle set takes them as-is -- applying
+            // NODE here again would double-transform the collision geometry.
+            if (!NOCOL) {
+                for (size_t t = 0; t + 2 < indices.size(); t += 3) {
+                    const auto V0 = indices[t] * 8;
+                    const auto V1 = indices[t + 1] * 8;
+                    const auto V2 = indices[t + 2] * 8;
+
+                    m_localTriangles.push_back({
+                        {verts[V0 + 0], verts[V0 + 1], verts[V0 + 2]},
+                        {verts[V1 + 0], verts[V1 + 1], verts[V1 + 2]},
+                        {verts[V2 + 0], verts[V2 + 1], verts[V2 + 2]},
+                    });
+                }
+            }
+
+            // GL upload.
+            glGenVertexArrays(1, &out.vao);
+            glGenBuffers(1, &out.vbo);
+            glGenBuffers(1, &out.ebo);
+
+            glBindVertexArray(out.vao);
+
+            glBindBuffer(GL_ARRAY_BUFFER, out.vbo);
+            glBufferData(GL_ARRAY_BUFFER,
+                         static_cast<GLsizeiptr>(verts.size() * sizeof(float)),
+                         verts.data(), GL_STATIC_DRAW);
+
+            glEnableVertexAttribArray(0);
+            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float),
+                                  reinterpret_cast<void*>(0));
+            glEnableVertexAttribArray(1);
+            glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float),
+                                  reinterpret_cast<void*>(3 * sizeof(float)));
+            glEnableVertexAttribArray(2);
+            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float),
+                                  reinterpret_cast<void*>(6 * sizeof(float)));
+
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, out.ebo);
+            glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                         static_cast<GLsizeiptr>(indices.size() * sizeof(uint32_t)),
+                         indices.data(), GL_STATIC_DRAW);
+
+            out.count   = static_cast<int>(indices.size());
+            out.indexed = true;
+
+            glBindVertexArray(0);
+            glBindBuffer(GL_ARRAY_BUFFER, 0);
+            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+
+            m_primitives.push_back(out);
+        }
+    }
+
+    cgltf_free(data);
+
+    m_loaded = true;
+    recomputeTriangles();
+    return true;
+}
+
+void CMapModel::destroy() {
+    for (const auto& P : m_primitives) {
+        if (P.ebo)
+            glDeleteBuffers(1, &P.ebo);
+        if (P.vbo)
+            glDeleteBuffers(1, &P.vbo);
+        if (P.vao)
+            glDeleteVertexArrays(1, &P.vao);
+    }
+    m_primitives.clear();
+
+    m_triangles.clear();
+    m_localTriangles.clear();
+    m_loaded = false;
+    ++m_generation;
+
+    glDeleteBuffers(1, &m_debugVBO);
+    glDeleteVertexArrays(1, &m_debugVAO);
+    m_debugVBO = m_debugVAO = 0;
+    m_debugVerts = 0;
+    m_debugPending = false;
+    m_debugBuiltGen = 0;
+
+    if (m_debugProgram) {
+        glDeleteProgram(m_debugProgram);
+        m_debugProgram = 0;
+        m_debugMVP = -1;
+    }
+
+    if (m_program) {
+        glDeleteProgram(m_program);
+        m_program = 0;
+        m_uMVP = m_uModel = m_uColor = m_uTex = -1;
+    }
+    m_path.clear();
+}
+
+// --- transform / draw -------------------------------------------------------
+
+void CMapModel::setTransform(const Vec3& position, const Vec3& rotationDeg,
+                             float scale) {
+    const float NEW_SCALE = scale > 0.001f ? scale : 0.001f;
+
+    // update3D pushes the config transform every frame; only a real change
+    // may trigger the (O(triangles)) world-space recompute.
+    if (m_loaded && m_position.x == position.x && m_position.y == position.y &&
+        m_position.z == position.z && m_rotationDeg.x == rotationDeg.x &&
+        m_rotationDeg.y == rotationDeg.y && m_rotationDeg.z == rotationDeg.z &&
+        m_scale == NEW_SCALE)
+        return;
+
+    m_position    = position;
+    m_rotationDeg = rotationDeg;
+    m_scale       = NEW_SCALE;
+
+    if (m_loaded)
+        recomputeTriangles();
+}
+
+void CMapModel::recomputeTriangles() {
+    const Mat4 MODEL = composeModel(m_position, m_rotationDeg, m_scale);
+
+    m_triangles.clear();
+    m_triangles.reserve(m_localTriangles.size());
+
+    for (const auto& T : m_localTriangles)
+        m_triangles.push_back({
+            transformPoint(MODEL, T.a),
+            transformPoint(MODEL, T.b),
+            transformPoint(MODEL, T.c),
+        });
+
+    // The debug wireframe must follow the new world-space set.
+    m_debugPending = m_debugOn;
+
+    // Collision rebuilds its BVH off this.
+    ++m_generation;
+}
+
+void CMapModel::setDebugCollisions(bool on) {
+    if (m_debugOn == on)
+        return;
+
+    m_debugOn      = on;
+    m_debugPending = on; // rebuild (or drop) the line buffer on next draw
+}
+
+void CMapModel::drawDebug(const Mat4& vp) {
+    if (!m_debugOn || m_triangles.empty() || !m_program)
+        return;
+
+    // (Re)build the line buffer whenever the triangles changed. The flag is
+    // set by recomputeTriangles() itself -- generation counters alone missed
+    // scale/rotation edits and the wireframe stayed at the old size.
+    if (m_debugPending) {
+        m_debugPending = false;
+        glDeleteBuffers(1, &m_debugVBO);
+        glDeleteVertexArrays(1, &m_debugVAO);
+        m_debugVBO = m_debugVAO = 0;
+
+        std::vector<float> lines;
+        lines.reserve(m_triangles.size() * 6 * 3);
+
+        for (const auto& T : m_triangles) {
+            const Vec3* EDS[3][2] = {{&T.a, &T.b}, {&T.b, &T.c}, {&T.c, &T.a}};
+            for (const auto& E : EDS)
+                for (const Vec3* P : E) {
+                    lines.push_back(P->x);
+                    lines.push_back(P->y);
+                    lines.push_back(P->z);
+                }
+        }
+
+        glGenVertexArrays(1, &m_debugVAO);
+        glGenBuffers(1, &m_debugVBO);
+
+        glBindVertexArray(m_debugVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, m_debugVBO);
+        glBufferData(GL_ARRAY_BUFFER,
+                     static_cast<GLsizeiptr>(lines.size() * sizeof(float)),
+                     lines.data(), GL_STATIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float),
+                              reinterpret_cast<void*>(0));
+        glBindVertexArray(0);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+
+        m_debugVerts = static_cast<int>(lines.size() / 3);
+    }
+
+    // A separate tiny program: the map program's fragment stage multiplies
+    // by vertex normals and a texture that the line stream does not have.
+    if (!m_debugProgram) {
+        const GLuint VS = compileMapShader(GL_VERTEX_SHADER, DEBUG_VERTEX);
+        const GLuint FS = compileMapShader(GL_FRAGMENT_SHADER, DEBUG_FRAGMENT);
+        if (VS && FS) {
+            const GLuint P = glCreateProgram();
+            glAttachShader(P, VS);
+            glAttachShader(P, FS);
+            glLinkProgram(P);
+            m_debugProgram = P;
+            m_debugMVP     = glGetUniformLocation(P, "uMVP");
+        }
+        if (VS)
+            glDeleteShader(VS);
+        if (FS)
+            glDeleteShader(FS);
+        if (!m_debugProgram)
+            return;
+    }
+
+    const Mat4 MVP = vp * composeModel(m_position, m_rotationDeg, m_scale);
+
+    glUseProgram(m_debugProgram);
+    glUniformMatrix4fv(m_debugMVP, 1, GL_FALSE, MVP.m.data());
+
+    // X-ray: depth test off so collision geometry inside walls stays visible.
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glDisable(GL_BLEND);
+
+    glBindVertexArray(m_debugVAO);
+    glDrawArrays(GL_LINES, 0, m_debugVerts);
+
+    glBindVertexArray(0);
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_TRUE);
+}
+
+void CMapModel::draw(const Mat4& vp) const {
+    if (!m_loaded || !m_program || m_primitives.empty())
+        return;
+
+    const Mat4 MODEL = composeModel(m_position, m_rotationDeg, m_scale);
+    const Mat4 MVP   = vp * MODEL;
+
+    glUseProgram(m_program);
+    glUniformMatrix4fv(m_uMVP, 1, GL_FALSE, MVP.m.data());
+    glUniformMatrix4fv(m_uModel, 1, GL_FALSE, MODEL.m.data());
+    glUniform1i(m_uTex, 0);
+
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+
+    glActiveTexture(GL_TEXTURE0);
+
+    for (const auto& P : m_primitives) {
+        glUniform4f(m_uColor, P.color[0], P.color[1], P.color[2], P.color[3]);
+
+        glBindTexture(GL_TEXTURE_2D, P.texture);
+
+        glBindVertexArray(P.vao);
+        glDrawElements(GL_TRIANGLES, P.count, GL_UNSIGNED_INT,
+                       reinterpret_cast<void*>(0));
+    }
+
+    glBindVertexArray(0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glEnable(GL_BLEND);
+}
+
+} // namespace H3D

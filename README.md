@@ -77,6 +77,16 @@ if hl.plugin.hypr3d then
         window_scale = 0.5, -- window size multiplier: real pixel size at a base density of 100 px/m, times this
         spawn_distance = 5, -- distance from the camera where new windows spawn
         player_spawn = { x = 0, y = 0, z = 0 }, -- player spawn point in the room
+
+        -- Optional glTF 2.0 map (.glb / .gltf): meshes, textures and player
+        -- collision. Nodes named "nocol*" render but never collide.
+        -- map = {
+        --     path = "/path/to/map.glb",   -- omit or "" for the grid room
+        --     position = { x = 0, y = 0, z = 0 },
+        --     rotation = { x = 0, y = 0, z = 0 }, -- degrees, XYZ
+        --     scale = 1.0,
+        --     debug_collision = false, -- red x-ray wireframe of collision tris
+        -- },
         -- That's all for now :p
     })
 end

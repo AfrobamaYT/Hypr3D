@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Render/MapModel.hpp"
 #include "World/Camera.hpp"
 #include "World/Picking.hpp"
 
@@ -83,6 +84,42 @@ class GLScene {
     void reset();
     void shutdown();
 
+    // F3 debug HUD: collision wireframe + info text (coords/yaw/pitch/fps).
+    void setDebugOverlay(bool on) {
+        m_debugOverlay = on;
+    }
+
+    void setDebugFps(float fps) {
+        m_debugFps = fps;
+    }
+
+    // The glTF map. The path/transform come from config; the file is loaded
+    // lazily inside render() (EGL current there) and reloaded on mtime
+    // change. Collision reads the world-space triangles + generation.
+    void setMapPath(const std::string& path) {
+        m_mapPath = path;
+    }
+
+    void setMapDebugCollisions(bool on) {
+        m_map.setDebugCollisions(on);
+    }
+
+    void setMapTransform(const Vec3& position, const Vec3& rotationDeg,
+                         float scale) {
+        m_mapPosition    = position;
+        m_mapRotationDeg = rotationDeg;
+        m_mapScale       = scale;
+        m_map.setTransform(position, rotationDeg, scale);
+    }
+
+    const std::vector<CMapModel::STL>& mapTriangles() const {
+        return m_map.triangles();
+    }
+
+    uint32_t mapGeneration() const {
+        return m_map.generation();
+    }
+
     // Diagnostics: requests a single pixel readback from the offscreen scene
     // on the next frame. If it comes back with alpha below 255 the composite
     // is see-through by construction, not because of the entry fade.
@@ -95,6 +132,10 @@ class GLScene {
     bool createPrograms();
     bool createMeshes();
     bool ensureSceneFramebuffer(int width, int height);
+
+    void refreshMap();
+
+    void drawDebugOverlay(int width, int height);
 
     void destroyGLObjects();
 
@@ -206,6 +247,25 @@ class GLScene {
     Camera m_camera;
 
     float m_time = 0.0f;
+
+    // F3 debug HUD state.
+    bool                            m_debugOverlay = false;
+    float                           m_debugFps     = 0.f;
+
+    unsigned int                    m_textProgram  = 0;
+    unsigned int                    m_textVAO = 0, m_textVBO = 0;
+    int                             m_textScale = -1, m_textColor = -1;
+    int                             m_textVerts = 0;
+
+    // Map state (see setMapPath).
+    CMapModel                       m_map;
+    std::string                     m_mapPath;
+    std::string                     m_mapLoadedPath;
+    std::filesystem::file_time_type m_mapMtime{};
+    bool                            m_mapMtimeValid = false;
+    Vec3                            m_mapPosition{};
+    Vec3                            m_mapRotationDeg{};
+    float                           m_mapScale      = 1.0f;
 
     bool          m_probeRequested = false;
     bool          m_probeValid     = false;

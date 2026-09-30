@@ -33,6 +33,7 @@ extern "C" {
 #include "Render/GLScene.hpp"
 #include "Input/AimFocus.hpp"
 #include "Input/InputController.hpp"
+#include "World/MapCollision.hpp"
 #include "World/World3D.hpp"
 #include "HyprlandCompat/WindowsCompat.hpp"
 #include "HyprlandCompat/FocusCompat.hpp"
@@ -248,6 +249,16 @@ static float       g_cfgSensitivity   = 0.0025f; // radians per pointer count
 static float       g_cfgWindowScale   = 0.5f;    // room multiplier on window size
 static float       g_cfgSpawnDistance = 5.0f;    // units in front of the camera
 static std::string g_cfgPanorama;                // panorama image path
+
+// The glTF map: source file plus its placement in the room.
+static std::string g_cfgMapPath;
+static Vec3        g_mapPosition{};
+static Vec3        g_mapRotationDeg{};           // XYZ Euler, degrees
+static float       g_mapScale = 1.0f;
+static bool        g_mapDebugCollisions = false;
+
+static CMapCollision g_mapCollision;
+static uint32_t               g_mapCollisionGen = 0;
 
 static void notify(const std::string& text, const CHyprColor& color);
 
@@ -1800,12 +1811,49 @@ static void update3D(float dt) {
     g_scene.camera().moveSpeed = g_cfgMoveSpeed;
     g_input.setSensitivity(g_cfgSensitivity);
 
+    // Map: the scene owns the file/GL side; collision rebuilds its BVH
+    // whenever the map (re)loaded.
+    g_scene.setMapPath(g_cfgMapPath);
+    g_scene.setMapTransform(g_mapPosition, g_mapRotationDeg, g_mapScale);
+    g_scene.setMapDebugCollisions(g_mapDebugCollisions);
+
+    if (g_scene.mapGeneration() != g_mapCollisionGen) {
+        g_mapCollision.build(g_scene.mapTriangles());
+        g_mapCollisionGen = g_scene.mapGeneration();
+    }
+
     if (g_input.consumeLook(yawDelta, pitchDelta, dt)) {
         g_scene.rotateView(yawDelta, pitchDelta);
         damageCurrentMonitor();
     }
 
+    const Vec3 PREMOVE = g_scene.camera().position;
     applyCameraMovement(dt);
+
+    // Map collision: per-axis, minecraft-style slide. The player box is the
+    // body (0.6 x 1.8 x 0.6) whose centre sits kEyeHeight - 0.9 below the
+    // eyes. The flat-floor clamp in Camera::move stays as the fallback.
+    if (!g_mapCollision.empty()) {
+        auto& CAM = g_scene.camera();
+        const Vec3 DELTA = CAM.position - PREMOVE;
+
+        if (DELTA.x != 0.f || DELTA.y != 0.f || DELTA.z != 0.f) {
+            const Vec3 EYE_TO_BODY{
+                0.f,
+                Camera::kBodyHeight * 0.5f - Camera::kEyeHeight,
+                0.f,
+            };
+            const Vec3 HALF{
+                Camera::kBodyHalfWidth,
+                Camera::kBodyHeight * 0.5f,
+                Camera::kBodyHalfWidth,
+            };
+
+            Vec3 body = PREMOVE + EYE_TO_BODY;
+            g_mapCollision.moveAABB(body, DELTA, HALF);
+            CAM.position = body - EYE_TO_BODY;
+        }
+    }
 
     // decoration:blur feeds the frost overlay on transparent windows
     // (CConfigValue binds by name and works with both hyprland.conf and
@@ -2704,6 +2752,86 @@ static int luaConfig(lua_State* L) {
     } else if (!lua_isnil(L, -1)) {
         lua_pop(L, 1);
         return luaL_error(L, "hypr3d.config: panorama must be a string");
+    }
+    lua_pop(L, 1);
+
+    // map = { path = "..", position = {x,y,z}, rotation = {x,y,z} (degrees),
+    //         scale = 1.0 }
+    lua_getfield(L, 1, "map");
+    if (!lua_isnil(L, -1)) {
+        if (!lua_istable(L, -1)) {
+            lua_pop(L, 1);
+            return luaL_error(
+                L, "hypr3d.config: map must be a table with path/position/rotation/scale");
+        }
+
+        lua_getfield(L, -1, "path");
+        if (lua_isstring(L, -1)) {
+            size_t LEN = 0;
+            const char* S = lua_tolstring(L, -1, &LEN);
+            g_cfgMapPath.assign(S, LEN);
+        } else if (!lua_isnil(L, -1)) {
+            lua_pop(L, 2);
+            return luaL_error(L, "hypr3d.config: map.path must be a string");
+        }
+        lua_pop(L, 1);
+
+        const auto AXIS = [&](int tableIndex, const char* name, float& out) {
+            lua_getfield(L, tableIndex, name);
+            if (lua_isnumber(L, -1))
+                out = static_cast<float>(lua_tonumber(L, -1));
+            lua_pop(L, 1);
+        };
+
+        // Sub-tables keep unspecified axes at their current values.
+        lua_getfield(L, -1, "position");
+        if (lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+        } else if (!lua_istable(L, -1)) {
+            lua_pop(L, 2);
+            return luaL_error(L, "hypr3d.config: map.position must be a table { x = .., y = .., z = .. }");
+        } else {
+            AXIS(-1, "x", g_mapPosition.x);
+            AXIS(-1, "y", g_mapPosition.y);
+            AXIS(-1, "z", g_mapPosition.z);
+            lua_pop(L, 1);
+        }
+
+        lua_getfield(L, -1, "rotation");
+        if (lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+        } else if (!lua_istable(L, -1)) {
+            lua_pop(L, 2);
+            return luaL_error(L, "hypr3d.config: map.rotation must be a table { x = .., y = .., z = .. } (degrees)");
+        } else {
+            AXIS(-1, "x", g_mapRotationDeg.x);
+            AXIS(-1, "y", g_mapRotationDeg.y);
+            AXIS(-1, "z", g_mapRotationDeg.z);
+            lua_pop(L, 1);
+        }
+
+        lua_getfield(L, -1, "debug_collision");
+        if (lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+        } else if (!lua_isboolean(L, -1)) {
+            lua_pop(L, 2);
+            return luaL_error(L, "hypr3d.config: map.debug_collision must be a boolean");
+        } else {
+            g_mapDebugCollisions = lua_toboolean(L, -1) != 0;
+            lua_pop(L, 1);
+        }
+
+        lua_getfield(L, -1, "scale");
+        if (lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+        } else if (!lua_isnumber(L, -1)) {
+            lua_pop(L, 2);
+            return luaL_error(L, "hypr3d.config: map.scale must be a number");
+        } else {
+            g_mapScale = std::clamp(
+                static_cast<float>(lua_tonumber(L, -1)), 0.05f, 10.0f);
+            lua_pop(L, 1);
+        }
     }
     lua_pop(L, 1);
 

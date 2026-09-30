@@ -103,6 +103,12 @@ Mat4 Mat4::scale(const Vec3& v) {
     return out;
 }
 
+Mat4 Mat4::fromColumnMajor(const float src[16]) {
+    Mat4 r;
+    std::copy(src, src + 16, r.m.begin());
+    return r;
+}
+
 Mat4 operator*(const Mat4& a, const Mat4& b) {
     Mat4 r{};
     for (int c = 0; c < 4; ++c)

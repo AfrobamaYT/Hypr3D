@@ -27,6 +27,9 @@ struct Mat4 {
     static Mat4 rotationZ(float r);
     static Mat4 translation(const Vec3& v);
     static Mat4 scale(const Vec3& v);
+
+    // Adopt a column-major float[16] (the cgltf/glTF node matrix layout).
+    static Mat4 fromColumnMajor(const float src[16]);
 };
 
 Mat4 operator*(const Mat4& a, const Mat4& b);

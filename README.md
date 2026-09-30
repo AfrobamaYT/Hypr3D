@@ -61,15 +61,23 @@ hl.bind("SUPER + F12", hl.plugin.hypr3d.toggle)
 | Super + Left Alt              | Toggle keyboard mode (movement / window input)           |
 
 ## Configuration
-### Lua config
+### Lua config example:
 
 ```lua
 if hl.plugin.hypr3d then
+hl.bind("SUPER + F12", hl.plugin.hypr3d.toggle)
 hl.config({
     plugin = {
         hypr3d = {
             -- U can set a panorama pic:
-            panorama = "~/panorama.png",
+            panorama = "/home/samine/Downloads/Qwen_image_2.1_00048.png",
+            -- And other world parameters:
+            look_inertia = 0.03,
+            move_inertia = 0.05,
+            move_speed = 4.0, -- Walking speed, world m/s (default 8.0, range 0.5–50). Sprinting is ×2.5 this value
+            sensitivity = 0.0025, -- Mouse sensitivity, radians per pointer count (default 0.0025, range 0.0001–0.05)
+            window_scale = 0.5, -- Window scale relative to the world: a multiplier applied to their actual pixel size at a base density of 100 px/m (default 1.0, range 0.1–8)
+            spawn_distance = 5, -- distance from the camera to the spawn point for the new window (default 10.0, range 1–100)
             -- That's all for now :p
         },
     },

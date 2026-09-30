@@ -18,6 +18,15 @@
 #include <hyprland/src/pointer/PointerController.hpp>
 #include <hyprutils/memory/UniquePtr.hpp>
 
+// This system's lua headers (5.5) lost the extern "C" guard: including them
+// from C++ mangles the API names and the plugin fails to load with
+// "undefined symbol: _Z8lua_typeP9lua_Statei". liblua exports plain C
+// symbols, so the linkage is forced here.
+extern "C" {
+#include <lua.h>
+#include <lauxlib.h>
+}
+
 #include <linux/input-event-codes.h>
 #include <xkbcommon/xkbcommon.h>
 
@@ -110,6 +119,14 @@ struct SResizeGesture {
     Vector2D      grabPx{};
     int           edgeX = 0; // -1 left, +1 right
     int           edgeY = 0; // +1 top, -1 bottom
+};
+
+// Player spawn point in the room, set from lua via playerSpawnPoint().
+// Defaults to the classic spawn: X=0 Z=11 at standing eye height.
+static Vec3 g_playerSpawn{
+    0.0f,
+    Camera::kFloorY + Camera::kEyeHeight, // standing eye level
+    11.0f,
 };
 
 static SResizeGesture g_resize{};
@@ -226,8 +243,16 @@ static bool g_keySprint = false;
 
 static bool g_hookInstalled = false;
 
-// Optional panorama background, set via plugin:hypr3d:panorama in the config.
-static SP<Config::Values::CStringValue> g_panoramaValue;
+// Plugin settings, set from lua via hl.plugin.hypr3d.config({...}). Missing
+// keys keep their current value, so a partial config only touches what it
+// names; wrong-typed keys raise a lua error. Everything is clamped on set.
+static float       g_cfgLookInertia   = 0.03f;   // seconds, 0 = off
+static float       g_cfgMoveInertia   = 0.05f;   // seconds, 0 = off
+static float       g_cfgMoveSpeed     = 8.0f;    // world units / second
+static float       g_cfgSensitivity   = 0.0025f; // radians per pointer count
+static float       g_cfgWindowScale   = 1.0f;    // room multiplier on window size
+static float       g_cfgSpawnDistance = 10.0f;   // units in front of the camera
+static std::string g_cfgPanorama;                // panorama image path
 
 static void notify(const std::string& text, const CHyprColor& color);
 
@@ -235,10 +260,7 @@ static void notify(const std::string& text, const CHyprColor& color);
 // missing file is reported once per path, and the scene itself reloads the
 // texture when the file's mtime changes.
 static void updatePanorama() {
-    if (!g_panoramaValue)
-        return;
-
-    std::string path = g_panoramaValue->value();
+    std::string path = g_cfgPanorama;
 
     if (!path.empty() && path.starts_with('~')) {
         if (const char* HOME = getenv("HOME"))
@@ -618,6 +640,23 @@ static void updateAimFocus(float dt) {
     }
 }
 
+// Raw (pre-smoothstep) fullscreen transition progress. Shared so syncWorld
+// and applyFullscreenAnimation agree on the same instant.
+static float fsRawProgress() {
+    return std::clamp(
+        std::chrono::duration<float>(std::chrono::steady_clock::now() -
+                                     g_fsPhaseStart).count() /
+            kFsAnimDuration,
+        0.0f, 1.0f);
+}
+
+// The room's uniform window scale, clamped. Shared by syncWorld (quad size)
+// and the fullscreen animation (its endpoints must match what the room
+// renders, or the transition visibly jumps).
+static float configWindowScale() {
+    return std::clamp(g_cfgWindowScale, 0.1f, 8.0f);
+}
+
 static void syncWorld(const PHLMONITOR& mon, float dt) {
     // Deliberately free of side effects on the layout and the renderer. This
     // runs from render.stage, i.e. between the frame's startRenderPass() and
@@ -631,6 +670,8 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
 
     const float MONW = mon->m_size.x;
     const float MONH = mon->m_size.y;
+
+    const float WIN_SCALE = configWindowScale();
 
     std::vector<World3D::SEntity> ENTITIES;
     ENTITIES.reserve(INFOS.size());
@@ -685,34 +726,31 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         entity.surfaceWidth   = SNAPSHOT->surfaceSize.x;
         entity.surfaceHeight  = SNAPSHOT->surfaceSize.y;
 
+        // Uniform window scale from config, applied to every entity every
+        // frame so a runtime change resizes the whole room. The scale is
+        // uniform so the captured content never distorts.
+        entity.spawnScale = WIN_SCALE;
+
         // Seed pose: existing entities own their world position and rotation.
         // NEW windows spawn straight in front of the camera at a fixed read
-        // distance, facing it, scaled down to fit within kSpawnFit -- coming
-        // in at their full 2D pixel size would fill half the room. The scale
-        // is uniform so the captured content never distorts, and it persists
-        // for the entity's lifetime (the quad keeps following the box).
+        // distance, facing it.
         if (const auto* EXISTING = g_world.find(info.id)) {
             entity.center = EXISTING->center;
             entity.yaw = EXISTING->yaw;
             entity.pitch = EXISTING->pitch;
             entity.roll = EXISTING->roll;
-            entity.spawnScale = EXISTING->spawnScale;
         }
         else {
             const auto& CAM = g_scene.camera();
             const Vec3 FWD = CAM.forward();
 
-            entity.center = CAM.position + FWD * kSpawnDistance;
+            entity.center = CAM.position + FWD * g_cfgSpawnDistance;
 
             // Face the camera: with this model's convention (the normal's Y
             // component is -sin(pitch)) the target is the camera's own yaw
             // and pitch.
             entity.yaw   = std::atan2(-FWD.x, -FWD.z);
             entity.pitch = std::asin(std::clamp(FWD.y, -1.0f, 1.0f));
-
-            // The real box is 720x480 (set in ghostWindows before the first
-            // snapshot), so the quad follows it at scale 1.
-            entity.spawnScale = 1.0f;
         }
 
         // The quad size ALWAYS follows the snapshot box (times the spawn
@@ -721,6 +759,30 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         // on every resize.
         entity.width  = World3D::toWorld(BOX.w) * entity.spawnScale;
         entity.height = World3D::toWorld(BOX.h) * entity.spawnScale;
+
+        // Fullscreen transition: the animation owns this quad's size, and it
+        // MUST be applied here -- the draw list below is built from these
+        // values, so overriding later in applyFullscreenAnimation only
+        // reaches the render a frame late. That late frame is what leaked
+        // the config scale into the monitor-facing handoff and left a seam.
+        // The scale glides between the room's config scale and the screen's
+        // exact 1:1, following the same eased progress as the box lerp.
+        if (g_fsPhase != EFullscreenPhase::None) {
+            if (auto FSW = g_fsWindow.lock();
+                FSW && Compat::windowId(FSW) == info.id) {
+                const float RAWP = fsRawProgress();
+                const float p = RAWP * RAWP * (3.0f - 2.0f * RAWP);
+                const float ROOM_S = configWindowScale();
+                const float S0 =
+                    g_fsPhase == EFullscreenPhase::To2D ? ROOM_S : 1.0f;
+                const float S1 =
+                    g_fsPhase == EFullscreenPhase::To2D ? 1.0f : ROOM_S;
+                const float S = S0 + (S1 - S0) * p;
+
+                entity.width  = World3D::toWorld(BOX.w) * S;
+                entity.height = World3D::toWorld(BOX.h) * S;
+            }
+        }
 
         if (g_resize.active && g_resize.id == info.id) {
             const float DW = entity.width - g_resize.startWorldWidth;
@@ -897,14 +959,21 @@ static Vector2D worldPointToGlobalPx(
     const Vec3 LOCAL = g_world.localPoint(g_resize.id, point);
     const CBox CURRENT = Compat::currentWindowBox(g_resize.window);
 
+    // The quad spans toWorld(box) * spawnScale world units while carrying
+    // box pixels of content, so the px density on the quad is the room's
+    // base density divided by the scale.
+    const auto* RESIZE_ENTITY = g_world.find(g_resize.id);
+    const double scale =
+        RESIZE_ENTITY ? RESIZE_ENTITY->spawnScale : 1.0f;
+
     const double currentCenterX = CURRENT.x + CURRENT.w * 0.5;
     const double currentCenterY = CURRENT.y + CURRENT.h * 0.5;
 
     return {
         currentCenterX + static_cast<double>(LOCAL.x) *
-            World3D::LOGICAL_PX_PER_UNIT,
+            World3D::LOGICAL_PX_PER_UNIT / scale,
         currentCenterY - static_cast<double>(LOCAL.y) *
-            World3D::LOGICAL_PX_PER_UNIT,
+            World3D::LOGICAL_PX_PER_UNIT / scale,
     };
 }
 
@@ -1159,11 +1228,7 @@ static void applyFullscreenAnimation() {
         return;
     }
 
-    const float RAWP = std::clamp(
-        std::chrono::duration<float>(std::chrono::steady_clock::now() -
-                                     g_fsPhaseStart).count() /
-            kFsAnimDuration,
-        0.0f, 1.0f);
+    const float RAWP = fsRawProgress();
     g_fsRawP = RAWP; // feeds the composite alpha below
     float p = RAWP * RAWP * (3.0f - 2.0f * RAWP); // smoothstep
 
@@ -1218,9 +1283,22 @@ static void applyFullscreenAnimation() {
     if (auto W = g_fsWindow.lock())
         Compat::setWindowBox(W, BOX);
 
-    // The quad follows the animated box at the room's pixel density.
-    E->width  = World3D::toWorld(BOX.w) * E->spawnScale;
-    E->height = World3D::toWorld(BOX.h) * E->spawnScale;
+    // The quad follows the animated box at the room's pixel density. The
+    // fullscreen quad maps 1:1 onto the monitor by definition, so the room's
+    // window scale is suspended for its duration (syncWorld re-applies it
+    // once the window lands back in the room). The scale itself is lerped
+    // across the animation so the endpoints match their neighbours: the room
+    // side is the window at config scale, the monitor side is exact 1:1 --
+    // otherwise the quad visibly jumps at the handoff frames.
+    E->spawnScale = 1.0f;
+
+    const float ROOM_SCALE = configWindowScale();
+    const float S0 = A ? ROOM_SCALE : 1.0f;
+    const float S1 = A ? 1.0f : ROOM_SCALE;
+    const float S = S0 + (S1 - S0) * p; // p is the eased progress
+
+    E->width  = World3D::toWorld(BOX.w) * S;
+    E->height = World3D::toWorld(BOX.h) * S;
 
     // The roll decays to zero: the 2D fullscreen view has no roll, and the
     // quad must land matching what the compositor will render.
@@ -1547,6 +1625,17 @@ static void enter3D() {
     g_world.clear();
     g_renderWindows.clear();
 
+    // Player spawn point (hl.plugin.hypr3d.playerSpawnPoint), facing the
+    // world centre.
+    {
+        auto& CAM = g_scene.camera();
+        CAM.position = g_playerSpawn;
+
+        // Camera forward is {sin yaw, ., -cos yaw}: looking at the origin
+        // from (x, z) means yaw = atan2(-x, z).
+        CAM.yaw = std::atan2(-g_playerSpawn.x, g_playerSpawn.z);
+    }
+
     g_capture.releaseAll();
 
     resetMovementKeys();
@@ -1655,9 +1744,7 @@ static void applyCameraMovement(float dt) {
 
     auto& CAM = g_scene.camera();
 
-    static const CConfigValue<Config::FLOAT> PMOVEINERTIA(
-        "plugin:hypr3d:move_inertia");
-    const float tau = std::clamp(static_cast<float>(*PMOVEINERTIA), 0.0f, 1.0f);
+    const float tau = g_cfgMoveInertia;
 
     const bool MOVING = FORWARD != 0.f || STRAFE != 0.f || VERTICAL != 0.f;
 
@@ -1712,12 +1799,11 @@ static void update3D(float dt) {
 
     // Look/movement stay live during the fullscreen transition: the To2D end
     // pose tracks the camera, so the quad keeps converging onto the view.
-    {
-        static const CConfigValue<Config::FLOAT> PLOOKINERTIA(
-            "plugin:hypr3d:look_inertia");
-        g_input.setLookSmoothing(
-            std::clamp(static_cast<float>(*PLOOKINERTIA), 0.0f, 1.0f));
-    }
+    // Plugin settings come from lua (hl.plugin.hypr3d.config) and are
+    // already clamped at set time.
+    g_input.setLookSmoothing(g_cfgLookInertia);
+    g_scene.camera().moveSpeed = g_cfgMoveSpeed;
+    g_input.setSensitivity(g_cfgSensitivity);
 
     if (g_input.consumeLook(yawDelta, pitchDelta, dt)) {
         g_scene.rotateView(yawDelta, pitchDelta);
@@ -2569,6 +2655,91 @@ static void onKeyboardKey(
 
 // --- plugin entry -----------------------------------------------------------
 
+static int luaConfig(lua_State* L) {
+    // hl.plugin.hypr3d.config({
+    //     panorama = "/path/to/image.png",
+    //     look_inertia = 0.03,   -- seconds, 0 = off
+    //     move_inertia = 0.05,   -- seconds, 0 = off
+    //     move_speed = 8.0,      -- world units / second
+    //     sensitivity = 0.0025,  -- radians per pointer count
+    //     window_scale = 1.0,    -- room multiplier on window size
+    //     spawn_distance = 10.0, -- units in front of the camera
+    //     player_spawn = { x = 0, y = -4.13, z = 11 },
+    // })
+    //
+    // Missing keys keep their current value; wrong-typed keys raise a lua
+    // error. Everything is clamped on set.
+    if (!lua_istable(L, 1))
+        return luaL_error(L, "hypr3d.config expects a single table");
+
+    const auto SET_NUM = [&](const char* key, float& out,
+                             float lo, float hi) -> bool {
+        lua_getfield(L, 1, key);
+        if (lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+            return true;
+        }
+        if (!lua_isnumber(L, -1)) {
+            lua_pop(L, 1);
+            return false;
+        }
+        out = std::clamp(static_cast<float>(lua_tonumber(L, -1)), lo, hi);
+        lua_pop(L, 1);
+        return true;
+    };
+
+    if (!SET_NUM("look_inertia", g_cfgLookInertia, 0.0f, 1.0f))
+        return luaL_error(L, "hypr3d.config: look_inertia must be a number");
+    if (!SET_NUM("move_inertia", g_cfgMoveInertia, 0.0f, 1.0f))
+        return luaL_error(L, "hypr3d.config: move_inertia must be a number");
+    if (!SET_NUM("move_speed", g_cfgMoveSpeed, 0.5f, 50.0f))
+        return luaL_error(L, "hypr3d.config: move_speed must be a number");
+    if (!SET_NUM("sensitivity", g_cfgSensitivity, 0.0001f, 0.05f))
+        return luaL_error(L, "hypr3d.config: sensitivity must be a number");
+    if (!SET_NUM("window_scale", g_cfgWindowScale, 0.1f, 8.0f))
+        return luaL_error(L, "hypr3d.config: window_scale must be a number");
+    if (!SET_NUM("spawn_distance", g_cfgSpawnDistance, 1.0f, 100.0f))
+        return luaL_error(L, "hypr3d.config: spawn_distance must be a number");
+
+    lua_getfield(L, 1, "panorama");
+    if (lua_isstring(L, -1)) {
+        size_t LEN = 0;
+        const char* S = lua_tolstring(L, -1, &LEN);
+        g_cfgPanorama.assign(S, LEN);
+    } else if (!lua_isnil(L, -1)) {
+        lua_pop(L, 1);
+        return luaL_error(L, "hypr3d.config: panorama must be a string");
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, 1, "player_spawn");
+    if (!lua_isnil(L, -1)) {
+        if (!lua_istable(L, -1)) {
+            lua_pop(L, 1);
+            return luaL_error(
+                L, "hypr3d.config: player_spawn must be a table { x = .., y = .., z = .. }");
+        }
+
+        const auto AXIS = [&](const char* name, float& out) {
+            lua_getfield(L, -1, name);
+            if (lua_isnumber(L, -1))
+                out = static_cast<float>(lua_tonumber(L, -1));
+            lua_pop(L, 1);
+        };
+
+        AXIS("x", g_playerSpawn.x);
+        AXIS("y", g_playerSpawn.y);
+        AXIS("z", g_playerSpawn.z);
+
+        // The player's feet cannot go below the floor anyway.
+        g_playerSpawn.y = std::clamp(
+            g_playerSpawn.y, Camera::kFloorY + Camera::kEyeHeight, 100.0f);
+    }
+    lua_pop(L, 1);
+
+    return 0;
+}
+
 static int luaToggle(lua_State*) {
     toggle3D();
     return 0;
@@ -2652,44 +2823,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "close", luaClose))
         throw std::runtime_error("[hypr3d] failed to register Lua close");
 
-    g_panoramaValue = makeShared<Config::Values::CStringValue>(
-        "plugin:hypr3d:panorama",
-        "3D room panorama background: equirectangular image path",
-        Config::STRING{},
-        Config::Values::SStringValueOptions{}
-    );
-
-    if (!HyprlandAPI::addConfigValueV2(PHANDLE, g_panoramaValue))
-        notify(
-            "[hypr3d] failed to register plugin:hypr3d:panorama",
-            CHyprColor{1.0f, 0.6f, 0.2f, 1.0f}
-        );
-
-    static auto SPHlookInertia = makeShared<Config::Values::CFloatValue>(
-        "plugin:hypr3d:look_inertia",
-        "Mouse-look glide after the mouse stops, seconds (0 = off)",
-        0.03f,
-        Config::Values::SFloatValueOptions{.min = 0.0f, .max = 1.0f}
-    );
-
-    if (!HyprlandAPI::addConfigValueV2(PHANDLE, SPHlookInertia))
-        notify(
-            "[hypr3d] failed to register plugin:hypr3d:look_inertia",
-            CHyprColor{1.0f, 0.6f, 0.2f, 1.0f}
-        );
-
-    static auto SPHmoveInertia = makeShared<Config::Values::CFloatValue>(
-        "plugin:hypr3d:move_inertia",
-        "WASD glide after the keys are released, seconds (0 = off)",
-        0.05f,
-        Config::Values::SFloatValueOptions{.min = 0.0f, .max = 1.0f}
-    );
-
-    if (!HyprlandAPI::addConfigValueV2(PHANDLE, SPHmoveInertia))
-        notify(
-            "[hypr3d] failed to register plugin:hypr3d:move_inertia",
-            CHyprColor{1.0f, 0.6f, 0.2f, 1.0f}
-        );
+    if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "config", luaConfig))
+        throw std::runtime_error("[hypr3d] failed to register Lua config");
 
     static auto renderPre =
         Event::bus()->m_events.render.pre.listen(

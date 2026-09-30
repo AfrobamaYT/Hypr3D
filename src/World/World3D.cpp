@@ -185,14 +185,16 @@ bool CWorld::startDrag(
     m_drag.id = id;
     m_drag.distance = DIST;
     m_drag.targetDistance = DIST;
-    // grabLocal is in BOX units; the rendered quad is box * spawnScale, so
-    // scale the offset to match or the grabbed point drifts off the crosshair.
+    // grabLocal is the grabbed point's offset from the centre in WORLD units
+    // (hit.point and center are both world), so it needs no scale factor:
+    // updateDrag rotates it back with the same pose and subtracts it from the
+    // carried point.
     m_drag.grabLocal = inverseRotate(
         hit.point - ENTITY->center,
         ENTITY->yaw,
         ENTITY->pitch,
         ENTITY->roll
-    ) * ENTITY->spawnScale;
+    );
 
     return true;
 }

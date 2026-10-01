@@ -154,10 +154,9 @@ void Camera::move(float forward, float right, float vertical, float dt) {
     // is what makes WASD feel like walking instead of like a flying camera.
     position += flatForward() * (forward * moveSpeed * dt);
 
-    // The 3D room has a real floor. Q/E (and now Shift/Space) can move the
-    // camera vertically, but the body's feet never sink through the floor
-    // plane: the eye stops at eye height above it.
-    position.y = std::max(position.y, kFloorY + kEyeHeight);
+    // No world floor clamp: the visible grid platform is a real collidable
+    // slab (built in main.cpp), and everywhere past its edge the player can
+    // descend freely.
 }
 
 Vec3 Camera::flatForward() const {
@@ -169,9 +168,6 @@ void Camera::displace(const Vec3& worldVelocity, float dt) {
         return;
 
     position += worldVelocity * dt;
-
-    // Same floor rule as move(): the feet never sink through the floor plane.
-    position.y = std::max(position.y, kFloorY + kEyeHeight);
 }
 
 Vec3 Camera::forward() const {

@@ -61,6 +61,143 @@ bool rayTriangle(const Vec3& o, const Vec3& d, const CMapCollision::STL& t,
     return true;
 }
 
+// Closest point on a 2D triangle (x, z projected) to point p. Degenerate
+// (zero-area) projections fall back to edge searches.
+static Vec3 closestTri2D(const CMapCollision::STL& t, float px, float pz) {
+    const float A[2] = {t.a.x, t.a.z}, B[2] = {t.b.x, t.b.z}, C[2] = {t.c.x, t.c.z};
+    const float P[2] = {px, pz};
+
+    const float AB[2] = {B[0] - A[0], B[1] - A[1]};
+    const float AC[2] = {C[0] - A[0], C[1] - A[1]};
+    const float AP[2] = {P[0] - A[0], P[1] - A[1]};
+
+    const float DOT_AB_AC = AB[0] * AC[0] + AB[1] * AC[1];
+    const float DOT_AB_AP = AB[0] * AP[0] + AB[1] * AP[1];
+    const float DOT_AC_AP = AC[0] * AP[0] + AC[1] * AP[1];
+    const float DOT_AB_AB = AB[0] * AB[0] + AB[1] * AB[1];
+    const float DOT_AC_AC = AC[0] * AC[0] + AC[1] * AC[1];
+
+    const float DET = DOT_AB_AB * DOT_AC_AC - DOT_AB_AC * DOT_AB_AC;
+    if (DET < 1e-12f) {
+        // Degenerate projection: nearest point among the three edges.
+        const auto EDGE = [&](const float U[2], const float V[2]) {
+            const float E[2] = {V[0] - U[0], V[1] - U[1]};
+            float TT = ((P[0] - U[0]) * E[0] + (P[1] - U[1]) * E[1]) /
+                (E[0] * E[0] + E[1] * E[1] + 1e-20f);
+            TT = std::clamp(TT, 0.f, 1.f);
+            return Vec3{U[0] + E[0] * TT, 0.f, U[1] + E[1] * TT};
+        };
+        const Vec3 E1 = EDGE(A, B), E2 = EDGE(B, C), E3 = EDGE(C, A);
+        const auto D2 = [&](const Vec3& Q) {
+            const float DX = Q.x - px, DZ = Q.z - pz;
+            return DX * DX + DZ * DZ;
+        };
+        Vec3 best = E1;
+        if (D2(E2) < D2(best))
+            best = E2;
+        if (D2(E3) < D2(best))
+            best = E3;
+        return best;
+    }
+
+    float S = (DOT_AC_AP * DOT_AB_AC - DOT_AB_AP * DOT_AC_AC) / DET;
+    float T = (DOT_AB_AP * DOT_AB_AC - DOT_AC_AP * DOT_AB_AB) / DET;
+
+    if (S < 0.f || T < 0.f || S + T > 1.f) {
+        // Outside: nearest of the three edges.
+        float bestD = 1e30f;
+        Vec3  best = t.a;
+        const auto TRY_EDGE = [&](const float U[2], const float V[2]) {
+            const float E[2] = {V[0] - U[0], V[1] - U[1]};
+            float TT = ((P[0] - U[0]) * E[0] + (P[1] - U[1]) * E[1]) /
+                (E[0] * E[0] + E[1] * E[1] + 1e-20f);
+            TT = std::clamp(TT, 0.f, 1.f);
+            const float QX = U[0] + E[0] * TT, QZ = U[1] + E[1] * TT;
+            const float D = (QX - px) * (QX - px) + (QZ - pz) * (QZ - pz);
+            if (D < bestD) {
+                bestD = D;
+                best  = Vec3{QX, 0.f, QZ};
+            }
+        };
+        TRY_EDGE(A, B);
+        TRY_EDGE(B, C);
+        TRY_EDGE(C, A);
+        return best;
+    }
+
+    return Vec3{A[0] + AB[0] * S + AC[0] * T, 0.f, A[1] + AB[1] * S + AC[1] * T};
+}
+
+// Ericson: closest point on a 3D triangle to p.
+static Vec3 closestTri3D(const CMapCollision::STL& t, const Vec3& p) {
+    const Vec3 AB = t.b - t.a;
+    const Vec3 AC = t.c - t.a;
+    const Vec3 AP = p - t.a;
+
+    const float D1 = dot(AB, AP);
+    const float D2 = dot(AC, AP);
+    if (D1 <= 0.f && D2 <= 0.f)
+        return t.a;
+
+    const Vec3 BP = p - t.b;
+    const float D3 = dot(AB, BP);
+    const float D4 = dot(AC, BP);
+    if (D3 >= 0.f && D4 <= D3)
+        return t.b;
+
+    const Vec3 CP = p - t.c;
+    const float D5 = dot(AB, CP);
+    const float D6 = dot(AC, CP);
+    if (D6 >= 0.f && D5 <= D6)
+        return t.c;
+
+    const float VC = D1 * D4 - D3 * D2;
+    if (VC <= 0.f && D1 >= 0.f && D3 <= 0.f) {
+        const float V = D1 / (D1 - D3);
+        return t.a + AB * V;
+    }
+
+    const float VB = D5 * D2 - D1 * D6;
+    if (VB <= 0.f && D2 >= 0.f && D6 <= 0.f) {
+        const float V = D2 / (D2 - D6);
+        return t.a + AC * V;
+    }
+
+    const float VA = D3 * D6 - D5 * D4;
+    if (VA <= 0.f && (D4 - D3) >= 0.f && (D5 - D6) >= 0.f) {
+        const float V = (D4 - D3) / ((D4 - D3) + (D5 - D6));
+        return t.b + (t.c - t.b) * V;
+    }
+
+    const float DEN = 1.f / (VA + VB + VC);
+    const float V = VB * DEN;
+    const float W = VC * DEN;
+    return t.a + AB * V + AC * W;
+}
+
+// Closest points between a (near-vertical) segment and a triangle.
+static void segTriClosest(const Vec3& a, const Vec3& b,
+                          const CMapCollision::STL& t, Vec3& outSeg,
+                          Vec3& outTri) {
+    // Seed with the triangle point closest to the vertical line, then
+    // refine both ways once. The segment is vertical in this engine, so the
+    // 2D seed is near-optimal. The segment point MUST stay on the segment's
+    // own axis (x, z from a) -- taking the triangle point's x/z made the
+    // pair collapse to zero distance exactly at contact and killed the
+    // push-out.
+    const float YMIN = std::min(a.y, b.y), YMAX = std::max(a.y, b.y);
+
+    Vec3 P = closestTri2D(t, a.x, a.z);
+    P.y = std::clamp(P.y, YMIN, YMAX);
+
+    Vec3 tri = closestTri3D(t, P);
+    Vec3 seg{a.x, std::clamp(tri.y, YMIN, YMAX), a.z};
+    tri = closestTri3D(t, seg);
+
+    outSeg = seg;
+    outTri = tri;
+}
+
 } // namespace
 
 // --- build ------------------------------------------------------------------
@@ -349,9 +486,12 @@ bool CMapCollision::moveAABB(Vec3& position, const Vec3& delta,
     const Vec3   START = position;
     const bool BLOCKED_X = RESOLVE(position, 0, delta.x);
     const bool BLOCKED_Z = RESOLVE(position, 2, delta.z);
-    RESOLVE(position, 1, delta.y);
+    const bool Y_GROUNDED = RESOLVE(position, 1, delta.y);
+    grounded = Y_GROUNDED;
 
     // Step-up retry: the same horizontal move from STEP above, then settle.
+    // The probe's own downward settle must NOT leak its grounded flag into
+    // the result when the step is rejected.
     if (BLOCKED_X || BLOCKED_Z) {
         Vec3 stepped{START.x, START.y + STEP, START.z};
         RESOLVE(stepped, 0, delta.x);
@@ -366,7 +506,116 @@ bool CMapCollision::moveAABB(Vec3& position, const Vec3& delta,
         if (LANDED && PROG_STEP > PROG_BASE + 1e-3f) {
             position = stepped;
             grounded = true;
+        } else {
+            grounded = Y_GROUNDED; // the probe's settle must not leak
         }
+    }
+
+    return grounded;
+}
+
+bool CMapCollision::moveCapsule(Vec3& feet, const Vec3& delta, float radius,
+                                float height, bool* ceiling) const {
+    if (m_tris.empty()) {
+        if (ceiling)
+            *ceiling = false;
+        return false;
+    }
+
+    bool grounded = false;
+    std::vector<uint32_t> near_;
+
+    // Auto step-up: thresholds and seams must not stop the walk.
+    constexpr float STEP = 0.35f;
+
+    const auto SEG = [&](const Vec3& f, Vec3& a, Vec3& b) {
+        a = Vec3{f.x, f.y + radius, f.z};
+        b = Vec3{f.x, f.y + height - radius, f.z};
+    };
+
+    // Push the capsule out of every nearby triangle, a few iterations so
+    // corner contacts settle. `up` = an upward contact grounded the capsule;
+    // `down` = a downward contact hit a ceiling.
+    const auto DEPENETRATE = [&](Vec3& f, bool& down) -> bool {
+        bool up = false;
+        down = false;
+
+        for (int it = 0; it < 4; ++it) {
+            Vec3 a, b;
+            SEG(f, a, b);
+
+            Vec3 lo{std::min(a.x, b.x) - radius, std::min(a.y, b.y) - radius,
+                    std::min(a.z, b.z) - radius};
+            Vec3 hi{std::max(a.x, b.x) + radius, std::max(a.y, b.y) + radius,
+                    std::max(a.z, b.z) + radius};
+
+            near_.clear();
+            query(lo, hi, near_);
+
+            bool pushed = false;
+            for (const auto I : near_) {
+                Vec3 qa, qb;
+                segTriClosest(a, b, m_tris[I], qa, qb);
+
+                const Vec3 D = qa - qb;
+                const float DIST = std::sqrt(dot(D, D));
+                if (DIST >= radius || DIST < 1e-7f)
+                    continue;
+
+                const Vec3 N = D * (1.f / DIST);
+                f = f + N * (radius - DIST);
+                pushed = true;
+
+                if (N.y > 0.5f)
+                    up = true;
+                if (N.y < -0.5f)
+                    down = true;
+
+                SEG(f, a, b); // refresh for the remaining triangles
+            }
+
+            if (!pushed)
+                break;
+        }
+
+        return up;
+    };
+
+    const Vec3 START = feet;
+
+    feet += delta;
+    bool ceilingHit = false;
+    const bool WALK_GROUNDED = DEPENETRATE(feet, ceilingHit);
+
+    // Only the real move may report the bump: the step-up probe's contacts
+    // are discarded along with its position.
+    if (ceiling)
+        *ceiling = ceilingHit;
+
+    // Horizontal progress vs intent: if the push-out ate most of the move,
+    // retry the whole move from STEP above and settle back down.
+    const float PROG = std::fabs(feet.x - START.x) + std::fabs(feet.z - START.z);
+    const float WANT = std::fabs(delta.x) + std::fabs(delta.z);
+
+    if (WANT > 1e-5f && PROG < WANT * 0.5f) {
+        Vec3 stepped{START.x, START.y + STEP, START.z};
+        stepped += delta;
+        bool probeDown = false;
+        DEPENETRATE(stepped, probeDown);
+        stepped += Vec3{0.f, -(STEP + 0.02f), 0.f};
+        const bool LANDED = DEPENETRATE(stepped, probeDown);
+
+        const float PROG_STEP = std::fabs(stepped.x - START.x) +
+            std::fabs(stepped.z - START.z);
+
+        if (LANDED && PROG_STEP > PROG + 1e-3f) {
+            feet     = stepped;
+            grounded = true;
+        } else {
+            grounded = WALK_GROUNDED;
+        }
+    } else {
+        grounded = WALK_GROUNDED;
     }
 
     return grounded;

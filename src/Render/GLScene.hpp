@@ -93,6 +93,19 @@ class GLScene {
         m_debugFps = fps;
     }
 
+    void setMapEmissiveScale(float s) {
+        m_map.setEmissiveScale(s);
+    }
+
+    void setMapFlat(bool flat) {
+        m_map.setFlat(flat);
+    }
+
+    // The base grid platform (world zero): visible + collidable.
+    void setGridVisible(bool on) {
+        m_gridVisible = on;
+    }
+
     // The glTF map. The path/transform come from config; the file is loaded
     // lazily inside render() (EGL current there) and reloaded on mtime
     // change. Collision reads the world-space triangles + generation.
@@ -105,7 +118,7 @@ class GLScene {
     }
 
     void setMapTransform(const Vec3& position, const Vec3& rotationDeg,
-                         float scale) {
+                         const Vec3& scale) {
         m_mapPosition    = position;
         m_mapRotationDeg = rotationDeg;
         m_mapScale       = scale;
@@ -250,12 +263,10 @@ class GLScene {
 
     // F3 debug HUD state.
     bool                            m_debugOverlay = false;
+    bool                            m_gridVisible  = true;
     float                           m_debugFps     = 0.f;
 
-    unsigned int                    m_textProgram  = 0;
     unsigned int                    m_textVAO = 0, m_textVBO = 0;
-    int                             m_textScale = -1, m_textColor = -1;
-    int                             m_textVerts = 0;
 
     // Map state (see setMapPath).
     CMapModel                       m_map;
@@ -265,7 +276,7 @@ class GLScene {
     bool                            m_mapMtimeValid = false;
     Vec3                            m_mapPosition{};
     Vec3                            m_mapRotationDeg{};
-    float                           m_mapScale      = 1.0f;
+    Vec3                            m_mapScale{1.0f, 1.0f, 1.0f};
 
     bool          m_probeRequested = false;
     bool          m_probeValid     = false;

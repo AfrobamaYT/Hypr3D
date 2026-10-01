@@ -47,7 +47,9 @@ class Camera {
     // so it never loses float precision after long sessions.
     static constexpr float kPitchLimit = 1.5f;
     static constexpr float kTau        = 6.28318530717958647692f;
-    static constexpr float kFloorY     = -5.75f;
+    // The grid platform's plane: world zero. Feet-level coords (player
+    // spawn, walking clamp) are measured against it.
+    static constexpr float kFloorY     = 0.0f;
 
     // Minecraft-style player body: an axis-aligned 0.6 x 1.8 x 0.6 box. The
     // eye sits 1.62 above the feet, so standing on the floor means the camera

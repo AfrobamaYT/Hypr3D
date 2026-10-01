@@ -123,8 +123,6 @@ struct SResizeGesture {
 };
 
 // Player spawn point in the room, set via hl.plugin.hypr3d.config().
-static Vec3 g_playerSpawn{0.0f, 0.0f, 0.0f};
-
 static SResizeGesture g_resize{};
 
 // Guards against a snapshot triggering another copy of the plugin inside
@@ -242,23 +240,44 @@ static bool g_hookInstalled = false;
 // Plugin settings, set from lua via hl.plugin.hypr3d.config({...}). Missing
 // keys keep their current value, so a partial config only touches what it
 // names; wrong-typed keys raise a lua error. Everything is clamped on set.
+// --- world ------------------------------------------------------------------
+static std::string g_cfgPanorama;                // panorama image path
+static bool        g_cfgGrid = true;             // base grid platform on/off
+
+// --- windows ----------------------------------------------------------------
+static float       g_cfgWindowScale   = 0.5f;    // room multiplier on window size
+static float       g_cfgSpawnDistance = 5.0f;    // units in front of the camera
+
+// --- player -----------------------------------------------------------------
 static float       g_cfgLookInertia   = 0.03f;   // seconds, 0 = off
 static float       g_cfgMoveInertia   = 0.05f;   // seconds, 0 = off
 static float       g_cfgMoveSpeed     = 4.0f;    // world units / second
 static float       g_cfgSensitivity   = 0.0025f; // radians per pointer count
-static float       g_cfgWindowScale   = 0.5f;    // room multiplier on window size
-static float       g_cfgSpawnDistance = 5.0f;    // units in front of the camera
-static std::string g_cfgPanorama;                // panorama image path
+static bool        g_playerFlying     = true;    // false = walk / jump / gravity
 
-// The glTF map: source file plus its placement in the room.
+// Feet position; eyes ride kEyeHeight above (spawn 0,0,0 = standing on
+// the grid platform at world zero).
+static Vec3 g_playerSpawn{0.0f, 0.0f, 0.0f};
+
+// Walking physics state.
+static bool  g_grounded    = false;
+static float g_verticalVel = 0.0f;
+
+// --- map --------------------------------------------------------------------
 static std::string g_cfgMapPath;
 static Vec3        g_mapPosition{};
 static Vec3        g_mapRotationDeg{};           // XYZ Euler, degrees
-static float       g_mapScale = 1.0f;
-static bool        g_mapDebugCollisions = false;
+static Vec3        g_mapScale{1.0f, 1.0f, 1.0f}; // per-axis
+static float       g_mapEmissiveScale = 1.0f;
+static bool        g_mapFlat = true;
+static bool        g_mapCollisionOn = true;
+
+// F3 debug HUD: collision wireframe + room info overlay.
+static bool        g_debugHud = false;
+static float       g_debugFps = 0.0f;
 
 static CMapCollision g_mapCollision;
-static uint32_t               g_mapCollisionGen = 0;
+static uint64_t      g_mapCollisionSetup = 0;
 
 static void notify(const std::string& text, const CHyprColor& color);
 
@@ -303,6 +322,7 @@ static uint64_t g_diagSinkCalls   = 0;
 static Vector2D g_diagLastPos{};
 static double   g_diagLastDx = 0.0;
 static double   g_diagLastDy = 0.0;
+static double   g_diagLastZoomStep = 0.0; // normalized wheel steps (+ = forward)
 static Vector2D g_diagPinned{};
 static bool     g_diagPinnedValid = false;
 static bool     g_warping         = false;
@@ -1160,11 +1180,44 @@ static void startTo3D() {
 }
 
 // None -> To2D when a fullscreen window appears; In2D -> To3D when it goes.
+// Hyprland fades windows with per-window alpha animations that only make
+// progress while the window is being damaged: during the fullscreen
+// handoff the non-FS windows fade out (their FADE/FULLSCREEN alpha channels
+// animate toward 0), and on the way back they fade in. Mid-fade the
+// compositor stops damaging them -- the animation freezes a couple of
+// frames in, and the room shows windows stuck at partial alpha until an
+// aim hover forces a frame (the user-diagnosed semi-transparent-after-FS
+// bug). Damage every window whose alpha channels are still in flight; the
+// damage drives the fade to completion and the loop stops on its own.
+static void damageWindowsWithLiveAlpha(const PHLMONITOR& mon) {
+    if (!Desktop::windowState() || !mon || !mon->m_activeWorkspace)
+        return;
+
+    for (const auto& W : Desktop::windowState()->windows()) {
+        if (!W || W->m_workspace != mon->m_activeWorkspace)
+            continue;
+
+        const bool FADE_IN_FLIGHT =
+            W->alphaValue(Desktop::View::WINDOW_ALPHA_FADE) !=
+            W->alphaGoal(Desktop::View::WINDOW_ALPHA_FADE);
+        const bool FS_IN_FLIGHT =
+            W->alphaValue(Desktop::View::WINDOW_ALPHA_FULLSCREEN) !=
+            W->alphaGoal(Desktop::View::WINDOW_ALPHA_FULLSCREEN);
+
+        if (FADE_IN_FLIGHT || FS_IN_FLIGHT)
+            g_pHyprRenderer->damageWindow(W);
+    }
+}
+
 static void pollFullscreen() {
     const auto MON = targetMonitor();
 
     if (!MON)
         return;
+
+    // The alpha keepalive rides the pump (8 ms) rather than the render pass,
+    // so the fade keeps ticking even when a frame is slow.
+    damageWindowsWithLiveAlpha(MON);
 
     const auto FSW = Fullscreen::controller()->getFullscreenWindow(MON);
 
@@ -1631,11 +1684,16 @@ static void enter3D() {
     g_world.clear();
     g_renderWindows.clear();
 
-    // Player spawn point (hl.plugin.hypr3d.playerSpawnPoint), facing the
-    // world centre.
+    // Player spawn point (config player_spawn): the coordinates are the
+    // player's FEET, so spawning at 0,0,0 stands on the grid platform at
+    // world zero instead of falling through it. Eyes ride kEyeHeight above.
     {
         auto& CAM = g_scene.camera();
-        CAM.position = g_playerSpawn;
+        CAM.position = Vec3{
+            g_playerSpawn.x,
+            g_playerSpawn.y + Camera::kEyeHeight,
+            g_playerSpawn.z,
+        };
 
         // Camera forward is {sin yaw, ., -cos yaw}: looking at the origin
         // from (x, z) means yaw = atan2(-x, z).
@@ -1645,6 +1703,9 @@ static void enter3D() {
     g_capture.releaseAll();
 
     resetMovementKeys();
+
+    g_grounded    = false;
+    g_verticalVel = 0.0f;
 
     g_keyboardMode = EKeyboardMode::Space;
     g_altHeld      = false;
@@ -1744,15 +1805,60 @@ static float updateTransition() {
 static Vec3 s_moveVel{};
 
 static void applyCameraMovement(float dt) {
-    const float FORWARD  = (g_keyFwd ? 1.f : 0.f) - (g_keyBack ? 1.f : 0.f);
-    const float STRAFE   = (g_keyRight ? 1.f : 0.f) - (g_keyLeft ? 1.f : 0.f);
-    const float VERTICAL = (g_keyUp ? 1.f : 0.f) - (g_keyDown ? 1.f : 0.f);
+    float FORWARD  = (g_keyFwd ? 1.f : 0.f) - (g_keyBack ? 1.f : 0.f);
+    float STRAFE   = (g_keyRight ? 1.f : 0.f) - (g_keyLeft ? 1.f : 0.f);
+    float VERTICAL = (g_keyUp ? 1.f : 0.f) - (g_keyDown ? 1.f : 0.f);
 
     auto& CAM = g_scene.camera();
 
-    const float tau = g_cfgMoveInertia;
+    // Walking mode: Shift does nothing (gravity owns vertical), Space is a
+    // jump impulse handled in the key handler.
+    if (!g_playerFlying)
+        VERTICAL = 0.f;
+
+    // Diagonals must not be faster than a straight run: W+D used to add the
+    // two key speeds into a sqrt(2)x diagonal.
+    {
+        const float LEN = std::sqrt(FORWARD * FORWARD + STRAFE * STRAFE);
+        if (LEN > 1.0f) {
+            FORWARD /= LEN;
+            STRAFE /= LEN;
+        }
+    }
 
     const bool MOVING = FORWARD != 0.f || STRAFE != 0.f || VERTICAL != 0.f;
+
+    if (!g_playerFlying) {
+        // --- walking: gravity owns the vertical axis, jump rides it ---
+        constexpr float GRAVITY  = 14.0f;
+        constexpr float TERMINAL = 40.0f;
+
+        g_verticalVel -= GRAVITY * dt;
+        if (g_verticalVel < -TERMINAL)
+            g_verticalVel = -TERMINAL;
+
+        const float    SPEED = CAM.moveSpeed * (g_keySprint ? 2.5f : 1.0f);
+        const Vec3     TARGET =
+            CAM.flatForward() * (FORWARD * SPEED) +
+            CAM.right() * (STRAFE * SPEED);
+
+        const float tau = g_cfgMoveInertia;
+        if (tau > 0.0f && dt > 0.0f)
+            s_moveVel += (TARGET - s_moveVel) * (1.0f - std::exp(-dt / tau));
+        else
+            s_moveVel = TARGET;
+
+        const bool MOVING_H = FORWARD != 0.f || STRAFE != 0.f;
+        if (!MOVING_H && std::fabs(s_moveVel.x) + std::fabs(s_moveVel.z) < 0.01f)
+            s_moveVel = Vec3{0.f, 0.f, s_moveVel.y};
+
+        const Vec3 STEP = s_moveVel + Vec3{0.f, g_verticalVel, 0.f};
+        CAM.displace(STEP, dt);
+        damageCurrentMonitor();
+        return;
+    }
+
+    const float tau = g_cfgMoveInertia;
 
     if (tau <= 0.0f || dt <= 0.0f) {
         s_moveVel = {};
@@ -1815,11 +1921,82 @@ static void update3D(float dt) {
     // whenever the map (re)loaded.
     g_scene.setMapPath(g_cfgMapPath);
     g_scene.setMapTransform(g_mapPosition, g_mapRotationDeg, g_mapScale);
-    g_scene.setMapDebugCollisions(g_mapDebugCollisions);
+    g_scene.setMapEmissiveScale(g_mapEmissiveScale);
+    g_scene.setMapFlat(g_mapFlat);
+    g_scene.setGridVisible(g_cfgGrid);
 
-    if (g_scene.mapGeneration() != g_mapCollisionGen) {
-        g_mapCollision.build(g_scene.mapTriangles());
-        g_mapCollisionGen = g_scene.mapGeneration();
+    // Frame rate for the F3 HUD: slow exponential average over dt.
+    if (dt > 0.0f)
+        g_debugFps = g_debugFps * 0.9f + (1.0f / dt) * 0.1f;
+    g_scene.setDebugFps(g_debugFps);
+
+    // Keep Hyprland's per-window alpha animations ticking while our view is
+    // live: the workspace under our composite does not re-render a window
+    // that has not changed, so a fade started by the fullscreen handoff
+    // (others fade out/in) stalls mid-flight -- windows froze at partial
+    // alpha until hovering forced a frame. Damage every window whose alpha
+    // channels have not reached their goals; the damage drives the fade to
+    // completion and then stops.
+    if (const auto MON = targetMonitor()) {
+        if (MON->m_activeWorkspace && Desktop::windowState()) {
+            for (const auto& W : Desktop::windowState()->windows()) {
+                if (!W || W->m_workspace != MON->m_activeWorkspace)
+                    continue;
+
+                bool inFlight = false;
+                for (int t = 0; t < 3 && !inFlight; ++t) {
+                    const auto CH =
+                        t == 0 ? Desktop::View::WINDOW_ALPHA_FADE :
+                        t == 1 ? Desktop::View::WINDOW_ALPHA_ACTIVE :
+                                 Desktop::View::WINDOW_ALPHA_FULLSCREEN;
+                    inFlight = W->alphaValue(CH) != W->alphaGoal(CH);
+                }
+
+                if (inFlight)
+                    Render::g_pHyprRenderer->damageWindow(W);
+            }
+        }
+    }
+
+    // The collision set = the grid platform (when world.grid) + the map
+    // triangles (when map.collision). Rebuild when any of those changed.
+    const uint64_t SETUP = (g_cfgGrid ? 1ull : 0ull) |
+        ((g_mapCollisionOn ? 1ull : 0ull) << 1) |
+        (static_cast<uint64_t>(g_scene.mapGeneration()) << 2);
+
+    if (SETUP != g_mapCollisionSetup) {
+        std::vector<CMapCollision::STL> TRIS;
+
+        if (g_cfgGrid) {
+            // The visible grid platform as a real slab: top at world zero,
+            // half extent matching the drawn grid lines (20), 0.5 thick.
+            // Past its edge there is no collision -- the world has no floor
+            // clamp, falling off the platform is falling.
+            constexpr float H = 20.0f, T = 0.5f;
+            const Vec3 A{-H, 0, -H}, B{H, 0, -H}, C{H, 0, H}, D{-H, 0, H};
+            const Vec3 A2{-H, -T, -H}, B2{H, -T, -H}, C2{H, -T, H},
+                D2{-H, -T, H};
+
+            const auto QUAD = [&](const Vec3& p1, const Vec3& p2,
+                                  const Vec3& p3, const Vec3& p4) {
+                TRIS.push_back({p1, p2, p3});
+                TRIS.push_back({p1, p3, p4});
+            };
+
+            QUAD(A, D, C, B);    // top
+            QUAD(A2, B2, C2, D2); // bottom
+            QUAD(A, B, B2, A2);  // -z side
+            QUAD(B, C, C2, B2);  // +x side
+            QUAD(C, D, D2, C2);  // +z side
+            QUAD(D, A, A2, D2);  // -x side
+        }
+
+        if (g_mapCollisionOn)
+            TRIS.insert(TRIS.end(), g_scene.mapTriangles().begin(),
+                        g_scene.mapTriangles().end());
+
+        g_mapCollision.build(TRIS);
+        g_mapCollisionSetup = SETUP;
     }
 
     if (g_input.consumeLook(yawDelta, pitchDelta, dt)) {
@@ -1830,29 +2007,35 @@ static void update3D(float dt) {
     const Vec3 PREMOVE = g_scene.camera().position;
     applyCameraMovement(dt);
 
-    // Map collision: per-axis, minecraft-style slide. The player box is the
-    // body (0.6 x 1.8 x 0.6) whose centre sits kEyeHeight - 0.9 below the
-    // eyes. The flat-floor clamp in Camera::move stays as the fallback.
+    // Map collision: a vertical capsule (rounded hull) instead of a box --
+    // walls and seams slide past instead of snagging corners. The flat-floor
+    // clamp in Camera::move stays as the fallback.
     if (!g_mapCollision.empty()) {
         auto& CAM = g_scene.camera();
         const Vec3 DELTA = CAM.position - PREMOVE;
 
-        if (DELTA.x != 0.f || DELTA.y != 0.f || DELTA.z != 0.f) {
-            const Vec3 EYE_TO_BODY{
-                0.f,
-                Camera::kBodyHeight * 0.5f - Camera::kEyeHeight,
-                0.f,
-            };
-            const Vec3 HALF{
-                Camera::kBodyHalfWidth,
-                Camera::kBodyHeight * 0.5f,
-                Camera::kBodyHalfWidth,
-            };
+        bool grounded    = false;
+        bool hitCeiling  = false;
 
-            Vec3 body = PREMOVE + EYE_TO_BODY;
-            g_mapCollision.moveAABB(body, DELTA, HALF);
-            CAM.position = body - EYE_TO_BODY;
+        if (DELTA.x != 0.f || DELTA.y != 0.f || DELTA.z != 0.f) {
+            Vec3 feet{PREMOVE.x, PREMOVE.y - Camera::kEyeHeight, PREMOVE.z};
+            grounded = g_mapCollision.moveCapsule(
+                feet, DELTA, Camera::kBodyHalfWidth, Camera::kBodyHeight,
+                &hitCeiling);
+            CAM.position = Vec3{feet.x, feet.y + Camera::kEyeHeight, feet.z};
         }
+
+        g_grounded = grounded;
+        if (grounded && g_verticalVel < 0.f)
+            g_verticalVel = 0.f; // the floor owns the fall
+
+        // Head bump: a jump into a ceiling must die right there, or the
+        // leftover upward velocity keeps pressing the capsule into it and
+        // the player hangs there while gravity slowly wins.
+        if (hitCeiling && g_verticalVel > 0.f)
+            g_verticalVel = 0.f;
+    } else {
+        g_grounded = false;
     }
 
     // decoration:blur feeds the frost overlay on transparent windows
@@ -2159,6 +2342,9 @@ static void dumpStatus() {
         << " pinned=" << g_diagPinned.x << "," << g_diagPinned.y
         << " lastDelta=" << g_diagLastDx << "," << g_diagLastDy << "\n";
 
+    out << "lastZoomStep=" << g_diagLastZoomStep
+        << " (positive = wheel forward = push away)\n";
+
     // warpAfter is what the compositor reported immediately after the last
     // warp: equal to `center` means the pin sticks, equal to the pre-warp
     // position means warpTo is a no-op here.
@@ -2345,14 +2531,26 @@ static void onMouseAxis(
     // Physical wheels report whole detents in deltaDiscrete; touchpads send
     // a smooth delta instead. Hi-res wheels report many detents per physical
     // click -- clamped, or a light scroll flings the window across the room.
-    const double STEPS = std::clamp(
-        event.deltaDiscrete != 0 ?
-            static_cast<double>(event.deltaDiscrete) :
-            event.delta * 0.05,
-        -2.0, 2.0);
+    //
+    // Sign, per the Wayland axis spec: a vertical delta is negative when the
+    // top of the wheel rolls AWAY from the user ("forward") with
+    // IDENTICAL direction, and positive when the client is told INVERTED
+    // (natural scroll). Normalize to +1 step = wheel forward in both cases,
+    // so the zoom below can be written against the physical wheel motion
+    // instead of guessing the compositor's sign.
+    const double RAW = event.deltaDiscrete != 0 ?
+        static_cast<double>(event.deltaDiscrete) :
+        event.delta * 0.05;
+
+    const bool INVERTED = event.relativeDirection ==
+        WL_POINTER_AXIS_RELATIVE_DIRECTION_INVERTED;
+
+    double STEPS = std::clamp(INVERTED ? RAW : -RAW, -2.0, 2.0);
 
     if (STEPS == 0.0)
         return;
+
+    g_diagLastZoomStep = STEPS;
 
     // During an LMB drag the wheel zooms the dragged window.
     if (g_pointerGesture == EPointerGesture::Move3D && g_pointerDown) {
@@ -2396,8 +2594,11 @@ static void onMouseAxis(
         s_zoomTarget = DIST;
     }
 
-    s_zoomTarget = std::clamp(
-        s_zoomTarget * std::pow(1.06, STEPS), 2.0, 40.0);
+    // Wheel forward (+) pushes the window away, wheel back pulls it closer;
+    // the drag zoom receives the same normalized sign, so both wheel paths
+    // agree. No distance limits -- the target stays positive, so scrolling
+    // just keeps multiplying; the window can come arbitrarily close or far.
+    s_zoomTarget *= std::pow(1.06, STEPS);
 
     info.cancelled = true;
     damageCurrentMonitor();
@@ -2663,6 +2864,26 @@ static void onKeyboardKey(
     else if (SYM == XKB_KEY_Alt_L)
         g_altHeld = PRESSED;
 
+    // Walking mode: Space jumps off whatever the capsule stands on. The
+    // held state still reaches setMovementSym, but the walking movement
+    // path zeroes the vertical input, so holding Space does not fly.
+    if (PRESSED && SYM == XKB_KEY_space && !g_playerFlying && g_grounded) {
+        g_verticalVel = 5.5f;
+        g_grounded    = false;
+    }
+
+    // F3 toggles the debug HUD (collision wireframe + info overlay) in both
+    // keyboard modes: it never belongs to the focused window.
+    if (PRESSED && SYM == XKB_KEY_F3) {
+        g_debugHud = !g_debugHud;
+        g_scene.setMapDebugCollisions(g_debugHud);
+        g_scene.setDebugOverlay(g_debugHud);
+
+        info.cancelled = true;
+        damageCurrentMonitor();
+        return;
+    }
+
     if (PRESSED && g_superHeld && g_altHeld &&
         (SYM == XKB_KEY_Alt_L || SYM == XKB_KEY_Super_L)) {
         g_keyboardMode =
@@ -2700,24 +2921,46 @@ static void onKeyboardKey(
 
 static int luaConfig(lua_State* L) {
     // hl.plugin.hypr3d.config({
-    //     panorama = "/path/to/image.png",
-    //     look_inertia = 0.03,   -- seconds, 0 = off
-    //     move_inertia = 0.05,   -- seconds, 0 = off
-    //     move_speed = 4.0,      -- world units / second
-    //     sensitivity = 0.0025,  -- radians per pointer count
-    //     window_scale = 0.5,    -- room multiplier on window size
-    //     spawn_distance = 5.0,  -- units in front of the camera
-    //     player_spawn = { x = 0, y = 0, z = 0 },
+    //     world = {
+    //         panorama = "~/picture.png",   -- 360-degree room background
+    //         grid = true,                  -- base grid platform (visible +
+    //                                       -- collidable, at world zero)
+    //     },
+    //     windows = {
+    //         window_scale = 0.5,           -- room multiplier on window size
+    //         spawn_distance = 5.0,         -- units in front of the camera
+    //     },
+    //     player = {
+    //         look_sensitivity = 0.0025,    -- radians per pointer count
+    //         look_inertia = 0.03,          -- look glide, seconds (0 = off)
+    //         move_inertia = 0.05,          -- walk glide, seconds (0 = off)
+    //         move_speed = 4.0,             -- world units / second
+    //         spawn = { x = 0, y = 0, z = 0 }, -- FEET position
+    //         flying = true,                -- false: gravity, Space jumps,
+    //                                       -- Shift does nothing
+    //     },
+    //     map = {
+    //         path = "~/map.glb",
+    //         transform = {
+    //             position = { x = 0, y = 0, z = 0 },
+    //             rotation = { x = 0, y = 0, z = 0 }, -- degrees, XYZ
+    //             scale = { x = 1, y = 1, z = 1 },    -- per-axis
+    //         },
+    //         emissive_scale = 1.0,
+    //         flat = true,                  -- baked-map look (no dynamic light)
+    //         collision = true,
+    //     },
     // })
     //
     // Missing keys keep their current value; wrong-typed keys raise a lua
-    // error. Everything is clamped on set.
+    // error. Numbers are clamped on set.
     if (!lua_istable(L, 1))
         return luaL_error(L, "hypr3d.config expects a single table");
 
-    const auto SET_NUM = [&](const char* key, float& out,
-                             float lo, float hi) -> bool {
-        lua_getfield(L, 1, key);
+    // Field accessors. TIDX = stack index of the section table (0 = absent).
+    const auto SET_NUM = [&](int tidx, const char* key, float& out,
+                             float lo, float hi, const char* path) -> bool {
+        lua_getfield(L, tidx, key);
         if (lua_isnil(L, -1)) {
             lua_pop(L, 1);
             return true;
@@ -2731,134 +2974,169 @@ static int luaConfig(lua_State* L) {
         return true;
     };
 
-    if (!SET_NUM("look_inertia", g_cfgLookInertia, 0.0f, 1.0f))
-        return luaL_error(L, "hypr3d.config: look_inertia must be a number");
-    if (!SET_NUM("move_inertia", g_cfgMoveInertia, 0.0f, 1.0f))
-        return luaL_error(L, "hypr3d.config: move_inertia must be a number");
-    if (!SET_NUM("move_speed", g_cfgMoveSpeed, 0.5f, 50.0f))
-        return luaL_error(L, "hypr3d.config: move_speed must be a number");
-    if (!SET_NUM("sensitivity", g_cfgSensitivity, 0.0001f, 0.05f))
-        return luaL_error(L, "hypr3d.config: sensitivity must be a number");
-    if (!SET_NUM("window_scale", g_cfgWindowScale, 0.1f, 8.0f))
-        return luaL_error(L, "hypr3d.config: window_scale must be a number");
-    if (!SET_NUM("spawn_distance", g_cfgSpawnDistance, 1.0f, 100.0f))
-        return luaL_error(L, "hypr3d.config: spawn_distance must be a number");
+    const auto SET_BOOL = [&](int tidx, const char* key, bool& out,
+                              const char* path) -> bool {
+        lua_getfield(L, tidx, key);
+        if (lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+            return true;
+        }
+        if (!lua_isboolean(L, -1)) {
+            lua_pop(L, 1);
+            return false;
+        }
+        out = lua_toboolean(L, -1) != 0;
+        lua_pop(L, 1);
+        return true;
+    };
 
-    lua_getfield(L, 1, "panorama");
-    if (lua_isstring(L, -1)) {
+    const auto SET_STRING = [&](int tidx, const char* key, std::string& out,
+                                const char* path) -> bool {
+        lua_getfield(L, tidx, key);
+        if (lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+            return true;
+        }
+        if (!lua_isstring(L, -1)) {
+            lua_pop(L, 1);
+            return false;
+        }
         size_t LEN = 0;
-        const char* S = lua_tolstring(L, -1, &LEN);
-        g_cfgPanorama.assign(S, LEN);
-    } else if (!lua_isnil(L, -1)) {
+        const char* STR = lua_tolstring(L, -1, &LEN);
+        out.assign(STR, LEN);
         lua_pop(L, 1);
-        return luaL_error(L, "hypr3d.config: panorama must be a string");
-    }
-    lua_pop(L, 1);
+        return true;
+    };
 
-    // map = { path = "..", position = {x,y,z}, rotation = {x,y,z} (degrees),
-    //         scale = 1.0 }
-    lua_getfield(L, 1, "map");
-    if (!lua_isnil(L, -1)) {
+    // Missing axes keep their current values.
+    const auto SET_VEC3 = [&](int tidx, const char* key, Vec3& out,
+                              const char* path) -> bool {
+        lua_getfield(L, tidx, key);
+        if (lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+            return true;
+        }
         if (!lua_istable(L, -1)) {
             lua_pop(L, 1);
-            return luaL_error(
-                L, "hypr3d.config: map must be a table with path/position/rotation/scale");
+            return false;
         }
 
-        lua_getfield(L, -1, "path");
-        if (lua_isstring(L, -1)) {
-            size_t LEN = 0;
-            const char* S = lua_tolstring(L, -1, &LEN);
-            g_cfgMapPath.assign(S, LEN);
-        } else if (!lua_isnil(L, -1)) {
-            lua_pop(L, 2);
-            return luaL_error(L, "hypr3d.config: map.path must be a string");
-        }
-        lua_pop(L, 1);
-
-        const auto AXIS = [&](int tableIndex, const char* name, float& out) {
-            lua_getfield(L, tableIndex, name);
-            if (lua_isnumber(L, -1))
-                out = static_cast<float>(lua_tonumber(L, -1));
-            lua_pop(L, 1);
-        };
-
-        // Sub-tables keep unspecified axes at their current values.
-        lua_getfield(L, -1, "position");
-        if (lua_isnil(L, -1)) {
-            lua_pop(L, 1);
-        } else if (!lua_istable(L, -1)) {
-            lua_pop(L, 2);
-            return luaL_error(L, "hypr3d.config: map.position must be a table { x = .., y = .., z = .. }");
-        } else {
-            AXIS(-1, "x", g_mapPosition.x);
-            AXIS(-1, "y", g_mapPosition.y);
-            AXIS(-1, "z", g_mapPosition.z);
-            lua_pop(L, 1);
-        }
-
-        lua_getfield(L, -1, "rotation");
-        if (lua_isnil(L, -1)) {
-            lua_pop(L, 1);
-        } else if (!lua_istable(L, -1)) {
-            lua_pop(L, 2);
-            return luaL_error(L, "hypr3d.config: map.rotation must be a table { x = .., y = .., z = .. } (degrees)");
-        } else {
-            AXIS(-1, "x", g_mapRotationDeg.x);
-            AXIS(-1, "y", g_mapRotationDeg.y);
-            AXIS(-1, "z", g_mapRotationDeg.z);
-            lua_pop(L, 1);
-        }
-
-        lua_getfield(L, -1, "debug_collision");
-        if (lua_isnil(L, -1)) {
-            lua_pop(L, 1);
-        } else if (!lua_isboolean(L, -1)) {
-            lua_pop(L, 2);
-            return luaL_error(L, "hypr3d.config: map.debug_collision must be a boolean");
-        } else {
-            g_mapDebugCollisions = lua_toboolean(L, -1) != 0;
-            lua_pop(L, 1);
-        }
-
-        lua_getfield(L, -1, "scale");
-        if (lua_isnil(L, -1)) {
-            lua_pop(L, 1);
-        } else if (!lua_isnumber(L, -1)) {
-            lua_pop(L, 2);
-            return luaL_error(L, "hypr3d.config: map.scale must be a number");
-        } else {
-            g_mapScale = std::clamp(
-                static_cast<float>(lua_tonumber(L, -1)), 0.05f, 10.0f);
-            lua_pop(L, 1);
-        }
-    }
-    lua_pop(L, 1);
-
-    lua_getfield(L, 1, "player_spawn");
-    if (!lua_isnil(L, -1)) {
-        if (!lua_istable(L, -1)) {
-            lua_pop(L, 1);
-            return luaL_error(
-                L, "hypr3d.config: player_spawn must be a table { x = .., y = .., z = .. }");
-        }
-
-        const auto AXIS = [&](const char* name, float& out) {
+        const auto AXIS = [&](const char* name, float& v) {
             lua_getfield(L, -1, name);
             if (lua_isnumber(L, -1))
-                out = static_cast<float>(lua_tonumber(L, -1));
+                v = static_cast<float>(lua_tonumber(L, -1));
             lua_pop(L, 1);
         };
 
-        AXIS("x", g_playerSpawn.x);
-        AXIS("y", g_playerSpawn.y);
-        AXIS("z", g_playerSpawn.z);
+        AXIS("x", out.x);
+        AXIS("y", out.y);
+        AXIS("z", out.z);
+        lua_pop(L, 1);
+        return true;
+    };
 
-        // The player's feet cannot go below the floor anyway.
-        g_playerSpawn.y = std::clamp(
-            g_playerSpawn.y, Camera::kFloorY + Camera::kEyeHeight, 100.0f);
+    // A sub-table section: returns its stack index, or 0 when absent/wrong.
+    // A wrong-typed section is an error, a missing one is skipped.
+    const auto SECTION = [&](const char* key, const char* path) -> int {
+        lua_getfield(L, 1, key);
+        if (lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+            return 0;
+        }
+        if (!lua_istable(L, -1))
+            return -1; // caller reports
+        return lua_gettop(L);
+    };
+
+    int idx = SECTION("world", "world");
+    if (idx == -1)
+        return luaL_error(L, "hypr3d.config: world must be a table");
+    if (idx > 0) {
+        if (!SET_STRING(idx, "panorama", g_cfgPanorama, "world.panorama"))
+            return luaL_error(L, "hypr3d.config: world.panorama must be a string");
+        if (!SET_BOOL(idx, "grid", g_cfgGrid, "world.grid"))
+            return luaL_error(L, "hypr3d.config: world.grid must be a boolean");
+        lua_pop(L, 1);
     }
-    lua_pop(L, 1);
+
+    idx = SECTION("windows", "windows");
+    if (idx == -1)
+        return luaL_error(L, "hypr3d.config: windows must be a table");
+    if (idx > 0) {
+        if (!SET_NUM(idx, "window_scale", g_cfgWindowScale, 0.1f, 8.0f,
+                     "windows.window_scale"))
+            return luaL_error(L, "hypr3d.config: windows.window_scale must be a number");
+        if (!SET_NUM(idx, "spawn_distance", g_cfgSpawnDistance, 1.0f, 100.0f,
+                     "windows.spawn_distance"))
+            return luaL_error(L, "hypr3d.config: windows.spawn_distance must be a number");
+        lua_pop(L, 1);
+    }
+
+    idx = SECTION("player", "player");
+    if (idx == -1)
+        return luaL_error(L, "hypr3d.config: player must be a table");
+    if (idx > 0) {
+        if (!SET_NUM(idx, "look_sensitivity", g_cfgSensitivity, 0.0001f, 0.05f,
+                     "player.look_sensitivity"))
+            return luaL_error(L, "hypr3d.config: player.look_sensitivity must be a number");
+        if (!SET_NUM(idx, "look_inertia", g_cfgLookInertia, 0.0f, 1.0f,
+                     "player.look_inertia"))
+            return luaL_error(L, "hypr3d.config: player.look_inertia must be a number");
+        if (!SET_NUM(idx, "move_inertia", g_cfgMoveInertia, 0.0f, 1.0f,
+                     "player.move_inertia"))
+            return luaL_error(L, "hypr3d.config: player.move_inertia must be a number");
+        if (!SET_NUM(idx, "move_speed", g_cfgMoveSpeed, 0.5f, 50.0f,
+                     "player.move_speed"))
+            return luaL_error(L, "hypr3d.config: player.move_speed must be a number");
+        if (!SET_BOOL(idx, "flying", g_playerFlying, "player.flying"))
+            return luaL_error(L, "hypr3d.config: player.flying must be a boolean");
+        if (!SET_VEC3(idx, "spawn", g_playerSpawn, "player.spawn"))
+            return luaL_error(L, "hypr3d.config: player.spawn must be a table { x = .., y = .., z = .. }");
+        // y is the FEET height; only guard against absurd values.
+        g_playerSpawn.y = std::clamp(g_playerSpawn.y, -1000.0f, 1000.0f);
+        lua_pop(L, 1);
+    }
+
+    idx = SECTION("map", "map");
+    if (idx == -1)
+        return luaL_error(L, "hypr3d.config: map must be a table");
+    if (idx > 0) {
+        if (!SET_STRING(idx, "path", g_cfgMapPath, "map.path"))
+            return luaL_error(L, "hypr3d.config: map.path must be a string");
+        if (!SET_BOOL(idx, "flat", g_mapFlat, "map.flat"))
+            return luaL_error(L, "hypr3d.config: map.flat must be a boolean");
+        if (!SET_BOOL(idx, "collision", g_mapCollisionOn, "map.collision"))
+            return luaL_error(L, "hypr3d.config: map.collision must be a boolean");
+        if (!SET_NUM(idx, "emissive_scale", g_mapEmissiveScale, 0.0f, 20.0f,
+                     "map.emissive_scale"))
+            return luaL_error(L, "hypr3d.config: map.emissive_scale must be a number");
+
+        lua_getfield(L, idx, "transform");
+        if (lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+        } else if (!lua_istable(L, -1)) {
+            lua_pop(L, 1);
+            return luaL_error(
+                L, "hypr3d.config: map.transform must be a table with position/rotation/scale");
+        } else {
+            const int TIDX = lua_gettop(L);
+
+            if (!SET_VEC3(TIDX, "position", g_mapPosition, "map.transform.position"))
+                return luaL_error(L, "hypr3d.config: map.transform.position must be a table { x = .., y = .., z = .. }");
+            if (!SET_VEC3(TIDX, "rotation", g_mapRotationDeg, "map.transform.rotation"))
+                return luaL_error(L, "hypr3d.config: map.transform.rotation must be a table { x = .., y = .., z = .. } (degrees)");
+            if (!SET_VEC3(TIDX, "scale", g_mapScale, "map.transform.scale"))
+                return luaL_error(L, "hypr3d.config: map.transform.scale must be a table { x = .., y = .., z = .. }");
+
+            // Zero axes would collapse the map to a plane hair.
+            g_mapScale.x = std::clamp(g_mapScale.x, 0.05f, 10.0f);
+            g_mapScale.y = std::clamp(g_mapScale.y, 0.05f, 10.0f);
+            g_mapScale.z = std::clamp(g_mapScale.z, 0.05f, 10.0f);
+
+            lua_pop(L, 1);
+        }
+        lua_pop(L, 1);
+    }
 
     return 0;
 }

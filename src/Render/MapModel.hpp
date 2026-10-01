@@ -24,7 +24,7 @@ class CMapModel {
     // path and transform is a cheap no-op (mtime is NOT checked here -- the
     // caller decides when the file changed).
     bool load(const std::string& path, const Vec3& position,
-              const Vec3& rotationDeg, float scale);
+              const Vec3& rotationDeg, const Vec3& scale);
     void destroy();
 
     bool loaded() const {
@@ -33,9 +33,23 @@ class CMapModel {
 
     // The map's own transform, remembered for the draw pass.
     void setTransform(const Vec3& position, const Vec3& rotationDeg,
-                      float scale);
+                      const Vec3& scale);
 
-    void draw(const Mat4& vp) const;
+    // Global emissive multiplier (config); 0 = pure lambert, 1 = as authored.
+    void setEmissiveScale(float s) {
+        m_emissiveScale = s > 0.f ? s : 0.f;
+    }
+
+    // Baked-map mode (default): textures carry all lighting, so the shader
+    // shows albedo/emission as-is with no dynamic light -- a lambert term
+    // re-shades baked shadows and greys out down-facing light fixtures.
+    void setFlat(bool flat) {
+        m_flat = flat;
+    }
+
+    // cameraPos orders the blend pass far-to-near (translucent surfaces
+    // need back-to-front to composite correctly against each other).
+    void draw(const Mat4& vp, const Vec3& cameraPos) const;
 
     // Wireframe of the world-space collision triangles (red, x-ray). The
     // line buffer is (re)built on the next draw whenever the triangles were
@@ -63,18 +77,29 @@ class CMapModel {
         bool         indexed = false;
         unsigned int texture = 0; // 0 = untextured (white fallback)
         float        color[4] = {1.f, 1.f, 1.f, 1.f};
+        unsigned int emissiveTex = 0;
+        float        emissiveFactor[3] = {1.f, 1.f, 1.f};
+        float        emissiveStrength = 1.0f;
+
+        // glTF alphaMode: 0 opaque, 1 mask (uAlphaCutoff), 2 blend.
+        int          alphaMode = 0;
+        float        alphaCutoff = 0.5f;
+        Vec3         centroid{}; // node-space AABB center, for blend sorting
     };
 
     unsigned int uploadTexture(const std::string& modelDir, const void* image,
                                bool embedded, const void* data, size_t size);
 
     std::vector<SPrimitive> m_primitives;
+    std::vector<unsigned>   m_ownedTextures; // unique image textures
     std::vector<STL>        m_localTriangles; // node space
     std::vector<STL>        m_triangles;      // world space (recomputed)
     std::string             m_path;
     Vec3                    m_position{};
     Vec3                    m_rotationDeg{};
-    float                   m_scale = 1.0f;
+    Vec3                    m_scale{1.0f, 1.0f, 1.0f};
+    float                   m_emissiveScale = 1.0f;
+    bool                    m_flat = true;
     bool                    m_loaded = false;
     uint32_t                m_generation = 0;
 
@@ -93,6 +118,13 @@ class CMapModel {
     int                     m_uModel = -1;
     int                     m_uColor = -1;
     int                     m_uTex = -1;
+    int                     m_uEmissive = -1;
+    int                     m_uHasEmissive = -1;
+    int                     m_uEmissiveFactor = -1;
+    int                     m_uEmissiveStrength = -1;
+    int                     m_uFlat = -1;
+    int                     m_uAlphaMode = -1;
+    int                     m_uAlphaCutoff = -1;
 };
 
 } // namespace H3D

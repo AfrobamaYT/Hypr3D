@@ -18,6 +18,14 @@ class CMapCollision {
   public:
     struct STL {
         Vec3 a, b, c;
+
+        STL() = default;
+        STL(const Vec3& A, const Vec3& B, const Vec3& C) : a(A), b(B), c(C) {}
+
+        // Accepts any triangle type exposing .a/.b/.c (MapModel::STL), so
+        // renderer and collision never need to share one struct.
+        template <class T>
+        STL(const T& t) : a(t.a), b(t.b), c(t.c) {}
     };
 
     // Rebuilds the tree over `triangles`. Works with any triangle type that
@@ -46,8 +54,22 @@ class CMapCollision {
     // Moves `position` by `delta` axis-by-axis (X, Z, Y), clamping against
     // every triangle the player box overlaps. `half` is the player box's
     // half extents. Returns true when downward Y motion was blocked
-    // (grounded).
+    // (grounded). Kept for tests; the player walks on moveCapsule().
     bool moveAABB(Vec3& position, const Vec3& delta, const Vec3& half) const;
+
+    // Vertical-capsule mover: `feet` is the body's bottom-centre, the
+    // capsule's segment runs feet.y + radius .. feet.y + height - radius.
+    // The move is applied whole, then the capsule is depenetrated against
+    // nearby triangles (iterative push-out along the shortest separation) --
+    // a rounded hull slides along walls and over seams where an AABB
+    // corner would snag. A step-up probe (STEP above, settle back) handles
+    // thresholds the push cannot climb. Returns grounded (pushed up by a
+    // mostly-upward contact).
+    // `ceiling` (optional) is set when a contact pushed the capsule DOWN --
+    // a head bump; the caller stops any upward jump velocity on it, or the
+    // player sticks to the ceiling while gravity slowly bleeds the jump off.
+    bool moveCapsule(Vec3& feet, const Vec3& delta, float radius,
+                     float height, bool* ceiling = nullptr) const;
 
     // Closest hit of a ray against the triangles, or -1. Used for aiming at
     // the map (placing windows on surfaces later).

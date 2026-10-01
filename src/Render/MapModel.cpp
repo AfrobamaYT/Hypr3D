@@ -73,17 +73,68 @@ in vec2 vUV;
 
 uniform sampler2D uTex;
 uniform vec4 uColor;
+uniform sampler2D uEmissive;
+uniform int uHasEmissive;
+uniform vec3 uEmissiveFactor;
+uniform float uEmissiveStrength;
+uniform int uFlat;   // baked-map mode: albedo/emission as-is, no dynamic light
+uniform int uAlphaMode;      // 0 opaque, 1 mask, 2 blend (glTF alphaMode)
+uniform float uAlphaCutoff;  // mask cutoff
 
 out vec4 fragColor;
 
 void main() {
-    // Fixed lambert: one light from above and a flat ambient floor. Real PBR
-    // is not the point of a map in a room of window quads.
-    vec3 N = normalize(vNormal);
-    float diffuse = max(dot(N, normalize(vec3(0.4, 0.8, 0.45))), 0.0);
-
     vec3 base = uColor.rgb * texture(uTex, vUV).rgb;
-    fragColor = vec4(base * (0.35 + 0.65 * diffuse), uColor.a);
+
+    // glTF alpha: baseColor alpha = factor.a * texture.a. Opaque forces 1;
+    // mask discards below the cutoff; blend passes it through (the draw
+    // call enables blending only for the blend pass).
+    float alpha = uColor.a * texture(uTex, vUV).a;
+    if (uAlphaMode == 0)
+        alpha = 1.0;
+
+    // Baked-map mode (uFlat): the textures already contain ALL lighting
+    // and shading (Sketchfab softbakes bake light into baseColor AND set
+    // emissive = baseColor). Any dynamic term re-shades what is baked --
+    // down-facing white lamp panels came out grey at 0.64x while the author
+    // intended them bright. Show albedo/emission exactly as authored, like
+    // Blender's view of a baked map.
+    if (uFlat != 0) {
+        if (uHasEmissive != 0) {
+            vec3 e = texture(uEmissive, vUV).rgb * uEmissiveFactor *
+                uEmissiveStrength;
+            float ea = uColor.a * texture(uEmissive, vUV).a;
+            if (uAlphaMode == 1 && ea < uAlphaCutoff)
+                discard;
+            fragColor = vec4(e, uAlphaMode == 0 ? 1.0 : ea);
+        } else {
+            if (uAlphaMode == 1 && alpha < uAlphaCutoff)
+                discard;
+            fragColor = vec4(base, alpha);
+        }
+        return;
+    }
+
+    // Dynamic mode: half-lambert (wrapped) light -- no hard terminator; a
+    // plain lambert crushed down-facing surfaces to the ambient floor.
+    vec3 N = normalize(vNormal);
+    float wrap = clamp(dot(N, normalize(vec3(0.4, 0.8, 0.45))) * 0.5 + 0.5,
+                       0.0, 1.0);
+
+    // Emissive replaces the lambert for baked lights: the bake already
+    // contains the lighting, adding both pushed rooms 1.6-2x over albedo.
+    if (uHasEmissive != 0) {
+        vec3 emissive = texture(uEmissive, vUV).rgb * uEmissiveFactor *
+            uEmissiveStrength;
+        float ea = uColor.a;
+        if (uAlphaMode == 1 && ea < uAlphaCutoff)
+            discard;
+        fragColor = vec4(emissive, uAlphaMode == 0 ? 1.0 : ea);
+    } else {
+        if (uAlphaMode == 1 && alpha < uAlphaCutoff)
+            discard;
+        fragColor = vec4(base * mix(vec3(0.6), vec3(1.0), wrap), alpha);
+    }
 }
 )GLSL";
 
@@ -102,14 +153,15 @@ GLuint compileMapShader(GLenum type, const char* src) {
     return SH;
 }
 
-Mat4 composeModel(const Vec3& position, const Vec3& rotationDeg, float scale) {
+Mat4 composeModel(const Vec3& position, const Vec3& rotationDeg,
+                  const Vec3& scale) {
     constexpr float DEG = 3.14159265358979f / 180.0f;
 
     const Mat4 T  = Mat4::translation(position);
     const Mat4 RY = Mat4::rotationY(rotationDeg.y * DEG);
     const Mat4 RX = Mat4::rotationX(rotationDeg.x * DEG);
     const Mat4 RZ = Mat4::rotationZ(rotationDeg.z * DEG);
-    const Mat4 S  = Mat4::scale(Vec3{scale, scale, scale});
+    const Mat4 S  = Mat4::scale(scale);
 
     // Same convention as the window model: RY * RX * RZ.
     return T * RY * (RX * (RZ * S));
@@ -196,7 +248,7 @@ unsigned int CMapModel::uploadTexture(const std::string& modelDir,
 // --- load / destroy ---------------------------------------------------------
 
 bool CMapModel::load(const std::string& path, const Vec3& position,
-                     const Vec3& rotationDeg, float scale) {
+                     const Vec3& rotationDeg, const Vec3& scale) {
     destroy();
 
     setTransform(position, rotationDeg, scale);
@@ -238,6 +290,13 @@ bool CMapModel::load(const std::string& path, const Vec3& position,
                 m_uModel  = glGetUniformLocation(P, "uModel");
                 m_uColor  = glGetUniformLocation(P, "uColor");
                 m_uTex    = glGetUniformLocation(P, "uTex");
+                m_uEmissive         = glGetUniformLocation(P, "uEmissive");
+                m_uHasEmissive      = glGetUniformLocation(P, "uHasEmissive");
+                m_uEmissiveFactor   = glGetUniformLocation(P, "uEmissiveFactor");
+                m_uEmissiveStrength = glGetUniformLocation(P, "uEmissiveStrength");
+                m_uFlat             = glGetUniformLocation(P, "uFlat");
+                m_uAlphaMode        = glGetUniformLocation(P, "uAlphaMode");
+                m_uAlphaCutoff      = glGetUniformLocation(P, "uAlphaCutoff");
             }
         }
 
@@ -301,9 +360,29 @@ bool CMapModel::load(const std::string& path, const Vec3& position,
             SPrimitive out{};
 
             if (prim->material) {
+                // glTF alpha pipeline.
+                out.alphaMode = static_cast<int>(prim->material->alpha_mode);
+                out.alphaCutoff = prim->material->alpha_cutoff > 0.f ?
+                    static_cast<float>(prim->material->alpha_cutoff) : 0.5f;
+
                 const auto& PBR = prim->material->pbr_metallic_roughness;
                 for (int c = 0; c < 4; ++c)
                     out.color[c] = static_cast<float>(PBR.base_color_factor[c]);
+
+                // Emissive: factor defaults to black per spec, strength to 1
+                // unless KHR_materials_emissive_strength says otherwise.
+                // NOTE: black factor really means "no emission" -- e.g. the
+                // backrooms Ceiling_Lamp carries none in either export; its
+                // brightness comes from the albedo shading below.
+                for (int c = 0; c < 3; ++c)
+                    out.emissiveFactor[c] =
+                        static_cast<float>(prim->material->emissive_factor[c]);
+                out.emissiveStrength =
+                    prim->material->has_emissive_strength ?
+                        static_cast<float>(
+                            prim->material->emissive_strength
+                                .emissive_strength) :
+                        1.0f;
 
                 if (PBR.base_color_texture.texture &&
                     PBR.base_color_texture.texture->image) {
@@ -332,6 +411,36 @@ bool CMapModel::load(const std::string& path, const Vec3& position,
                         }
                     }
                 }
+
+                if (prim->material->emissive_texture.texture &&
+                    prim->material->emissive_texture.texture->image) {
+                    const auto* IMG =
+                        prim->material->emissive_texture.texture->image;
+                    const auto IDX = static_cast<size_t>(IMG - data->images);
+
+                    if (IDX < imageTextures.size()) {
+                        if (imageTextures[IDX] != 0) {
+                            out.emissiveTex = imageTextures[IDX];
+                        } else {
+                            std::vector<uint8_t> bytes;
+                            bool                 embedded = false;
+
+                            if (IMG->buffer_view) {
+                                const auto* BV   = IMG->buffer_view;
+                                const auto* BASE = cgltf_buffer_view_data(BV);
+                                if (BASE) {
+                                    bytes.assign(BASE, BASE + BV->size);
+                                    embedded = true;
+                                }
+                            }
+
+                            out.emissiveTex = uploadTexture(
+                                MODEL_DIR, IMG, embedded, bytes.data(),
+                                bytes.size());
+                            imageTextures[IDX] = out.emissiveTex;
+                        }
+                    }
+                }
             }
 
             // Interleaved attribute stream for the GPU: pos(3) normal(3)
@@ -342,6 +451,9 @@ bool CMapModel::load(const std::string& path, const Vec3& position,
             // collision triangles land correctly.
             std::vector<float> verts;
             verts.reserve(static_cast<size_t>(POS->count) * 8);
+
+            // Node-space AABB center for the blend pass's distance sort.
+            Vec3 lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
 
             float cpos[3] = {0, 0, 0}, cnrm[3] = {0, 0, 1}, cuv[2] = {0, 0};
 
@@ -364,6 +476,11 @@ bool CMapModel::load(const std::string& path, const Vec3& position,
                     N.y /= LEN;
                     N.z /= LEN;
                 }
+
+                lo = {std::min(lo.x, P.x), std::min(lo.y, P.y),
+                      std::min(lo.z, P.z)};
+                hi = {std::max(hi.x, P.x), std::max(hi.y, P.y),
+                      std::max(hi.z, P.z)};
 
                 verts.push_back(P.x);
                 verts.push_back(P.y);
@@ -434,6 +551,9 @@ bool CMapModel::load(const std::string& path, const Vec3& position,
                          static_cast<GLsizeiptr>(indices.size() * sizeof(uint32_t)),
                          indices.data(), GL_STATIC_DRAW);
 
+            out.centroid = Vec3{(lo.x + hi.x) * 0.5f, (lo.y + hi.y) * 0.5f,
+                                (lo.z + hi.z) * 0.5f};
+
             out.count   = static_cast<int>(indices.size());
             out.indexed = true;
 
@@ -447,12 +567,28 @@ bool CMapModel::load(const std::string& path, const Vec3& position,
 
     cgltf_free(data);
 
+    // The image cache maps images -> textures; collect the unique ids so
+    // destroy() can free them (map reloads would otherwise leak every
+    // texture, base and emissive alike).
+    m_ownedTextures.clear();
+    for (const auto T : imageTextures)
+        if (T != 0 &&
+            std::find(m_ownedTextures.begin(), m_ownedTextures.end(), T) ==
+                m_ownedTextures.end())
+            m_ownedTextures.push_back(T);
+
     m_loaded = true;
     recomputeTriangles();
     return true;
 }
 
 void CMapModel::destroy() {
+    if (!m_ownedTextures.empty()) {
+        glDeleteTextures(static_cast<GLsizei>(m_ownedTextures.size()),
+                         m_ownedTextures.data());
+        m_ownedTextures.clear();
+    }
+
     for (const auto& P : m_primitives) {
         if (P.ebo)
             glDeleteBuffers(1, &P.ebo);
@@ -492,15 +628,21 @@ void CMapModel::destroy() {
 // --- transform / draw -------------------------------------------------------
 
 void CMapModel::setTransform(const Vec3& position, const Vec3& rotationDeg,
-                             float scale) {
-    const float NEW_SCALE = scale > 0.001f ? scale : 0.001f;
+                             const Vec3& scale) {
+    // Zero axes would collapse the map; clamp to a hair.
+    const Vec3 NEW_SCALE{
+        scale.x > 0.001f ? scale.x : 0.001f,
+        scale.y > 0.001f ? scale.y : 0.001f,
+        scale.z > 0.001f ? scale.z : 0.001f,
+    };
 
     // update3D pushes the config transform every frame; only a real change
     // may trigger the (O(triangles)) world-space recompute.
     if (m_loaded && m_position.x == position.x && m_position.y == position.y &&
         m_position.z == position.z && m_rotationDeg.x == rotationDeg.x &&
         m_rotationDeg.y == rotationDeg.y && m_rotationDeg.z == rotationDeg.z &&
-        m_scale == NEW_SCALE)
+        m_scale.x == NEW_SCALE.x && m_scale.y == NEW_SCALE.y &&
+        m_scale.z == NEW_SCALE.z)
         return;
 
     m_position    = position;
@@ -621,7 +763,7 @@ void CMapModel::drawDebug(const Mat4& vp) {
     glDepthMask(GL_TRUE);
 }
 
-void CMapModel::draw(const Mat4& vp) const {
+void CMapModel::draw(const Mat4& vp, const Vec3& cameraPos) const {
     if (!m_loaded || !m_program || m_primitives.empty())
         return;
 
@@ -632,26 +774,87 @@ void CMapModel::draw(const Mat4& vp) const {
     glUniformMatrix4fv(m_uMVP, 1, GL_FALSE, MVP.m.data());
     glUniformMatrix4fv(m_uModel, 1, GL_FALSE, MODEL.m.data());
     glUniform1i(m_uTex, 0);
+    glUniform1i(m_uEmissive, 1);
+    glUniform1i(m_uFlat, m_flat ? 1 : 0);
 
     glEnable(GL_DEPTH_TEST);
-    glDepthMask(GL_TRUE);
-    glDisable(GL_BLEND);
 
     glActiveTexture(GL_TEXTURE0);
 
-    for (const auto& P : m_primitives) {
+    const auto DRAW_PRIM = [&](const SPrimitive& P) {
         glUniform4f(m_uColor, P.color[0], P.color[1], P.color[2], P.color[3]);
+        glUniform1i(m_uAlphaMode, P.alphaMode);
+        glUniform1f(m_uAlphaCutoff, P.alphaCutoff);
 
+        const bool HAS_EMISSIVE =
+            P.emissiveTex != 0 &&
+            (P.emissiveFactor[0] > 0.f || P.emissiveFactor[1] > 0.f ||
+             P.emissiveFactor[2] > 0.f);
+        glUniform1i(m_uHasEmissive, HAS_EMISSIVE ? 1 : 0);
+        glUniform3f(m_uEmissiveFactor, P.emissiveFactor[0], P.emissiveFactor[1],
+                    P.emissiveFactor[2]);
+        glUniform1f(m_uEmissiveStrength, P.emissiveStrength * m_emissiveScale);
+
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, P.emissiveTex);
+        glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, P.texture);
 
         glBindVertexArray(P.vao);
         glDrawElements(GL_TRIANGLES, P.count, GL_UNSIGNED_INT,
                        reinterpret_cast<void*>(0));
+    };
+
+    // Pass 1: opaque + mask -- depth write on, no blending. These carve the
+    // depth buffer the blend pass tests against.
+    glDepthMask(GL_TRUE);
+    glDisable(GL_BLEND);
+
+    for (const auto& P : m_primitives)
+        if (P.alphaMode != 2)
+            DRAW_PRIM(P);
+
+    // Pass 2: blend (alphaMode BLEND) -- depth TEST on, depth WRITE off, so
+    // translucent surfaces never occlude each other's sorting, drawn
+    // far-to-near by centroid distance (correct back-to-front compositing).
+    const auto BLENDABLE = std::count_if(
+        m_primitives.begin(), m_primitives.end(),
+        [](const SPrimitive& P) { return P.alphaMode == 2; });
+
+    if (BLENDABLE > 0) {
+        std::vector<const SPrimitive*> blend;
+        blend.reserve(static_cast<size_t>(BLENDABLE));
+        for (const auto& P : m_primitives)
+            if (P.alphaMode == 2)
+                blend.push_back(&P);
+
+        std::sort(blend.begin(), blend.end(),
+                  [&](const SPrimitive* lhs, const SPrimitive* rhs) {
+                      const Vec3 L = transformPoint(MODEL, lhs->centroid);
+                      const Vec3 R = transformPoint(MODEL, rhs->centroid);
+                      const float DL = (L - cameraPos).x * (L - cameraPos).x +
+                          (L - cameraPos).y * (L - cameraPos).y +
+                          (L - cameraPos).z * (L - cameraPos).z;
+                      const float DR = (R - cameraPos).x * (R - cameraPos).x +
+                          (R - cameraPos).y * (R - cameraPos).y +
+                          (R - cameraPos).z * (R - cameraPos).z;
+                      return DL > DR; // far first
+                  });
+
+        glEnable(GL_BLEND);
+        glBlendFuncSeparate(
+            GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
+            GL_ONE, GL_ONE_MINUS_SRC_ALPHA
+        );
+        glDepthMask(GL_FALSE);
+
+        for (const auto* P : blend)
+            DRAW_PRIM(*P);
     }
 
     glBindVertexArray(0);
     glBindTexture(GL_TEXTURE_2D, 0);
-    glEnable(GL_BLEND);
+    glDepthMask(GL_TRUE);
 }
 
 } // namespace H3D

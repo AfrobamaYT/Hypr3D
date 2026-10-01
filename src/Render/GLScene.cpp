@@ -2,6 +2,10 @@
 
 #include "../../third_party/font8x8_basic.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
 #include <GLES3/gl32.h>
 
 #include <hyprgraphics/image/Image.hpp>
@@ -1054,9 +1058,11 @@ void GLScene::drawFloor(
     // Solid ground just under the grid. The floor is deliberately single-sided:
     // seeing this plane from below is a ceiling by definition, so back-face
     // culling makes the world coordinate system visually unambiguous.
+    // The platform is centered on world zero and matches the grid lines'
+    // extent (both halves of the visual and the collision slab in main.cpp).
     const Mat4 model =
-        Mat4::translation({0.0f, FLOOR_Y - 0.02f, -4.0f}) *
-        Mat4::scale({60.0f, 1.0f, 60.0f});
+        Mat4::translation({0.0f, FLOOR_Y - 0.02f, 0.0f}) *
+        Mat4::scale({40.0f, 1.0f, 40.0f});
 
     static constexpr float fullUV[4] = {0.0f, 0.0f, 1.0f, 1.0f};
 
@@ -1189,10 +1195,18 @@ void GLScene::refreshMap() {
         return;
     }
 
-    std::error_code ec;
-    const auto MTIME = std::filesystem::last_write_time(m_mapPath, ec);
+    // Expand a leading tilde like the panorama path does -- config paths
+    // arrive as "~/..." and cgltf would look for a literal '~' directory.
+    std::string path = m_mapPath;
+    if (path.starts_with('~')) {
+        if (const char* HOME = getenv("HOME"))
+            path = std::string{HOME} + path.substr(1);
+    }
 
-    const bool UNCHANGED = m_map.loaded() && m_mapLoadedPath == m_mapPath &&
+    std::error_code ec;
+    const auto MTIME = std::filesystem::last_write_time(path, ec);
+
+    const bool UNCHANGED = m_map.loaded() && m_mapLoadedPath == path &&
         m_mapMtimeValid && !ec && MTIME == m_mapMtime;
 
     if (UNCHANGED)
@@ -1200,9 +1214,9 @@ void GLScene::refreshMap() {
 
     m_mapMtime      = MTIME;
     m_mapMtimeValid = !ec;
-    m_mapLoadedPath = m_mapPath;
+    m_mapLoadedPath = path;
 
-    m_map.load(m_mapPath, m_mapPosition, m_mapRotationDeg, m_mapScale);
+    m_map.load(path, m_mapPosition, m_mapRotationDeg, m_mapScale);
 }
 
 void GLScene::drawPanorama(float aspect) {
@@ -1580,6 +1594,141 @@ const unsigned char* GLScene::probeRGBA() const {
     return m_probe;
 }
 
+    // F3 HUD text: a streaming quad per set font bit, screen-space ortho.
+// font8x8 is public domain (daniel hepper / marcel sondaar).
+void GLScene::drawDebugOverlay(int width, int height) {
+    if (!m_debugOverlay)
+        return;
+
+    // The blur pass leaves ITS OWN framebuffer bound (or 0); the HUD must
+    // land in the scene texture or the composite never picks it up. Save
+    // and restore whatever was current.
+    GLint oldFBO = 0, oldViewport[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &oldFBO);
+    glGetIntegerv(GL_VIEWPORT, oldViewport);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, m_sceneFBO);
+    glViewport(0, 0, width, height);
+
+    // The lines: coordinates, view angles, fps, map size.
+    const auto& CAM = m_camera;
+    char line0[96], line1[96], line2[96], line3[96];
+    snprintf(line0, sizeof(line0), "XYZ %.2f %.2f %.2f",
+             CAM.position.x, CAM.position.y, CAM.position.z);
+    snprintf(line1, sizeof(line1), "YAW %.1f  PIT %.1f",
+             CAM.yaw * 180.0f / 3.14159265f, CAM.pitch * 180.0f / 3.14159265f);
+    snprintf(line2, sizeof(line2), "FPS %.0f", m_debugFps);
+    snprintf(line3, sizeof(line3), "MAP %s%zu tris",
+             m_map.loaded() ? "" : "none  ", m_map.triangles().size());
+
+    const char* LINES[4] = {line0, line1, line2, line3};
+
+    constexpr float GLYPH = 8.0f;
+    constexpr float SCALE = 2.0f;   // 16 px tall text
+    constexpr float LINE  = GLYPH * SCALE + 4.0f;
+
+    std::vector<float> verts;
+    verts.reserve(64 * 1024);
+
+    // pos(3) + uv(2) -- the SCENE program's layout, so the text rides the
+    // same shader that already renders the floor and windows. A dedicated
+    // mini-program rendered nothing on real GLES; the scene program is the
+    // one path guaranteed to work.
+    const auto QUAD = [&](float l, float t, float r, float b) {
+        verts.insert(verts.end(), {
+            l, t, 0, 0, 0,  r, t, 0, 0, 0,  l, b, 0, 0, 0,
+            l, b, 0, 0, 0,  r, t, 0, 0, 0,  r, b, 0, 0, 0,
+        });
+    };
+
+    const auto EMIT_TEXT = [&](float x, float y) {
+        for (int li = 0; li < 4; ++li) {
+            float cx = x;
+            for (const char* P = LINES[li]; *P; ++P) {
+                const auto ROWS = font8x8_basic[static_cast<unsigned char>(*P)];
+                for (int row = 0; row < 8; ++row) {
+                    const unsigned BITS = ROWS[row];
+                    if (!BITS)
+                        continue;
+                    for (int col = 0; col < 8; ++col) {
+                        if (!(BITS & (1u << col)))
+                            continue;
+                        QUAD(cx + col * SCALE, y + li * LINE + row * SCALE,
+                             cx + col * SCALE + SCALE,
+                             y + li * LINE + row * SCALE + SCALE);
+                    }
+                }
+                cx += GLYPH * SCALE;
+            }
+        }
+    };
+
+    // Shadow text (offset +2,+2) then white -- readable without a bar.
+    EMIT_TEXT(10.0f, 12.0f);
+    const size_t SHADOW_VERTS = verts.size() / 5;
+    EMIT_TEXT(8.0f, 10.0f);
+
+    if (verts.empty())
+        return;
+
+    if (!m_textVAO) {
+        glGenVertexArrays(1, &m_textVAO);
+        glGenBuffers(1, &m_textVBO);
+        glBindVertexArray(m_textVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, m_textVBO);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float),
+                              reinterpret_cast<void*>(0));
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float),
+                              reinterpret_cast<void*>(3 * sizeof(float)));
+        glBindVertexArray(0);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+    }
+
+    glBindVertexArray(m_textVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_textVBO);
+    glBufferData(GL_ARRAY_BUFFER,
+                 static_cast<GLsizeiptr>(verts.size() * sizeof(float)),
+                 verts.data(), GL_DYNAMIC_DRAW);
+
+    // Pixel coords -> NDC, y down. The negative y scale mirrors winding,
+    // so face culling stays off for this pass.
+    const Mat4 ORTHO = Mat4::translation(Vec3{-1.f, 1.f, 0.f}) *
+        Mat4::scale(Vec3{2.0f / width, -2.0f / height, 1.0f});
+
+    glUseProgram(m_sceneProgram);
+    glUniformMatrix4fv(m_sceneMVP, 1, GL_FALSE, ORTHO.m.data());
+    glUniform4f(m_sceneUVRect, 0.f, 0.f, 1.f, 1.f);
+    glUniform1i(m_sceneTextured, 0);
+    glUniform1i(m_sceneFrost, 0);
+
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glEnable(GL_BLEND);
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+    glDisable(GL_CULL_FACE);
+
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float),
+                          reinterpret_cast<void*>(0));
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float),
+                          reinterpret_cast<void*>(3 * sizeof(float)));
+
+    glUniform4f(m_sceneColorUniform, 0.f, 0.f, 0.f, 0.9f);
+    glDrawArrays(GL_TRIANGLES, 0, static_cast<GLint>(SHADOW_VERTS));
+
+    glUniform4f(m_sceneColorUniform, 1.f, 1.f, 1.f, 1.f);
+    glDrawArrays(GL_TRIANGLES, static_cast<GLint>(SHADOW_VERTS),
+                 static_cast<GLint>(verts.size() / 5 - SHADOW_VERTS));
+
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glDepthMask(GL_TRUE);
+    glEnable(GL_DEPTH_TEST);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(oldFBO));
+    glViewport(oldViewport[0], oldViewport[1], oldViewport[2], oldViewport[3]);
+}
 bool GLScene::render(
     unsigned int targetFBO,
     int width,
@@ -1682,177 +1831,32 @@ bool GLScene::render(
 
     const Mat4 vp = projection * m_camera.view();
 
-    // F3 HUD text: a streaming quad per set font bit, screen-space ortho.
-// font8x8 is public domain (daniel hepper / marcel sondaar).
-void GLScene::drawDebugOverlay(int width, int height) {
-    if (!m_debugOverlay)
-        return;
-
-    if (!m_textProgram) {
-        static constexpr const char* VS = R"GLSL(
-#version 300 es
-
-layout(location = 0) in vec2 aPos;
-
-uniform vec2 uScale; // framebuffer size in pixels
-
-void main() {
-    float nx = aPos.x / uScale.x * 2.0 - 1.0;
-    float ny = 1.0 - aPos.y / uScale.y * 2.0;
-    gl_Position = vec4(nx, ny, 0.0, 1.0);
-}
-)GLSL";
-
-        static constexpr const char* FS = R"GLSL(
-#version 300 es
-
-precision mediump float;
-
-uniform vec4 uColor;
-
-out vec4 fragColor;
-
-void main() {
-    fragColor = uColor;
-}
-)GLSL";
-
-        const GLuint VS2 = compileShader(GL_VERTEX_SHADER, VS);
-        const GLuint FS2 = compileShader(GL_FRAGMENT_SHADER, FS);
-        if (!VS2 || !FS2)
-            return;
-
-        const GLuint P = glCreateProgram();
-        glAttachShader(P, VS2);
-        glAttachShader(P, FS2);
-        glLinkProgram(P);
-
-        GLint ok = GL_FALSE;
-        glGetProgramiv(P, GL_LINK_STATUS, &ok);
-        if (ok != GL_TRUE)
-            return;
-
-        m_textProgram = P;
-        m_textScale   = glGetUniformLocation(P, "uScale");
-        m_textColor   = glGetUniformLocation(P, "uColor");
-
-        glGenVertexArrays(1, &m_textVAO);
-        glGenBuffers(1, &m_textVBO);
-        glBindVertexArray(m_textVAO);
-        glBindBuffer(GL_ARRAY_BUFFER, m_textVBO);
-        glEnableVertexAttribArray(0);
-        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float),
-                              reinterpret_cast<void*>(0));
-        glBindVertexArray(0);
-        glBindBuffer(GL_ARRAY_BUFFER, 0);
-    }
-
-    // The lines: coordinates, view angles, fps, map size.
-    const auto& CAM = m_camera;
-    char line0[96], line1[96], line2[96], line3[96];
-    snprintf(line0, sizeof(line0), "XYZ %.2f %.2f %.2f",
-             CAM.position.x, CAM.position.y, CAM.position.z);
-    snprintf(line1, sizeof(line1), "YAW %.1f  PIT %.1f",
-             CAM.yaw * 180.0f / 3.14159265f, CAM.pitch * 180.0f / 3.14159265f);
-    snprintf(line2, sizeof(line2), "FPS %.0f", m_debugFps);
-    snprintf(line3, sizeof(line3), "MAP %s%zu tris",
-             m_map.loaded() ? "" : "none  ", m_map.triangles().size());
-
-    const char* LINES[4] = {line0, line1, line2, line3};
-
-    constexpr float GLYPH = 8.0f;
-    constexpr float SCALE = 2.0f;   // 16 px tall text
-    constexpr float LINE  = GLYPH * SCALE + 4.0f;
-
-    std::vector<float> verts;
-    verts.reserve(64 * 1024);
-
-    const auto EMIT_TEXT = [&](float x, float y) {
-        for (int li = 0; li < 4; ++li) {
-            float cx = x;
-            for (const char* P = LINES[li]; *P; ++P) {
-                const auto  ROWS = font8x8_basic[static_cast<unsigned char>(*P)];
-                for (int row = 0; row < 8; ++row) {
-                    const uint8_t BITS = ROWS[row];
-                    if (!BITS)
-                        continue;
-                    for (int col = 0; col < 8; ++col) {
-                        if (!(BITS & (1u << col)))
-                            continue;
-                        const float L = cx + col * SCALE;
-                        const float T = y + li * LINE + row * SCALE;
-                        const float R = L + SCALE;
-                        const float B = T + SCALE;
-                        verts.insert(verts.end(), {
-                            L, T, R, T, L, B,
-                            L, B, R, T, R, B,
-                        });
-                    }
-                }
-                cx += GLYPH * SCALE;
-            }
-        }
-    };
-
-    // Black offset shadow, then white -- readable on any background.
-    EMIT_TEXT(2.0f, 2.0f);
-    const size_t SHADOW_VERTS = verts.size() / 2;
-    EMIT_TEXT(0.0f, 0.0f);
-
-    glBindVertexArray(m_textVAO);
-    glBindBuffer(GL_ARRAY_BUFFER, m_textVBO);
-    glBufferData(GL_ARRAY_BUFFER,
-                 static_cast<GLsizeiptr>(verts.size() * sizeof(float)),
-                 verts.data(), GL_DYNAMIC_DRAW);
-
-    glUseProgram(m_textProgram);
-    glUniform2f(m_textScale, static_cast<float>(width), static_cast<float>(height));
-
-    glDisable(GL_DEPTH_TEST);
-    glDepthMask(GL_FALSE);
-    glEnable(GL_BLEND);
-    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
-
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float),
-                          reinterpret_cast<void*>(0));
-
-    glUniform4f(m_textColor, 0.f, 0.f, 0.f, 0.9f);
-    glDrawArrays(GL_TRIANGLES, 0, static_cast<GLint>(SHADOW_VERTS));
-
-    glUniform4f(m_textColor, 1.f, 1.f, 1.f, 1.f);
-    glDrawArrays(GL_TRIANGLES, static_cast<GLint>(SHADOW_VERTS),
-                 static_cast<GLint>(verts.size() / 2 - SHADOW_VERTS));
-
-    glBindVertexArray(0);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-    glDepthMask(GL_TRUE);
-    glEnable(GL_DEPTH_TEST);
-}
-
-// Background panorama first, then the map (it replaces the flat floor
-    // when loaded -- depth rejects whatever is behind its geometry), then
-    // the ground so windows behind it are depth-rejected.
+    // Background panorama first, then the map (it replaces the flat floor
+    // when loaded; depth rejects whatever is behind its geometry), then the
+    // ground so windows behind it are depth-rejected.
     refreshPanorama();
     refreshMap();
     drawPanorama(aspect);
 
     if (m_map.loaded()) {
-        m_map.draw(vp);
+        m_map.draw(vp, m_camera.position);
 
         // Red x-ray wireframe of the collision triangles (debug).
         m_map.drawDebug(vp);
     }
 
-    drawFloor(vp);
+    if (m_gridVisible) {
+        drawFloor(vp);
 
-    glEnable(GL_BLEND);
-    glBlendFuncSeparate(
-        GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
-        GL_ZERO, GL_ONE
-    );
-    glDepthMask(GL_FALSE);
+        glEnable(GL_BLEND);
+        glBlendFuncSeparate(
+            GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
+            GL_ZERO, GL_ONE
+        );
+        glDepthMask(GL_FALSE);
 
-    drawGrid(vp);
+        drawGrid(vp);
+    }
 
     // Sharp pass first, then blur the FINAL scene (windows included) and draw
     // it back over the window areas: the blur lands ON the windows, not just
@@ -1868,6 +1872,9 @@ void main() {
     }
 
     glDepthMask(GL_TRUE);
+
+    // F3 HUD: always on top of the scene, never part of the 3D pass state.
+    drawDebugOverlay(width, height);
 
     // Read back one pixel of the offscreen scene while it is still bound. A
     // floor point in the lower half of the screen, where ground and sky are
@@ -2049,6 +2056,14 @@ void GLScene::shutdown() {
 }
 
 void GLScene::destroyGLObjects() {
+    if (m_textVBO) {
+        glDeleteBuffers(1, &m_textVBO);
+        m_textVBO = 0;
+    }
+    if (m_textVAO) {
+        glDeleteVertexArrays(1, &m_textVAO);
+        m_textVAO = 0;
+    }
     if (m_crosshairVBO) {
         glDeleteBuffers(1, &m_crosshairVBO);
         m_crosshairVBO = 0;

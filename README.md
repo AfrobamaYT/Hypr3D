@@ -45,20 +45,21 @@ Or bind in lua config:
 hl.bind("SUPER + F12", hl.plugin.hypr3d.toggle)
 ```
 
-
 ## Controls
 
-| Input                         | Action                                                   |
-| -------------------------------| ----------------------------------------------------------|
-| Mouse move                    | Look around                                              |
-| WASD                          | Move                                                     |
-| Shift / Space                 | Move down / up                                           |
-| Ctrl                          | Sprint                                                   |
-| Super + Left click            | Drag window                                              |
-| Super + Right click           | Resize window                                            |
-| Super + Mouse wheel click     | rotate window                                            |
-| Super + Mouse wheel scrolling | Zoom in on or zoom out from a window under the crosshair |
-| Super + Left Alt              | Toggle keyboard mode (movement / window input)           |
+| Input                         | Action                                         |
+| -------------------------------| ------------------------------------------------|
+| Mouse move                    | Look around                                    |
+| WASD                          | Move                                           |
+| Space                         | Move up (flying) / Jump                        |
+| Shift                         | Move down (flying)                             |
+| Ctrl                          | Sprint                                         |
+| Super + Left click            | Drag window                                    |
+| Super + Right click           | Resize window                                  |
+| Super + Mouse wheel click     | rotate window                                  |
+| Super + Mouse wheel scrolling | Zoom window                                    |
+| Super + Left Alt              | Toggle keyboard mode (movement / window input) |
+| F3                            | Toggle debug HUD                               |
 
 ## Configuration
 ### Lua config example:
@@ -69,25 +70,34 @@ if hl.plugin.hypr3d then
     hl.bind("SUPER + F12", hl.plugin.hypr3d.toggle)
     -- parameters
     hl.plugin.hypr3d.config({
-        panorama = "/home/samine/Downloads/Qwen_image_2.1_00048.png", -- 360° room background image (equirectangular)
-        look_inertia = 0.03, -- mouse-look glide after the mouse stops, seconds (0 = off)
-        move_inertia = 0.05, -- WASD glide after the keys are released, seconds (0 = off)
-        move_speed = 4.0, -- walking speed, world m/s (sprint is ×2.5 this value)
-        sensitivity = 0.0025, -- mouse look sensitivity, radians per pointer count
-        window_scale = 0.5, -- window size multiplier: real pixel size at a base density of 100 px/m, times this
-        spawn_distance = 5, -- distance from the camera where new windows spawn
-        player_spawn = { x = 0, y = 0, z = 0 }, -- player spawn point in the room
-
-        -- Optional glTF 2.0 map (.glb / .gltf): meshes, textures and player
-        -- collision. Nodes named "nocol*" render but never collide.
-        -- map = {
-        --     path = "/path/to/map.glb",   -- omit or "" for the grid room
-        --     position = { x = 0, y = 0, z = 0 },
-        --     rotation = { x = 0, y = 0, z = 0 }, -- degrees, XYZ
-        --     scale = 1.0,
-        --     debug_collision = false, -- red x-ray wireframe of collision tris
-        -- },
-        -- That's all for now :p
+        -- Every key is optional
+        world = {
+            panorama = "~/Pictures/room.png", -- 360° room background (equirectangular)
+            grid = true,                      -- base 40x40 grid platform
+        },
+        windows = {
+            window_scale = 0.5,   -- window size multiplier (real px at 100 px/m)
+            spawn_distance = 5,   -- distance from the camera new windows spawn at
+        },
+        player = {
+            look_sensitivity = 0.0025, -- mouse look, radians per pointer count
+            look_inertia = 0.03,       -- look glide after the mouse stops, sec
+            move_inertia = 0.05,       -- walk glide after keys release, sec
+            move_speed = 4.0,          -- walking speed, m/s
+            spawn = { x = 0, y = 0, z = 0 }, -- player position
+            flying = true,             -- false: gravity, Space jumps off the ground, Shift does nothing
+        },
+        map = {
+            path = "~/map.glb",   -- glTF 2.0 map (.glb/.gltf)
+            transform = {
+                position = { x = 0, y = 0, z = 0 },
+                rotation = { x = 0, y = 0, z = 0 },
+                scale    = { x = 1, y = 1, z = 1 },
+            },
+            emissive_scale = 1.0, -- emission multiplier
+            flat = true,          -- textures carry all lighting
+            collision = true,     -- collide with the map
+        },
     })
 end
 ```

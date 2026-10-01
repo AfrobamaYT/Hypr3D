@@ -296,12 +296,11 @@ void CWorld::dragZoom(double steps) {
 
     // Multiplicative per detent: equal perceived zoom steps at any distance.
     // Writes the TARGET; updateDrag glides the actual distance toward it.
-    constexpr double ZOOM_FACTOR  = 1.06;
-    constexpr double MIN_DISTANCE = 2.0;
-    constexpr double MAX_DISTANCE = 40.0;
+    // No distance limits: the target stays positive, so the dragged window
+    // can come arbitrarily close to the camera or recede arbitrarily far.
+    constexpr double ZOOM_FACTOR = 1.06;
 
-    m_drag.targetDistance = std::clamp(
-        m_drag.targetDistance * std::pow(ZOOM_FACTOR, steps), MIN_DISTANCE, MAX_DISTANCE);
+    m_drag.targetDistance *= std::pow(ZOOM_FACTOR, steps);
 }
 
 } // namespace H3D::World3D

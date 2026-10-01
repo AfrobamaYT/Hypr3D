@@ -186,6 +186,15 @@ static bool  g_fsWasOn = false; // a fullscreen window existed since the last po
 static PHLWINDOWREF g_fsLastFSWindow; // the most recent fullscreen window
 static std::uintptr_t g_fsCurrentId = 0; // the id of the CURRENT fullscreen window, 0 = none
 static float g_fsAlpha = 1.0f;  // composite alpha during the transition
+
+// The room's own fade for the NON-fullscreen windows: 1 = visible. Driven by
+// the pump (deterministic ticks), sampled into WindowRender::alpha -- the
+// snapshot alpha is baked at capture time and never advances (the buffer
+// does not change during an alpha fade), so a snapshot-driven fade freezes
+// after a couple of frames. Hyprland's own fade animates the real channels;
+// ours guarantees the room matches it.
+static float g_fsFade = 1.0f;
+static std::chrono::steady_clock::time_point g_fsFadeLast{};
 static float g_fsRawP   = 0.0f;  // raw (pre-smoothstep) transition progress
 static float g_fsSavedRoll   = 0.0f; // the window's roll before the fullscreen
 static float g_fsRollAtStart = 0.0f; // roll at the To3D start (aborts may differ)
@@ -586,15 +595,46 @@ static void refreshCaptures(
         // Focus-change feedback (the active/inactive opacity fade and the
         // border color tween) is compositor-side -- no client commit happens,
         // so the buffer-change check would freeze both animations mid-way
-        // and make the window snap to its final look. While either runs, the
-        // snapshot refreshes at full rate.
+        // and make the window snap to its final look. While any of them
+        // runs, the snapshot refreshes at full rate. The FADE and FULLSCREEN
+        // channels belong to the same family: the fullscreen handoff fades
+        // every non-FS window through them, and without this the last
+        // snapshot keeps the MID-FADE alpha baked in -- static windows
+        // stayed semi-transparent until a hover forced a repaint.
+        // Alpha channels in flight force full-rate retakes -- but the LAST
+        // retake must happen AFTER the animation finishes: while
+        // isBeingAnimated() is still true the value can be 0.99, the
+        // animation then completes and no further retake runs, leaving the
+        // snapshot baked one tick short of the goal (the lingering
+        // semi-transparency on static windows). So once a channel was seen
+        // in flight, the window keeps forcing retakes for a grace period
+        // past the end -- the final retake captures the goal state exactly.
+        static std::unordered_map<std::uintptr_t,
+            std::chrono::steady_clock::time_point> alphaGrace;
+
+        const auto NOW = std::chrono::steady_clock::now();
+
         const bool FADING = info.window &&
             (info.window->alpha(Desktop::View::WINDOW_ALPHA_ACTIVE)
                  ->isBeingAnimated() ||
+                info.window->alpha(Desktop::View::WINDOW_ALPHA_FADE)
+                 ->isBeingAnimated() ||
+                info.window->alpha(Desktop::View::WINDOW_ALPHA_FULLSCREEN)
+                 ->isBeingAnimated() ||
                 info.window->m_borderFadeAnimationProgress->isBeingAnimated());
+
+        if (FADING)
+            alphaGrace[info.id] = NOW + std::chrono::milliseconds(200);
+        else if (auto IT = alphaGrace.find(info.id);
+                 IT != alphaGrace.end() && NOW > IT->second)
+            alphaGrace.erase(IT); // expired: keep the map from growing
+
+        const bool ALPHA_GRACE = info.window &&
+            alphaGrace.count(info.id) > 0;
 
         const bool FORCE =
             FADING ||
+            ALPHA_GRACE ||
             info.id == g_lastAimedId ||
             (g_world.dragActive() && g_world.draggedId() == info.id) ||
             (g_resize.active && g_resize.id == info.id) ||
@@ -859,6 +899,24 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
 
         render.width  = entity.width;
         render.height = entity.height;
+
+        // The room fade (see g_fsFade): every non-FS window rides it. The
+        // fullscreen window must NEVER ride it, in any of its three
+        // identities: the one fullscreened right now (g_fsCurrentId), the
+        // one being animated back to the room (To3D -- FSW is already null
+        // there, but g_fsWindow still holds it), and the one that JUST
+        // exited (g_fsLastFSWindow persists past the exit -- without this
+        // the ex-FS panel fades in together with everyone else even though
+        // it was never hidden and must sit at 100% immediately).
+        const auto FS_WIN      = g_fsWindow.lock();
+        const auto LAST_FS_WIN = g_fsLastFSWindow.lock();
+
+        const bool IS_FS_WINDOW =
+            entity.id == g_fsCurrentId ||
+            (FS_WIN && entity.id == Compat::windowId(FS_WIN)) ||
+            (LAST_FS_WIN && entity.id == Compat::windowId(LAST_FS_WIN));
+
+        render.alpha = IS_FS_WINDOW ? 1.0f : g_fsFade;
 
         // The snapshot framebuffer covers the whole monitor, so the window is
         // a subrect of it. Hyprland renders its framebuffers with logical Y
@@ -1183,12 +1241,13 @@ static void startTo3D() {
 // Hyprland fades windows with per-window alpha animations that only make
 // progress while the window is being damaged: during the fullscreen
 // handoff the non-FS windows fade out (their FADE/FULLSCREEN alpha channels
-// animate toward 0), and on the way back they fade in. Mid-fade the
-// compositor stops damaging them -- the animation freezes a couple of
-// frames in, and the room shows windows stuck at partial alpha until an
-// aim hover forces a frame (the user-diagnosed semi-transparent-after-FS
-// bug). Damage every window whose alpha channels are still in flight; the
-// damage drives the fade to completion and the loop stops on its own.
+// animate toward 0), and on the way back they fade in; focus changes fade
+// the ACTIVE channel the same way. Mid-fade the compositor stops damaging
+// them -- the animation freezes a couple of frames in, and the room shows
+// windows stuck at partial alpha until an aim hover forces a frame (the
+// semi-transparent-after-FS bug). Damage every window whose alpha channels
+// are still in flight; the damage drives the fade to completion and the
+// loop stops on its own.
 static void damageWindowsWithLiveAlpha(const PHLMONITOR& mon) {
     if (!Desktop::windowState() || !mon || !mon->m_activeWorkspace)
         return;
@@ -1197,14 +1256,13 @@ static void damageWindowsWithLiveAlpha(const PHLMONITOR& mon) {
         if (!W || W->m_workspace != mon->m_activeWorkspace)
             continue;
 
-        const bool FADE_IN_FLIGHT =
-            W->alphaValue(Desktop::View::WINDOW_ALPHA_FADE) !=
-            W->alphaGoal(Desktop::View::WINDOW_ALPHA_FADE);
-        const bool FS_IN_FLIGHT =
-            W->alphaValue(Desktop::View::WINDOW_ALPHA_FULLSCREEN) !=
-            W->alphaGoal(Desktop::View::WINDOW_ALPHA_FULLSCREEN);
+        const auto IN_FLIGHT = [&](Desktop::View::eWindowAlpha channel) {
+            return W->alphaValue(channel) != W->alphaGoal(channel);
+        };
 
-        if (FADE_IN_FLIGHT || FS_IN_FLIGHT)
+        if (IN_FLIGHT(Desktop::View::WINDOW_ALPHA_FADE) ||
+            IN_FLIGHT(Desktop::View::WINDOW_ALPHA_ACTIVE) ||
+            IN_FLIGHT(Desktop::View::WINDOW_ALPHA_FULLSCREEN))
             g_pHyprRenderer->damageWindow(W);
     }
 }
@@ -1222,6 +1280,28 @@ static void pollFullscreen() {
     const auto FSW = Fullscreen::controller()->getFullscreenWindow(MON);
 
     g_fsCurrentId = FSW ? Compat::windowId(FSW) : 0;
+
+    // Our own room fade: while a fullscreen exists (or a transition runs)
+    // the other windows glide to invisible; when it is gone they glide
+    // back. Deterministic wall-clock ticks -- never dependent on Hyprland's
+    // animation engine or on snapshot retakes.
+    constexpr float FADE_DURATION = 0.25f;
+
+    const auto FADE_NOW = std::chrono::steady_clock::now();
+    const float FADE_DT = g_fsFadeLast.time_since_epoch().count() == 0 ?
+        0.0f :
+        std::chrono::duration<float>(FADE_NOW - g_fsFadeLast).count();
+    g_fsFadeLast = FADE_NOW;
+
+    const float FADE_TARGET =
+        (FSW || g_fsPhase != EFullscreenPhase::None) ? 0.0f : 1.0f;
+
+    if (FADE_DT > 0.0f && g_fsFade != FADE_TARGET) {
+        const float STEP = std::min(FADE_DT / FADE_DURATION, 1.0f);
+        g_fsFade = FADE_TARGET > g_fsFade ?
+            std::min(g_fsFade + STEP, FADE_TARGET) :
+            std::max(g_fsFade - STEP, FADE_TARGET);
+    }
 
     if (g_fsPhase == EFullscreenPhase::None) {
         if (FSW && !g_fsWasOn && ownsInput())
@@ -1634,6 +1714,7 @@ static void deactivate3D() {
     g_fsWindow       = {};
     g_fsWasOn        = false;
     g_fsAlpha        = 1.0f;
+    g_fsFade         = 1.0f;
     g_fsAssertFrames = 0;
 
     // Restore the host cursor before anything else touches focus: removing
@@ -1930,33 +2011,8 @@ static void update3D(float dt) {
         g_debugFps = g_debugFps * 0.9f + (1.0f / dt) * 0.1f;
     g_scene.setDebugFps(g_debugFps);
 
-    // Keep Hyprland's per-window alpha animations ticking while our view is
-    // live: the workspace under our composite does not re-render a window
-    // that has not changed, so a fade started by the fullscreen handoff
-    // (others fade out/in) stalls mid-flight -- windows froze at partial
-    // alpha until hovering forced a frame. Damage every window whose alpha
-    // channels have not reached their goals; the damage drives the fade to
-    // completion and then stops.
-    if (const auto MON = targetMonitor()) {
-        if (MON->m_activeWorkspace && Desktop::windowState()) {
-            for (const auto& W : Desktop::windowState()->windows()) {
-                if (!W || W->m_workspace != MON->m_activeWorkspace)
-                    continue;
-
-                bool inFlight = false;
-                for (int t = 0; t < 3 && !inFlight; ++t) {
-                    const auto CH =
-                        t == 0 ? Desktop::View::WINDOW_ALPHA_FADE :
-                        t == 1 ? Desktop::View::WINDOW_ALPHA_ACTIVE :
-                                 Desktop::View::WINDOW_ALPHA_FULLSCREEN;
-                    inFlight = W->alphaValue(CH) != W->alphaGoal(CH);
-                }
-
-                if (inFlight)
-                    Render::g_pHyprRenderer->damageWindow(W);
-            }
-        }
-    }
+    // Window alpha keepalive lives on the FS pump (damageWindowsWithLiveAlpha)
+    // -- it must tick even when a frame is slow.
 
     // The collision set = the grid platform (when world.grid) + the map
     // triangles (when map.collision). Rebuild when any of those changed.

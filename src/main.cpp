@@ -91,7 +91,13 @@ static std::uintptr_t g_lastFocusId = 0;
 
 // 3D FPS-style mouse gestures. Super is the modifier: LMB moves the aimed
 // window in the 3D room, RMB resizes its real Hyprland/Wayland geometry.
-enum class EPointerGesture : uint8_t { None, Move3D, ResizeReal, WheelRoll };
+enum class EPointerGesture : uint8_t {
+    None,
+    Move3D,
+    ResizeReal,
+    WheelRoll,
+    MapDrag // carrying a dynamic (static = false) scene object
+};
 
 static bool            g_pointerDown = false;
 static EPointerGesture g_pointerGesture = EPointerGesture::None;
@@ -125,6 +131,7 @@ struct SResizeGesture {
 // Player spawn point in the room, set via hl.plugin.hypr3d.config().
 static SResizeGesture g_resize{};
 
+
 // Guards against a snapshot triggering another copy of the plugin inside
 // Hyprland's nested offscreen render.
 static bool g_capturing = false;
@@ -145,6 +152,8 @@ static std::uintptr_t g_lastAimedId = 0;
 // into itself.
 static struct SWheelRotate {
     bool           active     = false;
+    bool           model      = false;  // rolling a scene object, not a window
+    size_t         modelIndex = SIZE_MAX;
     std::uintptr_t id         = 0;
     Vec3           center     = {};
     Vec3           normal     = {};
@@ -272,21 +281,91 @@ static Vec3 g_playerSpawn{0.0f, 0.0f, 0.0f};
 static bool  g_grounded    = false;
 static float g_verticalVel = 0.0f;
 
-// --- map --------------------------------------------------------------------
-static std::string g_cfgMapPath;
-static Vec3        g_mapPosition{};
-static Vec3        g_mapRotationDeg{};           // XYZ Euler, degrees
-static Vec3        g_mapScale{1.0f, 1.0f, 1.0f}; // per-axis
-static float       g_mapEmissiveScale = 1.0f;
-static bool        g_mapFlat = true;
-static bool        g_mapCollisionOn = true;
+// --- scene: unlimited named glTF objects ------------------------------------
+struct SSceneObjectCfg {
+    std::string path;
+    Vec3        position{}, rotationDeg{}, scale{1.0f, 1.0f, 1.0f};
+    float       emissiveScale = 1.0f;
+    bool        flat = true;
+    bool        collision = true;
+    bool        dynamic = false; // static = false -> grabbable with Super+LMB
+};
+
+static std::vector<SSceneObjectCfg> g_sceneObjects;
+
+
+// Index of the currently grabbed dynamic object, SIZE_MAX when none.
+static size_t g_mapGrabIndex = SIZE_MAX;
+
+// Super+wheel hover zoom for a dynamic scene object (the model-class twin of
+// the window hover zoom): the aimed object's center rides the zoomed
+// distance on the camera-object line.
+static size_t s_modelZoomId   = SIZE_MAX;
+static float  s_modelZoomDist = 0.0f;
+static float  g_mapGrabDist  = 0.0f; // camera-to-object-CENTER distance
+
 
 // F3 debug HUD: collision wireframe + room info overlay.
 static bool        g_debugHud = false;
 static float       g_debugFps = 0.0f;
 
-static CMapCollision g_mapCollision;
-static uint64_t      g_mapCollisionSetup = 0;
+// Per-object collision trees (see update3D): one small BVH per scene
+// object plus the grid platform slab. The static map's tree builds once.
+static CMapCollision            g_platform;
+static bool                     g_platformBuilt = false;
+static std::vector<CMapCollision> g_objTrees;
+static std::vector<uint32_t>    g_objTreeGens;
+
+// Nearest scene-model hit of a ray. Occlusion (windows behind models lose
+// clicks/focus/aim) and the model gestures both go through this: collision-
+// enabled objects answer through their BVH trees (fast), a carried object is
+// skipped (it is on the crosshair already). collision = false objects neither
+// occlude nor grab.
+struct SModelRayHit {
+    bool   hit = false;
+    size_t index = SIZE_MAX;
+    float  dist = 0.0f;
+    bool   dynamic = false;
+};
+
+static SModelRayHit modelRayHit(const Vec3& origin, const Vec3& dir,
+                                bool dynamicOnly) {
+    SModelRayHit R;
+
+    for (size_t i = 0; i < g_sceneObjects.size(); ++i) {
+        if (dynamicOnly && !g_sceneObjects[i].dynamic)
+            continue;
+        if (!g_sceneObjects[i].collision)
+            continue;
+        if (i == g_mapGrabIndex)
+            continue;
+
+        float t = -1.f;
+        if (!g_objTrees[i].empty())
+            t = g_objTrees[i].rayCast(origin, dir);
+        else if (const auto* MODEL = g_scene.sceneModel(i);
+                 MODEL && MODEL->loaded())
+            t = MODEL->rayCast(origin, dir);
+
+        if (t > 0.f && (!R.hit || t < R.dist)) {
+            R.hit     = true;
+            R.index   = i;
+            R.dist    = t;
+            R.dynamic = g_sceneObjects[i].dynamic;
+        }
+    }
+
+    return R;
+}
+
+// A model is IN FRONT of the aimed window when its ray hit is closer (or
+// there is no window hit at all).
+static bool modelInFront(const Vec3& origin, const Vec3& dir,
+                         const World3D::SHit& windowHit) {
+    const auto MR = modelRayHit(origin, dir, /*dynamicOnly=*/false);
+    return MR.hit && (!windowHit.hit || MR.dist < windowHit.distance);
+}
+
 
 static void notify(const std::string& text, const CHyprColor& color);
 
@@ -685,7 +764,11 @@ static void updateAimFocus(float dt) {
     const World3D::SHit HIT =
         g_world.pick(cam.position, cam.centerRay());
 
-    const std::uintptr_t AIMED = HIT.hit ? HIT.id : 0;
+    // A scene model in front of the aimed window occludes it: no window
+    // focus through geometry (one distance space for both classes).
+    std::uintptr_t AIMED = HIT.hit ? HIT.id : 0;
+    if (AIMED != 0 && modelInFront(cam.position, cam.centerRay(), HIT))
+        AIMED = 0;
     g_lastAimedId = AIMED;
 
     const std::uintptr_t FOCUS = g_aim.update(AIMED, dt);
@@ -1532,6 +1615,34 @@ static void updateWheelRoll() {
     if (!s_wheelRot.active)
         return;
 
+    if (s_wheelRot.model) {
+        auto* MODEL = g_scene.sceneModel(s_wheelRot.modelIndex);
+        if (!MODEL || !MODEL->loaded()) {
+            s_wheelRot.active = false;
+            return;
+        }
+
+        const auto& CAM = g_scene.camera();
+        Vec3 P;
+        if (!rayPlanePoint(CAM.position, CAM.centerRay(), s_wheelRot.center,
+                           s_wheelRot.normal, P))
+            return;
+
+        const Vec3 V = P - s_wheelRot.center;
+        const float ANGLE = std::atan2(
+            dot(cross(s_wheelRot.reference, V), s_wheelRot.normal),
+            dot(s_wheelRot.reference, V));
+
+        constexpr float DEG = 3.14159265358979f / 180.0f;
+        auto& ROT = g_sceneObjects[s_wheelRot.modelIndex].rotationDeg;
+        ROT.z = (s_wheelRot.startRoll + ANGLE) / DEG;
+
+        g_scene.setSceneObjectTransform(s_wheelRot.modelIndex,
+                                        MODEL->position(), ROT);
+        damageCurrentMonitor();
+        return;
+    }
+
     const auto HIT = aimHit();
 
     if (!HIT.hit || HIT.id != s_wheelRot.id) {
@@ -1593,6 +1704,10 @@ static void resetPointerGesture() {
     g_pointerButton = 0;
     g_resize = {};
     s_wheelRot.active = false;
+
+    // Dropping a carried scene object: it re-enters the collision set at
+    // its current position (the SETUP fingerprint changes -> rebuild).
+    g_mapGrabIndex = SIZE_MAX;
 }
 
 static void finishClientButton(uint32_t timeMs) {
@@ -2000,10 +2115,21 @@ static void update3D(float dt) {
 
     // Map: the scene owns the file/GL side; collision rebuilds its BVH
     // whenever the map (re)loaded.
-    g_scene.setMapPath(g_cfgMapPath);
-    g_scene.setMapTransform(g_mapPosition, g_mapRotationDeg, g_mapScale);
-    g_scene.setMapEmissiveScale(g_mapEmissiveScale);
-    g_scene.setMapFlat(g_mapFlat);
+    std::vector<GLScene::SSceneSpec> SPECS;
+    SPECS.reserve(g_sceneObjects.size());
+
+    for (const auto& OBJ : g_sceneObjects) {
+        GLScene::SSceneSpec SPEC;
+        SPEC.path          = OBJ.path;
+        SPEC.position      = OBJ.position;
+        SPEC.rotationDeg   = OBJ.rotationDeg;
+        SPEC.scale         = OBJ.scale;
+        SPEC.emissiveScale = OBJ.emissiveScale;
+        SPEC.flat          = OBJ.flat;
+        SPECS.push_back(SPEC);
+    }
+
+    g_scene.setSceneObjects(SPECS);
     g_scene.setGridVisible(g_cfgGrid);
 
     // Frame rate for the F3 HUD: slow exponential average over dt.
@@ -2014,45 +2140,63 @@ static void update3D(float dt) {
     // Window alpha keepalive lives on the FS pump (damageWindowsWithLiveAlpha)
     // -- it must tick even when a frame is slow.
 
-    // The collision set = the grid platform (when world.grid) + the map
-    // triangles (when map.collision). Rebuild when any of those changed.
-    const uint64_t SETUP = (g_cfgGrid ? 1ull : 0ull) |
-        ((g_mapCollisionOn ? 1ull : 0ull) << 1) |
-        (static_cast<uint64_t>(g_scene.mapGeneration()) << 2);
+    // Collision = PER-OBJECT trees: each scene object owns a small BVH over
+    // its world triangles, rebuilt only when ITS OWN generation changes.
+    // The static map's big tree builds once and never rebuilds for the FS
+    // cycles or object carries -- the release hitch was the full 70k-triangle
+    // rebuild; now a release rebuilds only the carried prop's small tree.
+    // The carried object's tree also rebuilds per frame (a prop is small)
+    // but is EXCLUDED from the queries while carried, so the object the
+    // player holds cannot push them around.
+    g_objTrees.resize(g_sceneObjects.size());
+    g_objTreeGens.resize(g_sceneObjects.size(), 0);
 
-    if (SETUP != g_mapCollisionSetup) {
-        std::vector<CMapCollision::STL> TRIS;
+    for (size_t i = 0; i < g_sceneObjects.size(); ++i) {
+        const uint32_t GEN =
+            g_scene.sceneModel(i) ? g_scene.sceneModel(i)->generation() : 0;
 
-        if (g_cfgGrid) {
-            // The visible grid platform as a real slab: top at world zero,
-            // half extent matching the drawn grid lines (20), 0.5 thick.
-            // Past its edge there is no collision -- the world has no floor
-            // clamp, falling off the platform is falling.
-            constexpr float H = 20.0f, T = 0.5f;
-            const Vec3 A{-H, 0, -H}, B{H, 0, -H}, C{H, 0, H}, D{-H, 0, H};
-            const Vec3 A2{-H, -T, -H}, B2{H, -T, -H}, C2{H, -T, H},
-                D2{-H, -T, H};
+        const bool SKIP = !g_sceneObjects[i].collision || g_mapGrabIndex == i;
 
-            const auto QUAD = [&](const Vec3& p1, const Vec3& p2,
-                                  const Vec3& p3, const Vec3& p4) {
-                TRIS.push_back({p1, p2, p3});
-                TRIS.push_back({p1, p3, p4});
-            };
-
-            QUAD(A, D, C, B);    // top
-            QUAD(A2, B2, C2, D2); // bottom
-            QUAD(A, B, B2, A2);  // -z side
-            QUAD(B, C, C2, B2);  // +x side
-            QUAD(C, D, D2, C2);  // +z side
-            QUAD(D, A, A2, D2);  // -x side
+        if (SKIP) {
+            // Collision off / object carried: its tree must be EMPTY (the
+            // clear belongs to this branch only -- clearing after a build
+            // wiped every just-built tree and killed all collision).
+            if (!g_objTrees[i].empty())
+                g_objTrees[i].clear();
+            g_objTreeGens[i] = GEN;
+        } else if (g_objTreeGens[i] != GEN) {
+            if (const auto* MODEL = g_scene.sceneModel(i))
+                g_objTrees[i].build(MODEL->triangles());
+            g_objTreeGens[i] = GEN;
         }
+    }
 
-        if (g_mapCollisionOn)
-            TRIS.insert(TRIS.end(), g_scene.mapTriangles().begin(),
-                        g_scene.mapTriangles().end());
+    if (g_cfgGrid && !g_platformBuilt) {
+        // The visible grid platform as a real slab: top at world zero, half
+        // extent matching the drawn grid lines (20), 0.5 thick. Past its
+        // edge there is no collision -- the world has no floor clamp,
+        // falling off the platform is falling.
+        constexpr float H = 20.0f, T = 0.5f;
+        const Vec3 A{-H, 0, -H}, B{H, 0, -H}, C{H, 0, H}, D{-H, 0, H};
+        const Vec3 A2{-H, -T, -H}, B2{H, -T, -H}, C2{H, -T, H}, D2{-H, -T, H};
 
-        g_mapCollision.build(TRIS);
-        g_mapCollisionSetup = SETUP;
+        std::vector<CMapCollision::STL> TRIS_STORE;
+
+        const auto QUAD = [&](const Vec3& p1, const Vec3& p2,
+                              const Vec3& p3, const Vec3& p4) {
+            TRIS_STORE.push_back({p1, p2, p3});
+            TRIS_STORE.push_back({p1, p3, p4});
+        };
+
+        QUAD(A, D, C, B);     // top
+        QUAD(A2, B2, C2, D2); // bottom
+        QUAD(A, B, B2, A2);   // -z side
+        QUAD(B, C, C2, B2);   // +x side
+        QUAD(C, D, D2, C2);   // +z side
+        QUAD(D, A, A2, D2);   // -x side
+
+        g_platform.build(TRIS_STORE);
+        g_platformBuilt = true;
     }
 
     if (g_input.consumeLook(yawDelta, pitchDelta, dt)) {
@@ -2066,7 +2210,17 @@ static void update3D(float dt) {
     // Map collision: a vertical capsule (rounded hull) instead of a box --
     // walls and seams slide past instead of snagging corners. The flat-floor
     // clamp in Camera::move stays as the fallback.
-    if (!g_mapCollision.empty()) {
+    std::vector<const CMapCollision*> TREES;
+
+    if (g_cfgGrid && g_platformBuilt)
+        TREES.push_back(&g_platform);
+
+    for (size_t i = 0; i < g_objTrees.size(); ++i)
+        if (g_sceneObjects[i].collision && i != g_mapGrabIndex &&
+            !g_objTrees[i].empty())
+            TREES.push_back(&g_objTrees[i]);
+
+    if (!TREES.empty()) {
         auto& CAM = g_scene.camera();
         const Vec3 DELTA = CAM.position - PREMOVE;
 
@@ -2075,9 +2229,9 @@ static void update3D(float dt) {
 
         if (DELTA.x != 0.f || DELTA.y != 0.f || DELTA.z != 0.f) {
             Vec3 feet{PREMOVE.x, PREMOVE.y - Camera::kEyeHeight, PREMOVE.z};
-            grounded = g_mapCollision.moveCapsule(
-                feet, DELTA, Camera::kBodyHalfWidth, Camera::kBodyHeight,
-                &hitCeiling);
+            grounded = CMapCollision::moveCapsuleOn(
+                TREES, feet, DELTA, Camera::kBodyHalfWidth,
+                Camera::kBodyHeight, &hitCeiling);
             CAM.position = Vec3{feet.x, feet.y + Camera::kEyeHeight, feet.z};
         }
 
@@ -2094,20 +2248,51 @@ static void update3D(float dt) {
         g_grounded = false;
     }
 
-    // decoration:blur feeds the frost overlay on transparent windows
-    // (CConfigValue binds by name and works with both hyprland.conf and
-    // hyprland.lua -- the same accessor Hyprland's own renderer uses).
-    {
-        static const CConfigValue<Config::INTEGER> PBLURENABLED("decoration:blur:enabled");
-        static const CConfigValue<Config::INTEGER> PBLURSIZE("decoration:blur:size");
-        static const CConfigValue<Config::INTEGER> PBLURPASSES("decoration:blur:passes");
-        static const CConfigValue<Config::FLOAT>   PBLURVIBRANCY("decoration:blur:vibrancy");
+    // Map-drag carry: the grabbed object's CENTER rides the crosshair at
+    // the pickup distance, and the object turns to face the player (the
+    // same billboard convention as window dragging). The new placement is
+    // written INTO THE CONFIG OBJECT first: update3D pushes the config
+    // specs into the scene every frame, and a carry that only touched the
+    // scene slot would be overwritten right back -- the object teleported
+    // home on release and both writes recomputed the geometry every frame
+    // (the freezes). With the config object as the single source of truth
+    // the per-frame push compares equal and skips.
+    if (g_pointerGesture == EPointerGesture::MapDrag && g_pointerDown &&
+        g_mapGrabIndex != SIZE_MAX) {
+        const auto& CAM = g_scene.camera();
+        const Vec3 TARGET = CAM.position + CAM.centerRay() * g_mapGrabDist;
 
-        g_scene.setBlurConfig(
-            *PBLURENABLED != 0,
-            static_cast<int>(std::clamp(*PBLURSIZE, int64_t{1}, int64_t{32})),
-            static_cast<int>(std::clamp(*PBLURPASSES, int64_t{1}, int64_t{8})),
-            *PBLURVIBRANCY);
+        // Face the player: the object's +Z normal toward the camera (the
+        // model convention maps the normal's Y to -sin(pitch), so pitch =
+        // asin(-TO.y) -- the same math as the window drag billboard).
+        const Vec3 TO_CAM = normalize(CAM.position - TARGET);
+        const float TARGET_YAW = std::atan2(TO_CAM.x, TO_CAM.z);
+        const float TARGET_PITCH =
+            std::asin(std::clamp(-TO_CAM.y, -1.0f, 1.0f));
+
+        // Smoothly chase the target orientation (wrap-aware on yaw).
+        auto& ROT = g_sceneObjects[g_mapGrabIndex].rotationDeg;
+        constexpr float DEG = 3.14159265358979f / 180.0f;
+
+        float curYaw = ROT.y * DEG;
+        float curPitch = ROT.x * DEG;
+
+        float dYaw = TARGET_YAW - curYaw;
+        while (dYaw > 3.14159265f)
+            dYaw -= 6.28318531f;
+        while (dYaw < -3.14159265f)
+            dYaw += 6.28318531f;
+
+        const float K = 1.0f - std::exp(-10.0f * dt);
+        curYaw += dYaw * K;
+        curPitch += (TARGET_PITCH - curPitch) * K;
+
+        ROT.x = curPitch / DEG;
+        ROT.y = curYaw / DEG;
+
+        g_sceneObjects[g_mapGrabIndex].position = TARGET;
+        g_scene.setSceneObjectTransform(g_mapGrabIndex, TARGET, ROT);
+        damageCurrentMonitor();
     }
 
     // Super+wheel hover zoom: glide the window along its ray toward the
@@ -2622,6 +2807,54 @@ static void onMouseAxis(
     if (!g_superHeld)
         return;
 
+    // A DYNAMIC scene object closer than any window zooms instead: its
+    // center slides along the camera-object line, same multiplicative step,
+    // same no-limits policy as the window zoom.
+    {
+        const auto& CAMZ = g_scene.camera();
+        const auto MRAY = modelRayHit(CAMZ.position, CAMZ.centerRay(), true);
+        const World3D::SHit WHIT = aimHit();
+
+        const bool MODEL_CLOSER =
+            MRAY.hit && (!WHIT.hit || MRAY.dist < WHIT.distance);
+
+        if (!MODEL_CLOSER) {
+            if (s_modelZoomId != SIZE_MAX)
+                s_modelZoomId = SIZE_MAX; // aimed away: drop the zoom
+        } else {
+            const auto* MODEL = g_scene.sceneModel(MRAY.index);
+
+            if (!MODEL || !MODEL->loaded()) {
+                s_modelZoomId = SIZE_MAX;
+                return;
+            }
+
+            if (s_modelZoomId != MRAY.index)
+                s_modelZoomDist = std::sqrt(
+                    (MODEL->position() - CAMZ.position).x *
+                        (MODEL->position() - CAMZ.position).x +
+                    (MODEL->position() - CAMZ.position).y *
+                        (MODEL->position() - CAMZ.position).y +
+                    (MODEL->position() - CAMZ.position).z *
+                        (MODEL->position() - CAMZ.position).z);
+            s_modelZoomId = MRAY.index;
+
+            const float NEW_DIST = s_modelZoomDist * std::pow(1.06, STEPS);
+            const Vec3 DIR = normalize(MODEL->position() - CAMZ.position);
+
+            g_sceneObjects[MRAY.index].position =
+                CAMZ.position + DIR * NEW_DIST;
+            g_scene.setSceneObjectTransform(MRAY.index,
+                                            g_sceneObjects[MRAY.index].position,
+                                            MODEL->rotationDeg());
+            s_modelZoomDist = NEW_DIST;
+
+            info.cancelled = true;
+            damageCurrentMonitor();
+            return;
+        }
+    }
+
     const auto HIT = aimHit();
 
     if (!HIT.hit)
@@ -2686,6 +2919,48 @@ static void onMouseButton(
         const World3D::SHit HIT = aimHit();
         const auto* ENTITY = HIT.hit ? g_world.find(HIT.id) : nullptr;
 
+        // A dynamic scene object closer than any window: roll IT. The roll
+        // axis is its facing normal; the sweep angle is measured on the
+        // plane through its center, exactly like the window roll.
+        {
+            const auto& CAM = g_scene.camera();
+            const auto MRAY = modelRayHit(CAM.position, CAM.centerRay(),
+                                          /*dynamicOnly=*/true);
+
+            if (MRAY.hit && (!HIT.hit || MRAY.dist < HIT.distance)) {
+                const auto* MODEL = g_scene.sceneModel(MRAY.index);
+                const Vec3 CENTER = MODEL->position();
+                const Vec3 NORMAL = normalize(CAM.position - CENTER);
+
+                Vec3 PLANE_POINT;
+                if (rayPlanePoint(CAM.position, CAM.centerRay(), CENTER,
+                                  NORMAL, PLANE_POINT) &&
+                    dot(PLANE_POINT - CENTER, PLANE_POINT - CENTER) > 0.0004f) {
+                    s_wheelRot.active     = true;
+                    s_wheelRot.model      = true;
+                    s_wheelRot.modelIndex = MRAY.index;
+                    s_wheelRot.id         = 0;
+                    s_wheelRot.center     = CENTER;
+                    s_wheelRot.normal     = NORMAL;
+                    s_wheelRot.reference  = PLANE_POINT - CENTER;
+                    s_wheelRot.startRoll  = MODEL->rotationDeg().z *
+                        (3.14159265358979f / 180.0f);
+
+                    g_pointerGesture = EPointerGesture::WheelRoll;
+                    g_pointerButton  = BTN_MIDDLE;
+                    g_pointerDown    = true;
+                    g_resize         = {};
+
+                    info.cancelled = true;
+                    damageCurrentMonitor();
+                    return;
+                }
+
+                info.cancelled = true;
+                return;
+            }
+        }
+
         if (ENTITY) {
             const Vec3 REFERENCE = HIT.point - ENTITY->center;
 
@@ -2723,6 +2998,68 @@ static void onMouseButton(
         const World3D::SHit HIT = aimHit();
         const auto TARGET = HIT.hit ? targetFromHit(HIT.id) : SHitTarget{};
 
+        // A DYNAMIC scene object closer than any window is grabbed with the
+        // left button (one class of grabbable objects: windows and models).
+        // The grabbed object leaves the collision set for the duration (it
+        // follows the crosshair and must not push the player), and returns
+        // to it on release.
+        if (event.button == BTN_LEFT) {
+            const auto& CAM = g_scene.camera();
+            const Vec3 DIR = CAM.centerRay();
+
+            float bestT = -1.f;
+            size_t bestIdx = SIZE_MAX;
+
+            for (size_t i = 0; i < g_sceneObjects.size(); ++i) {
+                if (!g_sceneObjects[i].dynamic)
+                    continue;
+
+                const auto* MODEL = g_scene.sceneModel(i);
+                if (!MODEL || !MODEL->loaded())
+                    continue;
+
+                const float T = MODEL->rayCast(CAM.position, DIR);
+                if (T > 0.f && (bestT < 0.f || T < bestT)) {
+                    bestT   = T;
+                    bestIdx = i;
+                }
+            }
+
+            // The model must also be CLOSER than the aimed window -- one
+            // distance space for both classes.
+            if (bestIdx != SIZE_MAX && bestT < 0.f)
+                bestIdx = SIZE_MAX;
+            if (bestIdx != SIZE_MAX && HIT.hit && bestT >= HIT.distance)
+                bestIdx = SIZE_MAX;
+
+            if (bestIdx != SIZE_MAX) {
+                const auto* MODEL = g_scene.sceneModel(bestIdx);
+
+                // Center grab: the object's center rides the crosshair, so
+                // the pickup distance is the camera-to-CENTER distance and
+                // there is no point offset.
+                g_mapGrabIndex = bestIdx;
+                g_mapGrabDist  = std::sqrt(
+                    (MODEL->position() - CAM.position).x *
+                        (MODEL->position() - CAM.position).x +
+                    (MODEL->position() - CAM.position).y *
+                        (MODEL->position() - CAM.position).y +
+                    (MODEL->position() - CAM.position).z *
+                        (MODEL->position() - CAM.position).z);
+
+                s_modelZoomId = SIZE_MAX; // the drag owns the object now
+
+                g_pointerGesture = EPointerGesture::MapDrag;
+                g_pointerButton  = BTN_LEFT;
+                g_pointerDown    = true;
+                g_resize         = {};
+
+                info.cancelled = true;
+                damageCurrentMonitor();
+                return;
+            }
+        }
+
         if (!TARGET.window && !TARGET.layer) {
             info.cancelled = true;
             return;
@@ -2733,9 +3070,14 @@ static void onMouseButton(
         if (TARGET.window)
             Compat::focusWindow(TARGET.window);
 
-        if (event.button == BTN_RIGHT && !TARGET.window) {
-            info.cancelled = true;
-            return;
+        // Resize is a window-only control: a scene model in front of the
+        // crosshair must not let the gesture reach a window behind it.
+        if (event.button == BTN_RIGHT) {
+            if (!TARGET.window || modelInFront(CAM.position,
+                                               CAM.centerRay(), HIT)) {
+                info.cancelled = true;
+                return;
+            }
         }
 
         if (event.button == BTN_LEFT) {
@@ -2800,8 +3142,16 @@ static void onMouseButton(
 
     // Regular buttons are virtual-pointer buttons at the crosshair. Track the
     // pressed surface so release goes back to the same client even if the
-    // camera turns away before release.
+    // camera turns away before release. A scene model closer than the aimed
+    // window occludes it: the click hits geometry, not the client.
+    const auto& CAMC = g_scene.camera();
     const World3D::SHit HIT = aimHit();
+
+    if (modelInFront(CAMC.position, CAMC.centerRay(), HIT)) {
+        info.cancelled = true;
+        return;
+    }
+
     const auto TARGET = HIT.hit ? targetFromHit(HIT.id) : SHitTarget{};
 
     if (!TARGET.window && !TARGET.layer) {
@@ -3153,45 +3503,143 @@ static int luaConfig(lua_State* L) {
         lua_pop(L, 1);
     }
 
-    idx = SECTION("map", "map");
+    // scene = { <any name> = { path, transform, emissive_scale, flat,
+    //           collision, static }, ... } -- unlimited named objects.
+    // Object names are free-form (for the user's readability only).
+    idx = SECTION("scene", "scene");
     if (idx == -1)
-        return luaL_error(L, "hypr3d.config: map must be a table");
+        return luaL_error(L, "hypr3d.config: scene must be a table");
     if (idx > 0) {
-        if (!SET_STRING(idx, "path", g_cfgMapPath, "map.path"))
-            return luaL_error(L, "hypr3d.config: map.path must be a string");
-        if (!SET_BOOL(idx, "flat", g_mapFlat, "map.flat"))
-            return luaL_error(L, "hypr3d.config: map.flat must be a boolean");
-        if (!SET_BOOL(idx, "collision", g_mapCollisionOn, "map.collision"))
-            return luaL_error(L, "hypr3d.config: map.collision must be a boolean");
-        if (!SET_NUM(idx, "emissive_scale", g_mapEmissiveScale, 0.0f, 20.0f,
-                     "map.emissive_scale"))
-            return luaL_error(L, "hypr3d.config: map.emissive_scale must be a number");
+        std::vector<SSceneObjectCfg> OBJECTS;
 
-        lua_getfield(L, idx, "transform");
-        if (lua_isnil(L, -1)) {
-            lua_pop(L, 1);
-        } else if (!lua_istable(L, -1)) {
-            lua_pop(L, 1);
-            return luaL_error(
-                L, "hypr3d.config: map.transform must be a table with position/rotation/scale");
-        } else {
-            const int TIDX = lua_gettop(L);
+        lua_pushnil(L);
+        while (lua_next(L, idx) != 0) {
+            // stack: [key, value]
+            if (!lua_istable(L, -1)) {
+                lua_pop(L, 1); // keep the key for the next iteration
+                continue;
+            }
 
-            if (!SET_VEC3(TIDX, "position", g_mapPosition, "map.transform.position"))
-                return luaL_error(L, "hypr3d.config: map.transform.position must be a table { x = .., y = .., z = .. }");
-            if (!SET_VEC3(TIDX, "rotation", g_mapRotationDeg, "map.transform.rotation"))
-                return luaL_error(L, "hypr3d.config: map.transform.rotation must be a table { x = .., y = .., z = .. } (degrees)");
-            if (!SET_VEC3(TIDX, "scale", g_mapScale, "map.transform.scale"))
-                return luaL_error(L, "hypr3d.config: map.transform.scale must be a table { x = .., y = .., z = .. }");
+            SSceneObjectCfg OBJ;
+            const int OIDX = lua_gettop(L);
 
-            // Zero axes would collapse the map to a plane hair.
-            g_mapScale.x = std::clamp(g_mapScale.x, 0.05f, 10.0f);
-            g_mapScale.y = std::clamp(g_mapScale.y, 0.05f, 10.0f);
-            g_mapScale.z = std::clamp(g_mapScale.z, 0.05f, 10.0f);
+            if (!SET_STRING(OIDX, "path", OBJ.path, "scene.<name>.path")) {
+                lua_pop(L, 1);
+                return luaL_error(L, "hypr3d.config: scene.<name>.path must be a string");
+            }
+
+            // transform = { position, rotation, scale } -- a NESTED table.
+            // (An earlier parser revision looked for position/rotation/scale
+            // directly on the object, found nothing, and every object
+            // rendered at its identity transform.)
+            lua_getfield(L, OIDX, "transform");
+            if (lua_isnil(L, -1)) {
+                lua_pop(L, 1);
+            } else if (!lua_istable(L, -1)) {
+                lua_pop(L, 1);
+                return luaL_error(L, "hypr3d.config: scene.<name>.transform must be a table with position/rotation/scale");
+            } else {
+                const int TIDX = lua_gettop(L);
+
+                if (!SET_VEC3(TIDX, "position", OBJ.position,
+                              "scene.<name>.transform.position"))
+                    return luaL_error(L, "hypr3d.config: scene.<name>.transform.position must be a table { x = .., y = .., z = .. }");
+                if (!SET_VEC3(TIDX, "rotation", OBJ.rotationDeg,
+                              "scene.<name>.transform.rotation"))
+                    return luaL_error(L, "hypr3d.config: scene.<name>.transform.rotation must be a table { x = .., y = .., z = .. } (degrees)");
+                if (!SET_VEC3(TIDX, "scale", OBJ.scale,
+                              "scene.<name>.transform.scale"))
+                    return luaL_error(L, "hypr3d.config: scene.<name>.transform.scale must be a table { x = .., y = .., z = .. }");
+
+                // Zero axes would collapse the object to a plane hair.
+                OBJ.scale.x = std::clamp(OBJ.scale.x, 0.05f, 10.0f);
+                OBJ.scale.y = std::clamp(OBJ.scale.y, 0.05f, 10.0f);
+                OBJ.scale.z = std::clamp(OBJ.scale.z, 0.05f, 10.0f);
+
+                lua_pop(L, 1);
+            }
+
+            if (!SET_NUM(OIDX, "emissive_scale", OBJ.emissiveScale, 0.0f, 20.0f,
+                         "scene.<name>.emissive_scale")) {
+                lua_pop(L, 1);
+                return luaL_error(L, "hypr3d.config: scene.<name>.emissive_scale must be a number");
+            }
+            if (!SET_BOOL(OIDX, "flat", OBJ.flat, "scene.<name>.flat")) {
+                lua_pop(L, 1);
+                return luaL_error(L, "hypr3d.config: scene.<name>.flat must be a boolean");
+            }
+            if (!SET_BOOL(OIDX, "collision", OBJ.collision, "scene.<name>.collision")) {
+                lua_pop(L, 1);
+                return luaL_error(L, "hypr3d.config: scene.<name>.collision must be a boolean");
+            }
+
+            // static = true (default): immovable location geometry.
+            // static = false: a dynamic object -- grabbable with Super+LMB.
+            bool staticObj = true;
+            if (!SET_BOOL(OIDX, "static", staticObj, "scene.<name>.static")) {
+                lua_pop(L, 1);
+                return luaL_error(L, "hypr3d.config: scene.<name>.static must be a boolean");
+            }
+            OBJ.dynamic = !staticObj;
+
+            OBJECTS.push_back(OBJ);
+            lua_pop(L, 1); // pop the value; the key remains for lua_next
+        }
+
+        g_sceneObjects = std::move(OBJECTS);
+        lua_pop(L, 1);
+    }
+
+    // Legacy single-map section: folded into the scene as one object (a
+    // scene = { map = ... } entry supersedes it -- scene wins when both
+    // exist).
+    if (g_sceneObjects.empty()) {
+        idx = SECTION("map", "map");
+        if (idx == -1)
+            return luaL_error(L, "hypr3d.config: map must be a table");
+        if (idx > 0) {
+            SSceneObjectCfg OBJ;
+
+            if (!SET_STRING(idx, "path", OBJ.path, "map.path"))
+                return luaL_error(L, "hypr3d.config: map.path must be a string");
+
+            // transform = { position, rotation, scale } -- nested, same as
+            // the scene objects.
+            lua_getfield(L, idx, "transform");
+            if (lua_isnil(L, -1)) {
+                lua_pop(L, 1);
+            } else if (!lua_istable(L, -1)) {
+                lua_pop(L, 1);
+                return luaL_error(L, "hypr3d.config: map.transform must be a table with position/rotation/scale");
+            } else {
+                const int TIDX = lua_gettop(L);
+
+                if (!SET_VEC3(TIDX, "position", OBJ.position, "map.transform.position"))
+                    return luaL_error(L, "hypr3d.config: map.transform.position must be a table { x = .., y = .., z = .. }");
+                if (!SET_VEC3(TIDX, "rotation", OBJ.rotationDeg, "map.transform.rotation"))
+                    return luaL_error(L, "hypr3d.config: map.transform.rotation must be a table { x = .., y = .., z = .. } (degrees)");
+                if (!SET_VEC3(TIDX, "scale", OBJ.scale, "map.transform.scale"))
+                    return luaL_error(L, "hypr3d.config: map.transform.scale must be a table { x = .., y = .., z = .. }");
+
+                OBJ.scale.x = std::clamp(OBJ.scale.x, 0.05f, 10.0f);
+                OBJ.scale.y = std::clamp(OBJ.scale.y, 0.05f, 10.0f);
+                OBJ.scale.z = std::clamp(OBJ.scale.z, 0.05f, 10.0f);
+
+                lua_pop(L, 1);
+            }
+
+            if (!SET_NUM(idx, "emissive_scale", OBJ.emissiveScale, 0.0f, 20.0f,
+                         "map.emissive_scale"))
+                return luaL_error(L, "hypr3d.config: map.emissive_scale must be a number");
+            if (!SET_BOOL(idx, "flat", OBJ.flat, "map.flat"))
+                return luaL_error(L, "hypr3d.config: map.flat must be a boolean");
+            if (!SET_BOOL(idx, "collision", OBJ.collision, "map.collision"))
+                return luaL_error(L, "hypr3d.config: map.collision must be a boolean");
+
+            g_sceneObjects.push_back(OBJ);
 
             lua_pop(L, 1);
         }
-        lua_pop(L, 1);
     }
 
     return 0;

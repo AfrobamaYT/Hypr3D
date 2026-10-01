@@ -51,6 +51,22 @@ class CMapModel {
     // need back-to-front to composite correctly against each other).
     void draw(const Mat4& vp, const Vec3& cameraPos) const;
 
+    // Closest world-space hit of a ray against this model's triangles, or
+    // -1. Used to grab dynamic (static = false) scene objects.
+    float rayCast(const Vec3& origin, const Vec3& dir) const;
+
+    const Vec3& position() const {
+        return m_position;
+    }
+
+    const Vec3& rotationDeg() const {
+        return m_rotationDeg;
+    }
+
+    bool hasPath() const {
+        return !m_path.empty();
+    }
+
     // Wireframe of the world-space collision triangles (red, x-ray). The
     // line buffer is (re)built on the next draw whenever the triangles were
     // recomputed (m_debugPending) -- scale/rotation changes included.

@@ -11,6 +11,8 @@
 #include <hyprgraphics/image/Image.hpp>
 
 #include <algorithm>
+#include <functional>
+#include <memory>
 #include <cmath>
 #include <cstddef>
 #include <filesystem>
@@ -27,6 +29,168 @@ constexpr float PI = 3.14159265358979323846f;
 // Real ground plane. The camera is constrained above this level and the grid
 // is drawn on this plane, not on a ceiling. Windows live above it.
 constexpr float FLOOR_Y = Camera::kFloorY;
+
+// --- window transparency: BSP-ordered exact compositing ---------------------
+//
+// Two translucent window quads crossing in space cannot be blended correctly
+// by a single global draw order: per pixel, the draw order must match which
+// plane is actually closer, and for crossing planes that flips across the
+// intersection line. A BSP built from the window planes splits crossing quads
+// along those lines and the back-to-front traversal yields a per-pixel
+// correct order (the classic use of BSP for alpha sorting). Every window is
+// a handful of polygons, so the tree is tiny.
+
+struct SWVert {
+    Vec3  p{};
+    float u = 0.f, v = 0.f;
+};
+
+struct SWPoly {
+    std::vector<SWVert> verts;
+    unsigned int        tex = 0;
+    float               alpha = 1.0f; // the window's room alpha (g_fsFade etc.)
+};
+
+// Split a polygon by a plane. Pieces on the positive side go to `front`,
+// negative to `back`; vertices on the plane land in both.
+static void bspSplitPoly(const SWPoly& poly, const Vec3& pl, const Vec3& n,
+                         SWPoly& front, SWPoly& back,
+                         bool& hasFront, bool& hasBack) {
+    front.verts.clear();
+    back.verts.clear();
+    // Both pieces belong to the same window: carry its texture and alpha,
+    // or a split piece renders with texture 0 -- pure black.
+    front.tex      = poly.tex;
+    front.alpha    = poly.alpha;
+    back.tex       = poly.tex;
+    back.alpha     = poly.alpha;
+    hasFront = hasBack = false;
+
+    const size_t COUNT = poly.verts.size();
+    if (COUNT < 3 || COUNT > 32)
+        return;
+
+    float dist[32];
+    for (size_t i = 0; i < COUNT; ++i)
+        dist[i] = dot(poly.verts[i].p - pl, n);
+
+    for (size_t i = 0; i < COUNT; ++i) {
+        const size_t J = (i + 1) % COUNT;
+        const auto&  A = poly.verts[i];
+        const auto&  B = poly.verts[J];
+        const float  DA = dist[i], DB = dist[J];
+
+        if (DA >= 0.f) {
+            front.verts.push_back(A);
+            if (DA > 0.f)
+                hasFront = true;
+        }
+        if (DA <= 0.f) {
+            back.verts.push_back(A);
+            if (DA < 0.f)
+                hasBack = true;
+        }
+
+        if ((DA > 0.f && DB < 0.f) || (DA < 0.f && DB > 0.f)) {
+            const float T = DA / (DA - DB);
+            SWVert I{
+                A.p + (B.p - A.p) * T,
+                A.u + (B.u - A.u) * T,
+                A.v + (B.v - A.v) * T,
+            };
+            front.verts.push_back(I);
+            back.verts.push_back(I);
+        }
+    }
+
+    hasFront = hasFront && front.verts.size() >= 3;
+    hasBack  = hasBack  && back.verts.size()  >= 3;
+}
+
+struct SBspNode {
+    Vec3 p{}, n{};
+    std::vector<SWPoly>        coplanar;
+    std::unique_ptr<SBspNode>  front, back;
+};
+
+static void bspBuild(SBspNode& node, std::vector<SWPoly>& polys, int depth) {
+    if (polys.empty())
+        return;
+
+    // Node plane from the first polygon.
+    const Vec3 A = polys[0].verts[0].p;
+    const Vec3 B = polys[0].verts[1].p;
+    const Vec3 C = polys[0].verts[2].p;
+    node.p = A;
+    node.n = normalize(cross(B - A, C - A));
+
+    std::vector<SWPoly> frontList, backList;
+
+    for (auto& POLY : polys) {
+        float dist[32];
+        const size_t COUNT = std::min<size_t>(POLY.verts.size(), 32);
+
+        bool pos = false, neg = false;
+        for (size_t i = 0; i < COUNT; ++i) {
+            dist[i] = dot(POLY.verts[i].p - node.p, node.n);
+            pos = pos || dist[i] > 1e-4f;
+            neg = neg || dist[i] < -1e-4f;
+        }
+
+        if (!pos) {
+            node.coplanar.push_back(std::move(POLY));
+        } else if (!neg) {
+            frontList.push_back(std::move(POLY));
+        } else {
+            SWPoly front, back;
+            bool hasFront = false, hasBack = false;
+            bspSplitPoly(POLY, node.p, node.n, front, back, hasFront, hasBack);
+
+            if (hasFront)
+                frontList.push_back(std::move(front));
+            if (hasBack)
+                backList.push_back(std::move(back));
+            // Fully straddling polygons lose nothing: both pieces carry the
+            // texture onward.
+        }
+    }
+
+    constexpr int MAX_DEPTH = 12;
+
+    if (depth < MAX_DEPTH && !frontList.empty()) {
+        node.front = std::make_unique<SBspNode>();
+        bspBuild(*node.front, frontList, depth + 1);
+    } else {
+        for (auto& P : frontList)
+            node.coplanar.push_back(std::move(P));
+    }
+
+    if (depth < MAX_DEPTH && !backList.empty()) {
+        node.back = std::make_unique<SBspNode>();
+        bspBuild(*node.back, backList, depth + 1);
+    } else {
+        for (auto& P : backList)
+            node.coplanar.push_back(std::move(P));
+    }
+}
+
+static void bspTraverse(const SBspNode& node, const Vec3& eye,
+                        const std::function<void(const SWPoly&)>& emit) {
+    const float SIDE = dot(eye - node.p, node.n);
+
+    // The side the eye is on is NEARER: draw the other side first.
+    const SBspNode* FAR_FIRST = SIDE > 0 ? node.back.get() : node.front.get();
+    const SBspNode* NEAR_LAST = SIDE > 0 ? node.front.get() : node.back.get();
+
+    if (FAR_FIRST)
+        bspTraverse(*FAR_FIRST, eye, emit);
+
+    for (const auto& P : node.coplanar)
+        emit(P);
+
+    if (NEAR_LAST)
+        bspTraverse(*NEAR_LAST, eye, emit);
+}
 
 static GLuint compileShader(
     GLenum type,
@@ -251,28 +415,14 @@ in vec2 vUV;
 uniform sampler2D uTexture;
 uniform int uTextured;
 uniform vec4 uColor;
-uniform int uFrost;
-uniform sampler2D uBlurTex;
-uniform vec2 uScreen;
 
 out vec4 fragColor;
 
 void main() {
-    if (uTextured != 0) {
-        vec4 win = texture(uTexture, vUV) * uColor;
-
-        // Frosted overlay: the blurred FINAL scene at this screen area,
-        // alpha'd by the client content. The blur lands ON the window
-        // itself (decoration:blur), not just the backdrop behind it.
-        if (uFrost != 0) {
-            vec3 bg = texture(uBlurTex, gl_FragCoord.xy / uScreen).rgb;
-            fragColor = vec4(bg, win.a);
-        } else {
-            fragColor = win;
-        }
-    } else {
+    if (uTextured != 0)
+        fragColor = texture(uTexture, vUV) * uColor;
+    else
         fragColor = uColor;
-    }
 }
 )GLSL";
 
@@ -398,89 +548,6 @@ void main() {
     if (!m_blitProgram)
         return false;
 
-    static constexpr const char* blurVertexShader = R"GLSL(
-#version 300 es
-
-layout(location = 0) in vec2 aPosition;
-layout(location = 1) in vec2 aUV;
-
-out vec2 vUV;
-
-void main() {
-    vUV = aUV;
-    gl_Position = vec4(aPosition, 0.0, 1.0);
-}
-)GLSL";
-
-    // Separable 5-tap gaussian; the final pass applies the vibrancy boost.
-    static constexpr const char* blurFragmentShader = R"GLSL(
-#version 300 es
-
-precision mediump float;
-
-in vec2 vUV;
-
-uniform sampler2D uTex;
-uniform vec2 uTexel;
-uniform vec2 uDir;
-uniform float uRadius;
-uniform float uVibrancy;
-uniform int uFinal;
-
-out vec4 fragColor;
-
-void main() {
-    vec4 c = texture(uTex, vUV) * 0.2270270270;
-
-    vec2 o1 = uDir * uTexel * 1.3846153846 * uRadius;
-    vec2 o2 = uDir * uTexel * 3.2307692308 * uRadius;
-
-    c += texture(uTex, vUV + o1) * 0.3162162162;
-    c += texture(uTex, vUV - o1) * 0.3162162162;
-    c += texture(uTex, vUV + o2) * 0.0702702703;
-    c += texture(uTex, vUV - o2) * 0.0702702703;
-
-    if (uFinal != 0) {
-        float luma = dot(c.rgb, vec3(0.2126, 0.7152, 0.0722));
-        c.rgb = mix(vec3(luma), c.rgb, 1.0 + uVibrancy);
-    }
-
-    fragColor = c;
-}
-)GLSL";
-
-    const GLuint BLUR_VS =
-        compileShader(
-            GL_VERTEX_SHADER,
-            blurVertexShader
-        );
-
-    if (!BLUR_VS)
-        return false;
-
-    const GLuint BLUR_FS =
-        compileShader(
-            GL_FRAGMENT_SHADER,
-            blurFragmentShader
-        );
-
-    if (!BLUR_FS) {
-        glDeleteShader(BLUR_VS);
-        return false;
-    }
-
-    m_blurProgram =
-        linkProgram(
-            BLUR_VS,
-            BLUR_FS
-        );
-
-    glDeleteShader(BLUR_VS);
-    glDeleteShader(BLUR_FS);
-
-    if (!m_blurProgram)
-        return false;
-
     static constexpr const char* panoramaVertexShader = R"GLSL(
 #version 300 es
 
@@ -597,60 +664,6 @@ void main() {
             "uUVRect"
         );
 
-    m_sceneFrost =
-        glGetUniformLocation(
-            m_sceneProgram,
-            "uFrost"
-        );
-
-    m_sceneBlurTex =
-        glGetUniformLocation(
-            m_sceneProgram,
-            "uBlurTex"
-        );
-
-    m_sceneScreen =
-        glGetUniformLocation(
-            m_sceneProgram,
-            "uScreen"
-        );
-
-    m_blurUTex =
-        glGetUniformLocation(
-            m_blurProgram,
-            "uTex"
-        );
-
-    m_blurUTexel =
-        glGetUniformLocation(
-            m_blurProgram,
-            "uTexel"
-        );
-
-    m_blurUDir =
-        glGetUniformLocation(
-            m_blurProgram,
-            "uDir"
-        );
-
-    m_blurURadius =
-        glGetUniformLocation(
-            m_blurProgram,
-            "uRadius"
-        );
-
-    m_blurUVibrancy =
-        glGetUniformLocation(
-            m_blurProgram,
-            "uVibrancy"
-        );
-
-    m_blurUFinal =
-        glGetUniformLocation(
-            m_blurProgram,
-            "uFinal"
-        );
-
     m_blitTexture =
         glGetUniformLocation(
             m_blitProgram,
@@ -711,15 +724,6 @@ void main() {
         m_sceneTextured >= 0 &&
         m_sceneColorUniform >= 0 &&
         m_sceneUVRect >= 0 &&
-        m_sceneFrost >= 0 &&
-        m_sceneBlurTex >= 0 &&
-        m_sceneScreen >= 0 &&
-        m_blurUTex >= 0 &&
-        m_blurUTexel >= 0 &&
-        m_blurUDir >= 0 &&
-        m_blurURadius >= 0 &&
-        m_blurUVibrancy >= 0 &&
-        m_blurUFinal >= 0 &&
         m_blitTexture >= 0 &&
         m_blitAlpha >= 0 &&
         m_panoramaFwd >= 0 &&
@@ -1018,18 +1022,6 @@ void GLScene::drawQuad(
         uvRect[3] - uvRect[1]
     );
 
-    // Frosted overlay draw (window second pass only; the floor and crosshair
-    // run with m_frost == false).
-    glUniform1i(m_sceneFrost, m_frost ? 1 : 0);
-    if (m_useBlur && m_blurFinalTex) {
-        glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, m_blurFinalTex);
-        glUniform1i(m_sceneBlurTex, 1);
-        glUniform2f(m_sceneScreen,
-            static_cast<float>(m_width), static_cast<float>(m_height));
-        glActiveTexture(GL_TEXTURE0);
-    }
-
     if (texture) {
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, texture);
@@ -1041,12 +1033,6 @@ void GLScene::drawQuad(
     glDrawArrays(GL_TRIANGLES, 0, vertexCount);
 
     glBindVertexArray(0);
-
-    if (m_useBlur && m_blurFinalTex) {
-        glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, 0);
-        glActiveTexture(GL_TEXTURE0);
-    }
 
     if (texture)
         glBindTexture(GL_TEXTURE_2D, 0);
@@ -1182,41 +1168,114 @@ void GLScene::refreshPanorama() {
     m_panoramaW = W;
 }
 
-// Loads (or reloads) the glTF map when the config path or the file's mtime
-// changed. Runs inside render() so the EGL context is current -- the same
-// rule as the panorama.
-void GLScene::refreshMap() {
-    if (m_mapPath.empty()) {
-        if (m_map.loaded()) {
-            m_map.destroy();
-            m_mapLoadedPath.clear();
-            m_mapMtimeValid = false;
+// Diff-apply the config object list against the slot vector.
+void GLScene::setSceneObjects(const std::vector<SSceneSpec>& specs) {
+    while (m_slots.size() > specs.size()) {
+        if (m_slots.back().model)
+            m_slots.back().model->destroy();
+        m_slots.pop_back();
+    }
+
+    m_slots.resize(specs.size());
+
+    for (size_t i = 0; i < specs.size(); ++i) {
+        auto& S = m_slots[i];
+
+        if (!S.model)
+            S.model = std::make_unique<CMapModel>();
+
+        const bool TRANSFORM_CHANGED =
+            S.spec.position.x != specs[i].position.x ||
+            S.spec.position.y != specs[i].position.y ||
+            S.spec.position.z != specs[i].position.z ||
+            S.spec.rotationDeg.x != specs[i].rotationDeg.x ||
+            S.spec.rotationDeg.y != specs[i].rotationDeg.y ||
+            S.spec.rotationDeg.z != specs[i].rotationDeg.z ||
+            S.spec.scale.x != specs[i].scale.x ||
+            S.spec.scale.y != specs[i].scale.y ||
+            S.spec.scale.z != specs[i].scale.z;
+
+        S.spec = specs[i];
+
+        S.model->setEmissiveScale(S.spec.emissiveScale);
+        S.model->setFlat(S.spec.flat);
+
+        if (TRANSFORM_CHANGED)
+            S.model->setTransform(S.spec.position, S.spec.rotationDeg,
+                                  S.spec.scale);
+    }
+}
+
+void GLScene::setSceneObjectTransform(size_t index, const Vec3& position,
+                                      const Vec3& rotationDeg) {
+    if (index >= m_slots.size() || !m_slots[index].model)
+        return;
+
+    auto& S = m_slots[index];
+    S.spec.position    = position;
+    S.spec.rotationDeg = rotationDeg;
+    S.model->setTransform(S.spec.position, S.spec.rotationDeg, S.spec.scale);
+}
+
+uint64_t GLScene::sceneFingerprint() const {
+    // Fold per-model generations + slot count: any (re)load, transform
+    // change, or add/remove changes the fingerprint.
+    uint64_t F = 1469598103934665603ull;
+
+    const auto MIX = [&](uint64_t V) {
+        F ^= V;
+        F *= 1099511628211ull;
+    };
+
+    MIX(m_slots.size());
+
+    for (const auto& S : m_slots)
+        MIX(S.model ? S.model->generation() : 0ull);
+
+    return F;
+}
+
+// Loads (or reloads) each scene object when its config path or the file's
+// mtime changed. Runs inside render() so the EGL context is current -- the
+// same rule as the panorama.
+void GLScene::refreshScene() {
+    for (auto& S : m_slots) {
+        const std::string& CFG_PATH = S.spec.path;
+
+        if (CFG_PATH.empty()) {
+            if (S.model && S.model->loaded()) {
+                S.model->destroy();
+                S.loadedPath.clear();
+                S.mtimeValid = false;
+            }
+            continue;
         }
-        return;
+
+        // Expand a leading tilde like the panorama path does -- config
+        // paths arrive as "~/..." and cgltf would look for a literal '~'.
+        std::string path = CFG_PATH;
+        if (path.starts_with('~')) {
+            if (const char* HOME = getenv("HOME"))
+                path = std::string{HOME} + path.substr(1);
+        }
+
+        std::error_code ec;
+        const auto MTIME = std::filesystem::last_write_time(path, ec);
+
+        const bool UNCHANGED = S.model && S.model->loaded() &&
+            S.loadedPath == path && S.mtimeValid && !ec &&
+            MTIME == S.mtime;
+
+        if (UNCHANGED)
+            continue;
+
+        S.mtime      = MTIME;
+        S.mtimeValid = !ec;
+        S.loadedPath = path;
+
+        S.model->load(path, S.spec.position, S.spec.rotationDeg,
+                      S.spec.scale);
     }
-
-    // Expand a leading tilde like the panorama path does -- config paths
-    // arrive as "~/..." and cgltf would look for a literal '~' directory.
-    std::string path = m_mapPath;
-    if (path.starts_with('~')) {
-        if (const char* HOME = getenv("HOME"))
-            path = std::string{HOME} + path.substr(1);
-    }
-
-    std::error_code ec;
-    const auto MTIME = std::filesystem::last_write_time(path, ec);
-
-    const bool UNCHANGED = m_map.loaded() && m_mapLoadedPath == path &&
-        m_mapMtimeValid && !ec && MTIME == m_mapMtime;
-
-    if (UNCHANGED)
-        return;
-
-    m_mapMtime      = MTIME;
-    m_mapMtimeValid = !ec;
-    m_mapLoadedPath = path;
-
-    m_map.load(path, m_mapPosition, m_mapRotationDeg, m_mapScale);
 }
 
 void GLScene::drawPanorama(float aspect) {
@@ -1268,126 +1327,6 @@ void GLScene::drawPanorama(float aspect) {
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 
-bool GLScene::ensureBlurTargets(int width, int height) {
-    const int W = std::max(1, width / 2);
-    const int H = std::max(1, height / 2);
-
-    if (m_blurFBOA && m_blurW == W && m_blurH == H)
-        return true;
-
-    destroyBlurTargets();
-
-    glGenTextures(1, &m_blurTexA);
-    glGenTextures(1, &m_blurTexB);
-    glGenFramebuffers(1, &m_blurFBOA);
-    glGenFramebuffers(1, &m_blurFBOB);
-
-    for (unsigned tex : {m_blurTexA, m_blurTexB}) {
-        glBindTexture(GL_TEXTURE_2D, tex);
-
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-
-        glTexImage2D(
-            GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-    }
-
-    for (auto [fbo, tex] : {std::pair<unsigned, unsigned>{m_blurFBOA, m_blurTexA},
-                            std::pair<unsigned, unsigned>{m_blurFBOB, m_blurTexB}}) {
-        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-        glFramebufferTexture2D(
-            GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
-    }
-
-    glBindFramebuffer(GL_FRAMEBUFFER, 0);
-
-    m_blurW = W;
-    m_blurH = H;
-
-    return m_blurFBOA && m_blurFBOB;
-}
-
-void GLScene::destroyBlurTargets() {
-    if (m_blurFBOA) {
-        glDeleteFramebuffers(1, &m_blurFBOA);
-        m_blurFBOA = 0;
-    }
-    if (m_blurFBOB) {
-        glDeleteFramebuffers(1, &m_blurFBOB);
-        m_blurFBOB = 0;
-    }
-    if (m_blurTexA) {
-        glDeleteTextures(1, &m_blurTexA);
-        m_blurTexA = 0;
-    }
-    if (m_blurTexB) {
-        glDeleteTextures(1, &m_blurTexB);
-        m_blurTexB = 0;
-    }
-    m_blurFinalTex = 0;
-    m_blurW = 0;
-    m_blurH = 0;
-}
-
-// Blurs the backdrop (already in m_sceneColor) into half-res ping-pong
-// targets: one radius-0 copy, then `passes` separable H+V gaussian passes,
-// the last one applying the vibrancy boost. The final texture is always
-// m_blurTexA.
-bool GLScene::renderBlur(int width, int height) {
-    if (!ensureBlurTargets(width, height))
-        return false;
-
-    const float RADIUS = static_cast<float>(std::clamp(m_blurSize, 1, 16));
-
-    glUseProgram(m_blurProgram);
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_BLEND);
-
-    const auto pass = [&](unsigned srcTex, unsigned dstFBO, float dx, float dy,
-                          float radius, bool finalPass) {
-        glBindFramebuffer(GL_FRAMEBUFFER, dstFBO);
-        glViewport(0, 0, m_blurW, m_blurH);
-
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, srcTex);
-        glUniform1i(m_blurUTex, 0);
-        glUniform2f(m_blurUTexel, 1.0f / m_blurW, 1.0f / m_blurH);
-        glUniform2f(m_blurUDir, dx, dy);
-        glUniform1f(m_blurURadius, radius);
-        glUniform1f(m_blurUVibrancy, m_blurVibrancy);
-        glUniform1i(m_blurUFinal, finalPass ? 1 : 0);
-
-        glBindVertexArray(m_fullscreenVAO);
-        glDrawArrays(GL_TRIANGLES, 0, 6);
-        glBindVertexArray(0);
-    };
-
-    // radius-0 copy of the sharp backdrop into the ping-pong chain
-    pass(m_sceneColor, m_blurFBOA, 1, 0, 0, false);
-
-    unsigned cur = m_blurTexA;
-
-    for (int i = 0; i < m_blurPasses; ++i) {
-        const bool LAST = i == m_blurPasses - 1;
-
-        pass(cur, m_blurFBOB, 1, 0, RADIUS, false);
-        pass(m_blurTexB, m_blurFBOA, 0, 1, RADIUS, LAST);
-        cur = m_blurTexA;
-    }
-
-    m_blurFinalTex = cur;
-
-    glBindTexture(GL_TEXTURE_2D, 0);
-    glEnable(GL_DEPTH_TEST);
-    glEnable(GL_BLEND);
-    glDepthMask(GL_FALSE); // windows draw without depth writes, as before
-    glViewport(0, 0, width, height);
-
-    return true;
-}
-
 void GLScene::drawGrid(
     const Mat4& vp
 ) {
@@ -1415,12 +1354,12 @@ void GLScene::drawGrid(
 
 void GLScene::drawWindows(
     const Mat4& vp,
-    const std::vector<WindowRender>& windows,
-    bool frost
+    const std::vector<WindowRender>& windows
 ) {
-    m_frost = frost;
-    std::vector<const WindowRender*> visible;
-    visible.reserve(windows.size());
+    // World-space polygons for the visible windows (the unit quad's corners
+    // run through each window's model matrix; uvRect is folded into the
+    // corner UVs).
+    std::vector<SWPoly> polys;
 
     for (const auto& window : windows) {
         if (!window.texture)
@@ -1432,65 +1371,154 @@ void GLScene::drawWindows(
         if (window.width <= 0.0f || window.height <= 0.0f)
             continue;
 
-        visible.emplace_back(&window);
+        const Mat4 model =
+            Mat4::translation({window.x, window.y, window.z}) *
+            Mat4::rotationY(window.yaw) *
+            Mat4::rotationX(window.pitch) *
+            Mat4::rotationZ(window.roll) *
+            Mat4::scale({window.width, window.height, 1.0f});
+
+        const float CU[4] = {0.f, 1.f, 1.f, 0.f};
+        const float CV[4] = {0.f, 0.f, 1.f, 1.f};
+        const float LX[4] = {-0.5f, 0.5f, 0.5f, -0.5f};
+        const float LY[4] = {-0.5f, -0.5f, 0.5f, 0.5f};
+
+        SWPoly poly;
+        poly.tex   = window.texture;
+        poly.alpha = window.alpha;
+
+        for (int c = 0; c < 4; ++c) {
+            const Vec3 LOCAL{LX[c], LY[c], 0.f};
+            SWVert V{
+                Vec3{
+                    model.m[0] * LOCAL.x + model.m[4] * LOCAL.y +
+                        model.m[8] * LOCAL.z + model.m[12],
+                    model.m[1] * LOCAL.x + model.m[5] * LOCAL.y +
+                        model.m[9] * LOCAL.z + model.m[13],
+                    model.m[2] * LOCAL.x + model.m[6] * LOCAL.y +
+                        model.m[10] * LOCAL.z + model.m[14],
+                },
+                window.u0 + (window.u1 - window.u0) * CU[c],
+                window.v0 + (window.v1 - window.v0) * CV[c],
+            };
+            poly.verts.push_back(V);
+        }
+
+        polys.push_back(std::move(poly));
     }
 
-    if (visible.empty())
+    if (polys.empty())
         return;
 
-    // Alpha-blended windows must be submitted back to front, otherwise a
-    // nearer window drawn first gets overpainted by the one behind it.
+    // Far-to-near insertion order: coplanar overlapping windows (which the
+    // BSP keeps in insertion order) then blend far first, like the sort the
+    // old painter path used.
     const Vec3 eye = m_camera.position;
 
     std::sort(
-        visible.begin(),
-        visible.end(),
-        [&eye](const WindowRender* a, const WindowRender* b) {
-            const float dxA = a->x - eye.x, dyA = a->y - eye.y, dzA = a->z - eye.z;
-            const float dxB = b->x - eye.x, dyB = b->y - eye.y, dzB = b->z - eye.z;
-
-            const float distA = dxA * dxA + dyA * dyA + dzA * dzA;
-            const float distB = dxB * dxB + dyB * dyB + dzB * dzB;
-
-            return distA > distB;
+        polys.begin(),
+        polys.end(),
+        [&eye](const SWPoly& a, const SWPoly& b) {
+            const float ax = a.verts[0].p.x - eye.x;
+            const float ay = a.verts[0].p.y - eye.y;
+            const float az = a.verts[0].p.z - eye.z;
+            const float bx = b.verts[0].p.x - eye.x;
+            const float by = b.verts[0].p.y - eye.y;
+            const float bz = b.verts[0].p.z - eye.z;
+            return ax * ax + ay * ay + az * az >
+                   bx * bx + by * by + bz * bz;
         }
     );
 
-    // Depth still occludes against the ground, but windows do not write depth
-    // -- the ordering above is what decides their blending.
+    // Exact ordering: split crossing quads along each other's planes and
+    // traverse back-to-front from the eye.
+    SBspNode root;
+    bspBuild(root, polys, 0);
+
+    std::vector<SWPoly> ordered;
+    bspTraverse(root, eye, [&ordered](const SWPoly& P) {
+        ordered.push_back(P);
+    });
+
+    if (ordered.empty())
+        return;
+
+    if (!m_polyVAO) {
+        glGenVertexArrays(1, &m_polyVAO);
+        glGenBuffers(1, &m_polyVBO);
+
+        glBindVertexArray(m_polyVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, m_polyVBO);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float),
+                              reinterpret_cast<void*>(0));
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float),
+                              reinterpret_cast<void*>(3 * sizeof(float)));
+        glBindVertexArray(0);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+    }
+
+    glUseProgram(m_sceneProgram);
+    glUniformMatrix4fv(m_sceneMVP, 1, GL_FALSE, vp.m.data());
+    glUniform4f(m_sceneUVRect, 0.f, 0.f, 1.f, 1.f);
+    glUniform1i(m_sceneTexture, 0);
+
     glEnable(GL_DEPTH_TEST);
-    glDepthMask(GL_FALSE);
+    glDepthMask(GL_TRUE);
     glEnable(GL_BLEND);
     glBlendFuncSeparate(
         GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
         GL_ZERO, GL_ONE
     );
 
-    for (const auto* window : visible) {
-        const Mat4 model =
-            Mat4::translation({window->x, window->y, window->z}) *
-            Mat4::rotationY(window->yaw) *
-            Mat4::rotationX(window->pitch) *
-            Mat4::rotationZ(window->roll) *
-            Mat4::scale({window->width, window->height, 1.0f});
+    glBindVertexArray(m_polyVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_polyVBO);
 
-        const float uvRect[4] = {
-            window->u0, window->v0, window->u1, window->v1
-        };
+    glActiveTexture(GL_TEXTURE0);
 
-        drawQuad(
-            m_quadVAO,
-            m_quadVertexCount,
-            vp * model,
-            window->texture,
-            uvRect,
-            1.0f, 1.0f, 1.0f, window->alpha
-        );
+    for (const auto& P : ordered) {
+        std::vector<float> verts;
+        verts.reserve(P.verts.size() * 5);
+
+        for (size_t i = 1; i + 1 < P.verts.size(); ++i) {
+            const auto& A = P.verts[0];
+            const auto& B = P.verts[i];
+            const auto& C = P.verts[i + 1];
+
+            verts.insert(verts.end(), {
+                A.p.x, A.p.y, A.p.z, A.u, A.v,
+                B.p.x, B.p.y, B.p.z, B.u, B.v,
+                C.p.x, C.p.y, C.p.z, C.u, C.v,
+            });
+        }
+
+        glBufferData(GL_ARRAY_BUFFER,
+                     static_cast<GLsizeiptr>(verts.size() * sizeof(float)),
+                     verts.data(), GL_DYNAMIC_DRAW);
+
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float),
+                              reinterpret_cast<void*>(0));
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float),
+                              reinterpret_cast<void*>(3 * sizeof(float)));
+
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, P.tex);
+        glUniform1i(m_sceneTextured, 1);
+        glUniform4f(m_sceneColorUniform, 1.f, 1.f, 1.f, P.alpha);
+
+        glDrawArrays(GL_TRIANGLES, 0,
+                     static_cast<GLint>(verts.size() / 5));
     }
 
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
     glDepthMask(GL_TRUE);
 }
 
+// Restored from the pre-unification revision: the black cross with the
+// white outline at the screen centre (screen-space, scene program).
 void GLScene::drawCrosshair(int width, int height) {
     if (!m_crosshairVAO || !m_crosshairVBO || width <= 0 || height <= 0)
         return;
@@ -1600,9 +1628,8 @@ void GLScene::drawDebugOverlay(int width, int height) {
     if (!m_debugOverlay)
         return;
 
-    // The blur pass leaves ITS OWN framebuffer bound (or 0); the HUD must
-    // land in the scene texture or the composite never picks it up. Save
-    // and restore whatever was current.
+    // The HUD must land in the scene texture or the composite never picks
+    // it up. Save and restore whatever framebuffer was current.
     GLint oldFBO = 0, oldViewport[4] = {0, 0, 0, 0};
     glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &oldFBO);
     glGetIntegerv(GL_VIEWPORT, oldViewport);
@@ -1618,8 +1645,16 @@ void GLScene::drawDebugOverlay(int width, int height) {
     snprintf(line1, sizeof(line1), "YAW %.1f  PIT %.1f",
              CAM.yaw * 180.0f / 3.14159265f, CAM.pitch * 180.0f / 3.14159265f);
     snprintf(line2, sizeof(line2), "FPS %.0f", m_debugFps);
-    snprintf(line3, sizeof(line3), "MAP %s%zu tris",
-             m_map.loaded() ? "" : "none  ", m_map.triangles().size());
+    size_t tris = 0;
+    size_t loaded = 0;
+    for (const auto& S : m_slots)
+        if (S.model && S.model->loaded()) {
+            ++loaded;
+            tris += S.model->triangles().size();
+        }
+
+    snprintf(line3, sizeof(line3), "MAP %zu/%zu objects %zu tris",
+             loaded, m_slots.size(), tris);
 
     const char* LINES[4] = {line0, line1, line2, line3};
 
@@ -1701,7 +1736,6 @@ void GLScene::drawDebugOverlay(int width, int height) {
     glUniformMatrix4fv(m_sceneMVP, 1, GL_FALSE, ORTHO.m.data());
     glUniform4f(m_sceneUVRect, 0.f, 0.f, 1.f, 1.f);
     glUniform1i(m_sceneTextured, 0);
-    glUniform1i(m_sceneFrost, 0);
 
     glDisable(GL_DEPTH_TEST);
     glDepthMask(GL_FALSE);
@@ -1835,14 +1869,17 @@ bool GLScene::render(
     // when loaded; depth rejects whatever is behind its geometry), then the
     // ground so windows behind it are depth-rejected.
     refreshPanorama();
-    refreshMap();
+    refreshScene();
     drawPanorama(aspect);
 
-    if (m_map.loaded()) {
-        m_map.draw(vp, m_camera.position);
+    for (auto& S : m_slots) {
+        if (!S.model || !S.model->loaded())
+            continue;
+
+        S.model->draw(vp, m_camera.position);
 
         // Red x-ray wireframe of the collision triangles (debug).
-        m_map.drawDebug(vp);
+        S.model->drawDebug(vp);
     }
 
     if (m_gridVisible) {
@@ -1858,18 +1895,9 @@ bool GLScene::render(
         drawGrid(vp);
     }
 
-    // Sharp pass first, then blur the FINAL scene (windows included) and draw
-    // it back over the window areas: the blur lands ON the windows, not just
-    // the backdrop behind them.
+    // Windows submit back to front and write depth: crossing quads cut into
+    // each other honestly, and translucency composites in order.
     drawWindows(vp, windows);
-
-    m_useBlur = false;
-
-    if (m_blurEnabled && renderBlur(width, height)) {
-        m_useBlur = true;
-        drawWindows(vp, windows, /*frost*/ true);
-        m_useBlur = false;
-    }
 
     glDepthMask(GL_TRUE);
 
@@ -1989,12 +2017,6 @@ void GLScene::setPanoramaPath(const std::string& path) {
     m_panoramaPath = path;
 }
 
-void GLScene::setBlurConfig(bool enabled, int size, int passes, float vibrancy) {
-    m_blurEnabled  = enabled;
-    m_blurSize     = size;
-    m_blurPasses   = passes;
-    m_blurVibrancy = vibrancy;
-}
 
 void GLScene::mouseMove(
     float dx,
@@ -2051,7 +2073,10 @@ void GLScene::reset() {
 }
 
 void GLScene::shutdown() {
-    m_map.destroy();
+    for (auto& S : m_slots)
+        if (S.model)
+            S.model->destroy();
+    m_slots.clear();
     destroyGLObjects();
 }
 
@@ -2144,12 +2169,7 @@ void GLScene::destroyGLObjects() {
         m_panoramaProgram = 0;
     }
 
-    if (m_blurProgram) {
-        glDeleteProgram(m_blurProgram);
-        m_blurProgram = 0;
-    }
 
-    destroyBlurTargets();
 
     if (m_panoramaTex) {
         glDeleteTextures(1, &m_panoramaTex);

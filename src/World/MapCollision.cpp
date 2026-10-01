@@ -32,33 +32,7 @@ Vec3 triMax(const CMapCollision::STL& t) {
 // Möller–Trumbore. Two-sided: the map may be entered from either side.
 bool rayTriangle(const Vec3& o, const Vec3& d, const CMapCollision::STL& t,
                  float& outT) {
-    const Vec3 E1 = t.b - t.a;
-    const Vec3 E2 = t.c - t.a;
-    const Vec3 P  = cross(d, E2);
-    const float DET = dot(E1, P);
-
-    if (std::fabs(DET) < 1e-9f)
-        return false;
-
-    const float INV = 1.0f / DET;
-    const Vec3  T   = o - t.a;
-    const float U   = dot(T, P) * INV;
-
-    if (U < 0.f || U > 1.f)
-        return false;
-
-    const Vec3 Q = cross(T, E1);
-    const float V = dot(d, Q) * INV;
-
-    if (V < 0.f || U + V > 1.f)
-        return false;
-
-    const float TIME = dot(E2, Q) * INV;
-    if (TIME < 1e-5f)
-        return false;
-
-    outT = TIME;
-    return true;
+    return mapRayTriangle(o, d, t.a, t.b, t.c, outT);
 }
 
 // Closest point on a 2D triangle (x, z projected) to point p. Degenerate
@@ -199,6 +173,39 @@ static void segTriClosest(const Vec3& a, const Vec3& b,
 }
 
 } // namespace
+
+// Möller–Trumbore. Two-sided: the map may be entered from either side. This
+// is the H3D-scope definition the header's rayTriangles template calls.
+bool mapRayTriangle(const Vec3& o, const Vec3& d, const Vec3& a,
+                    const Vec3& b, const Vec3& c, float& outT) {
+    const Vec3 E1 = b - a;
+    const Vec3 E2 = c - a;
+    const Vec3 P  = cross(d, E2);
+    const float DET = dot(E1, P);
+
+    if (std::fabs(DET) < 1e-9f)
+        return false;
+
+    const float INV = 1.0f / DET;
+    const Vec3  T   = o - a;
+    const float U   = dot(T, P) * INV;
+
+    if (U < 0.f || U > 1.f)
+        return false;
+
+    const Vec3 Q = cross(T, E1);
+    const float V = dot(d, Q) * INV;
+
+    if (V < 0.f || U + V > 1.f)
+        return false;
+
+    const float TIME = dot(E2, Q) * INV;
+    if (TIME < 1e-5f)
+        return false;
+
+    outT = TIME;
+    return true;
+}
 
 // --- build ------------------------------------------------------------------
 
@@ -516,14 +523,28 @@ bool CMapCollision::moveAABB(Vec3& position, const Vec3& delta,
 
 bool CMapCollision::moveCapsule(Vec3& feet, const Vec3& delta, float radius,
                                 float height, bool* ceiling) const {
-    if (m_tris.empty()) {
+    std::vector<const CMapCollision*> self{this};
+    return moveCapsuleOn(self, feet, delta, radius, height, ceiling);
+}
+
+bool CMapCollision::moveCapsuleOn(
+    const std::vector<const CMapCollision*>& trees, Vec3& feet,
+    const Vec3& delta, float radius, float height, bool* ceiling) {
+    bool anyTris = false;
+    for (const auto* T : trees)
+        if (T && !T->m_tris.empty())
+            anyTris = true;
+
+    if (!anyTris) {
         if (ceiling)
             *ceiling = false;
         return false;
     }
 
     bool grounded = false;
-    std::vector<uint32_t> near_;
+
+    // (tree, triangle) candidates gathered from every tree per query.
+    std::vector<std::pair<const CMapCollision*, uint32_t>> near_;
 
     // Auto step-up: thresholds and seams must not stop the walk.
     constexpr float STEP = 0.35f;
@@ -550,12 +571,17 @@ bool CMapCollision::moveCapsule(Vec3& feet, const Vec3& delta, float radius,
                     std::max(a.z, b.z) + radius};
 
             near_.clear();
-            query(lo, hi, near_);
+            for (const auto* T : trees) {
+                std::vector<uint32_t> local;
+                T->query(lo, hi, local);
+                for (const uint32_t I : local)
+                    near_.push_back({T, I});
+            }
 
             bool pushed = false;
-            for (const auto I : near_) {
+            for (const auto& [TREE, I] : near_) {
                 Vec3 qa, qb;
-                segTriClosest(a, b, m_tris[I], qa, qb);
+                segTriClosest(a, b, TREE->m_tris[I], qa, qb);
 
                 const Vec3 D = qa - qb;
                 const float DIST = std::sqrt(dot(D, D));

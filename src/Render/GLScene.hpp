@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -65,10 +66,6 @@ class GLScene {
     // Equirectangular mapping around the camera.
     void setPanoramaPath(const std::string& path);
 
-    // Backdrop blur behind transparent window pixels, mirroring Hyprland's
-    // decoration:blur config (pushed every frame by main.cpp).
-    void setBlurConfig(bool enabled, int size, int passes, float vibrancy);
-
     // What the crosshair currently points at, or 0 for "nothing". Ray is cast
     // through the centre of the screen from the camera, never from the OS
     // cursor, so aiming is independent of where the pointer happens to sit.
@@ -93,44 +90,47 @@ class GLScene {
         m_debugFps = fps;
     }
 
-    void setMapEmissiveScale(float s) {
-        m_map.setEmissiveScale(s);
-    }
-
-    void setMapFlat(bool flat) {
-        m_map.setFlat(flat);
-    }
-
     // The base grid platform (world zero): visible + collidable.
     void setGridVisible(bool on) {
         m_gridVisible = on;
     }
 
-    // The glTF map. The path/transform come from config; the file is loaded
-    // lazily inside render() (EGL current there) and reloaded on mtime
-    // change. Collision reads the world-space triangles + generation.
-    void setMapPath(const std::string& path) {
-        m_mapPath = path;
+    // --- scene: an arbitrary number of glTF objects -------------------------
+
+    // One object's render-relevant config (index-aligned with the slots).
+    struct SSceneSpec {
+        std::string path;
+        Vec3 position{}, rotationDeg{}, scale{1.0f, 1.0f, 1.0f};
+        float emissiveScale = 1.0f;
+        bool flat = true;
+    };
+
+    // Diff-apply the object list: new slots are created (files load lazily
+    // in refreshScene, EGL current there), changed specs update transforms
+    // in place, removed slots free their GL objects. The scene fingerprint
+    // folds every model's generation, so collision can rebuild when any
+    // object (re)loads or moves.
+    void setSceneObjects(const std::vector<SSceneSpec>& specs);
+
+    // Per-model access for collision and the grab interaction.
+    size_t sceneModelCount() const {
+        return m_slots.size();
     }
+
+    CMapModel* sceneModel(size_t index) {
+        return index < m_slots.size() ? m_slots[index].model.get() : nullptr;
+    }
+
+    // Move/rotate a (grabbed) object: updates the slot spec and the model
+    // transform in one place so mtime reloads keep the new placement.
+    void setSceneObjectTransform(size_t index, const Vec3& position,
+                                 const Vec3& rotationDeg);
+
+    uint64_t sceneFingerprint() const;
 
     void setMapDebugCollisions(bool on) {
-        m_map.setDebugCollisions(on);
-    }
-
-    void setMapTransform(const Vec3& position, const Vec3& rotationDeg,
-                         const Vec3& scale) {
-        m_mapPosition    = position;
-        m_mapRotationDeg = rotationDeg;
-        m_mapScale       = scale;
-        m_map.setTransform(position, rotationDeg, scale);
-    }
-
-    const std::vector<CMapModel::STL>& mapTriangles() const {
-        return m_map.triangles();
-    }
-
-    uint32_t mapGeneration() const {
-        return m_map.generation();
+        for (auto& S : m_slots)
+            S.model->setDebugCollisions(on);
     }
 
     // Diagnostics: requests a single pixel readback from the offscreen scene
@@ -146,7 +146,7 @@ class GLScene {
     bool createMeshes();
     bool ensureSceneFramebuffer(int width, int height);
 
-    void refreshMap();
+    void refreshScene();
 
     void drawDebugOverlay(int width, int height);
 
@@ -168,11 +168,7 @@ class GLScene {
     void drawPanorama(float aspect);
     void refreshPanorama();
 
-    bool ensureBlurTargets(int width, int height);
-    bool renderBlur(int width, int height);
-    void destroyBlurTargets();
-    void drawWindows(const Mat4& vp, const std::vector<WindowRender>& windows,
-                     bool frost = false);
+    void drawWindows(const Mat4& vp, const std::vector<WindowRender>& windows);
     void drawFullscreen(float alpha);
     void drawCrosshair(int width, int height);
 
@@ -195,6 +191,11 @@ class GLScene {
     unsigned int m_quadVBO = 0;
     int          m_quadVertexCount = 0;
 
+    // Dynamic mesh for BSP-ordered window pieces (pos3+uv2, like the scene
+    // program's layout).
+    unsigned int m_polyVAO = 0;
+    unsigned int m_polyVBO = 0;
+
     // Unit quad in the XZ plane. The ground.
     unsigned int m_floorVAO = 0;
     unsigned int m_floorVBO = 0;
@@ -215,9 +216,6 @@ class GLScene {
     int m_sceneTextured = -1;
     int m_sceneColorUniform = -1;
     int m_sceneUVRect = -1;
-    int m_sceneFrost = -1;
-    int m_sceneBlurTex = -1;
-    int m_sceneScreen = -1;
 
     int m_blitTexture = -1;
     int m_blitAlpha = -1;
@@ -237,22 +235,6 @@ class GLScene {
     unsigned int m_panoramaTex = 0;
     int m_panoramaW = 0;
 
-    // Backdrop blur (decoration:blur). Two half-res ping-pong targets; the
-    // window shader samples the final one at screen coordinates for pixels
-    // where the client content is transparent.
-    unsigned int m_blurFBOA = 0, m_blurTexA = 0;
-    unsigned int m_blurFBOB = 0, m_blurTexB = 0;
-    unsigned int m_blurProgram = 0;
-    int m_blurUTex = -1, m_blurUTexel = -1, m_blurUDir = -1;
-    int m_blurURadius = -1, m_blurUVibrancy = -1, m_blurUFinal = -1;
-    int  m_blurW = 0, m_blurH = 0;
-    unsigned int m_blurFinalTex = 0;
-    bool m_blurEnabled  = false;
-    int  m_blurSize     = 3;
-    int  m_blurPasses   = 1;
-    float m_blurVibrancy = 0.1696f;
-    bool m_useBlur      = false;
-    bool m_frost        = false;
     int  m_width = 0, m_height = 0;
 
     // Single source of truth for the view pose: mouse-look, movement and the
@@ -268,15 +250,15 @@ class GLScene {
 
     unsigned int                    m_textVAO = 0, m_textVBO = 0;
 
-    // Map state (see setMapPath).
-    CMapModel                       m_map;
-    std::string                     m_mapPath;
-    std::string                     m_mapLoadedPath;
-    std::filesystem::file_time_type m_mapMtime{};
-    bool                            m_mapMtimeValid = false;
-    Vec3                            m_mapPosition{};
-    Vec3                            m_mapRotationDeg{};
-    Vec3                            m_mapScale{1.0f, 1.0f, 1.0f};
+    // Scene slots: one per config object, index-aligned with the specs.
+    struct SSlot {
+        std::unique_ptr<CMapModel>      model;
+        SSceneSpec                      spec{};
+        std::string                     loadedPath; // expanded
+        std::filesystem::file_time_type mtime{};
+        bool                            mtimeValid = false;
+    };
+    std::vector<SSlot>              m_slots;
 
     bool          m_probeRequested = false;
     bool          m_probeValid     = false;

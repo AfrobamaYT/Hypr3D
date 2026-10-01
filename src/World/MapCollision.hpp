@@ -7,6 +7,11 @@
 
 namespace H3D {
 
+// Two-sided Möller–Trumbore against one triangle; true on hit with the
+// distance in outT. Free function so the header's template can use it.
+bool mapRayTriangle(const Vec3& o, const Vec3& d, const Vec3& a,
+                    const Vec3& b, const Vec3& c, float& outT);
+
 // BVH over the map's world-space triangles, answering the player's per-axis
 // collision queries. Pure math: no GL, no Hyprland -- unit-testable.
 //
@@ -71,9 +76,40 @@ class CMapCollision {
     bool moveCapsule(Vec3& feet, const Vec3& delta, float radius,
                      float height, bool* ceiling = nullptr) const;
 
+    // The same mover, but against a LIST of trees (the per-object collision
+    // architecture: one tree per scene object + the grid platform -- a
+    // released object rebuilds only ITS OWN small tree, the static map's
+    // big tree never rebuilds for it).
+    static bool moveCapsuleOn(const std::vector<const CMapCollision*>& trees,
+                              Vec3& feet, const Vec3& delta, float radius,
+                              float height, bool* ceiling = nullptr);
+
     // Closest hit of a ray against the triangles, or -1. Used for aiming at
     // the map (placing windows on surfaces later).
     float rayCast(const Vec3& origin, const Vec3& dir) const;
+
+    // Collect triangle indices whose AABBs intersect the box (the internal
+    // BVH query) -- the multi-tree mover gathers candidates this way.
+    void collect(const Vec3& min, const Vec3& max,
+                 std::vector<uint32_t>& out) const {
+        query(min, max, out);
+    }
+
+    // Brute-force closest hit against an arbitrary triangle set (two-sided
+    // Möller–Trumbore). Shared with per-model picking; accepts any triangle
+    // type exposing .a/.b/.c.
+    template <class TriangleRange>
+    static float rayTriangles(const TriangleRange& triangles,
+                              const Vec3& origin, const Vec3& dir) {
+        float best = -1.f;
+        for (const auto& T : triangles) {
+            float t = -1.f;
+            if (mapRayTriangle(origin, dir, T.a, T.b, T.c, t) &&
+                (best < 0.f || t < best))
+                best = t;
+        }
+        return best;
+    }
 
   private:
     struct SNode {

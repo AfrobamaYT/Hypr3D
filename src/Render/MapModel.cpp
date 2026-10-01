@@ -5,6 +5,8 @@
 
 #include "Render/MapModel.hpp"
 
+#include "World/MapCollision.hpp"
+
 #include <hyprgraphics/image/Image.hpp>
 #include <hyprutils/memory/SharedPtr.hpp>
 
@@ -582,6 +584,13 @@ bool CMapModel::load(const std::string& path, const Vec3& position,
     return true;
 }
 
+float CMapModel::rayCast(const Vec3& origin, const Vec3& dir) const {
+    if (!m_loaded || m_triangles.empty())
+        return -1.f;
+
+    return CMapCollision::rayTriangles(m_triangles, origin, dir);
+}
+
 void CMapModel::destroy() {
     if (!m_ownedTextures.empty()) {
         glDeleteTextures(static_cast<GLsizei>(m_ownedTextures.size()),
@@ -745,10 +754,13 @@ void CMapModel::drawDebug(const Mat4& vp) {
             return;
     }
 
-    const Mat4 MVP = vp * composeModel(m_position, m_rotationDeg, m_scale);
-
+    // The line vertices are already in WORLD space (m_triangles are the
+    // transformed collision set) -- the model matrix must NOT be applied
+    // again: a carried object's wireframe would draw displaced by exactly
+    // its own position (invisible for an identity transform, obvious once
+    // the object moves).
     glUseProgram(m_debugProgram);
-    glUniformMatrix4fv(m_debugMVP, 1, GL_FALSE, MVP.m.data());
+    glUniformMatrix4fv(m_debugMVP, 1, GL_FALSE, vp.m.data());
 
     // X-ray: depth test off so collision geometry inside walls stays visible.
     glDisable(GL_DEPTH_TEST);

@@ -3339,7 +3339,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         "hypr3d",
         "A new perspective on window management",
         "Samine825",
-        "0.3.0"
+        "0.5.0"
     };
 }
 

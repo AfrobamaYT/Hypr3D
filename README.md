@@ -3,21 +3,22 @@
 ![alt text](images/Screenshot.png)
 
 **A new perspective on window management -- literally.**
-A Hyprland plugin that turns your workspace into a walkable 3D space where
-windows float in mid-air, ready to be grabbed, dragged and resized.
+A Hyprland plugin that turns your workspace into a walkable 3D space
 
 > Experimental, pinned to Hyprland 0.56.2.
 
-> It's kinda buggy, but I'm working on it.
 ## Installation
 ### Hyprpm
 
 ```bash
+# Install latest
 hyprpm add https://github.com/samine825/Hypr3D
 hyprpm enable Hypr3D
+
+# Update
+hyprpm update
 ```
 
-(`hyprpm update` picks up new commits.)
 
 
 ### Manual
@@ -70,7 +71,7 @@ if hl.plugin.hypr3d then
     hl.bind("SUPER + F12", hl.plugin.hypr3d.toggle)
     -- parameters
     hl.plugin.hypr3d.config({
-        -- Every key is optional
+        -- every key is optional
         world = {
             panorama = "~/Pictures/room.png", -- 360° room background (equirectangular)
             grid = true,                      -- base 40x40 grid platform
@@ -85,10 +86,10 @@ if hl.plugin.hypr3d then
             move_inertia = 0.05,       -- walk glide after keys release, sec
             move_speed = 4.0,          -- walking speed, m/s
             spawn = { x = 0, y = 0, z = 0 }, -- player position
-            flying = true,             -- false: gravity, Space jumps off the ground, Shift does nothing
+            flying = true,             -- on alse: gravity, Space jumps off the ground, Shift does nothing
         },
         map = {
-            path = "~/map.glb",   -- glTF 2.0 map (.glb/.gltf)
+            path = "~/map.gltf",   -- glTF 2.0 map (.glb/.gltf)
             transform = {
                 position = { x = 0, y = 0, z = 0 },
                 rotation = { x = 0, y = 0, z = 0 },
@@ -99,5 +100,6 @@ if hl.plugin.hypr3d then
             collision = true,     -- collide with the map
         },
     })
+    -- That's all for now :p
 end
 ```

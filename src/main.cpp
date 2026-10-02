@@ -13,6 +13,11 @@
 #include <Jolt/Core/JobSystemThreadPool.h>
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
+#include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
+#include <Jolt/Physics/Collision/Shape/PlaneShape.h>
+#include <Jolt/Physics/Collision/CastResult.h>
+#include <Jolt/Physics/Collision/NarrowPhaseQuery.h>
+#include <Jolt/Physics/Collision/RayCast.h>
 
 #include <hyprland/src/event/EventBus.hpp>
 #include <hyprland/src/render/OpenGL.hpp>
@@ -305,9 +310,8 @@ static bool        g_playerFlying     = true;    // false = walk / jump / gravit
 // the grid platform at world zero).
 static Vec3 g_playerSpawn{0.0f, 0.0f, 0.0f};
 
-// Walking physics state.
-static bool  g_grounded    = false;
-static float g_verticalVel = 0.0f;
+// Walking physics state (grounded comes from the Jolt body's ground ray).
+static bool g_grounded = false;
 
 // --- scene: unlimited named glTF objects ------------------------------------
 struct SSceneObjectCfg {
@@ -353,9 +357,8 @@ static bool        g_debugHud = false;
 static float       g_debugFps = 0.0f;
 
 // Per-object collision trees (see update3D): one small BVH per scene
-// object plus the grid platform slab. The static map's tree builds once.
-static CMapCollision            g_platform;
-static bool                     g_platformBuilt = false;
+// object, used by picking (modelRayHit). The static map's tree builds once;
+// the grid platform slab lives in Jolt (syncFloorBody).
 static std::vector<CMapCollision> g_objTrees;
 static std::vector<uint32_t>    g_objTreeGens;
 
@@ -364,7 +367,10 @@ static std::vector<uint32_t>    g_objTreeGens;
 // with everything; static-vs-static never (they cannot move anyway).
 constexpr JPH::ObjectLayer LAYER_STATIC = 0;
 constexpr JPH::ObjectLayer LAYER_MOVING = 1;
-constexpr JPH::ObjectLayer NUM_OBJECT_LAYERS = 2;
+// A carried object is pose-driven: it sits in NO contact pair at all, so it
+// can neither shove the player body around nor fight its own teleport.
+constexpr JPH::ObjectLayer LAYER_GRABBED = 2;
+constexpr JPH::ObjectLayer NUM_OBJECT_LAYERS = 3;
 
 constexpr JPH::BroadPhaseLayer BP_LAYER_STATIC(0);
 constexpr JPH::BroadPhaseLayer BP_LAYER_MOVING(1);
@@ -374,6 +380,7 @@ class SBroadPhaseLayerInterface final : public JPH::BroadPhaseLayerInterface {
     SBroadPhaseLayerInterface() {
         mObjectToBroadPhase[LAYER_STATIC] = BP_LAYER_STATIC;
         m_objectToBroadPhase2[LAYER_MOVING] = BP_LAYER_MOVING;
+        m_objectToBroadPhase2[LAYER_GRABBED] = BP_LAYER_MOVING;
     }
 
     JPH::uint GetNumBroadPhaseLayers() const override {
@@ -401,6 +408,8 @@ class SObjectVsBroadPhase final : public JPH::ObjectVsBroadPhaseLayerFilter {
 class SObjectLayerPair final : public JPH::ObjectLayerPairFilter {
   public:
     bool ShouldCollide(JPH::ObjectLayer a, JPH::ObjectLayer b) const override {
+        if (a == LAYER_GRABBED || b == LAYER_GRABBED)
+            return false; // carried: pose-driven, collides with nothing
         if (a == LAYER_STATIC)
             return b == LAYER_MOVING;
         return true; // moving vs moving and moving vs static
@@ -466,6 +475,98 @@ static void joltShutdown() {
         delete JPH::Factory::sInstance;
         JPH::Factory::sInstance = nullptr;
     }
+}
+
+// --- the player's own physics body ------------------------------------------
+// A dynamic Jolt capsule driven by per-frame velocity control: the keys own
+// the horizontal axes (the inertia glide computes s_moveVel), Jolt owns
+// gravity, contacts and the pose. Active physics bodies meet it through the
+// exact same contact pipeline they use between themselves -- it can push
+// them, stand on them, be stood on. Rotation is locked out with
+// translation-only DOFs: the solver keeps the capsule upright, and the look
+// direction stays in our own yaw/pitch angles.
+static JPH::BodyID g_playerBody{};      // invalid until joltInit succeeds
+static JPH::BodyID g_floorBody{};       // grid platform slab (world.grid)
+static bool        g_playerJumpQueued = false;
+
+// Body center -> eye offset: the eye rides kEyeHeight above the feet.
+static constexpr float PLAYER_EYE_OFF =
+    Camera::kEyeHeight - Camera::kBodyHeight * 0.5f;
+
+static void ensurePlayerBody() {
+    if (!g_joltSystem || !g_playerBody.IsInvalid())
+        return;
+
+    JPH::CapsuleShapeSettings CAPSULE(
+        Camera::kBodyHeight * 0.5f - Camera::kBodyHalfWidth, // cylinder half
+        Camera::kBodyHalfWidth);                             // -> 0.6x1.8
+    CAPSULE.SetEmbedded();
+    auto RES = CAPSULE.Create();
+    if (RES.HasError())
+        return;
+
+    // Spawned under the camera (the camera was placed by the spawn reset).
+    const auto& CAM = g_scene.camera();
+    JPH::BodyCreationSettings BCS(
+        RES.Get(),
+        JPH::RVec3(CAM.position.x, CAM.position.y - PLAYER_EYE_OFF,
+                   CAM.position.z),
+        JPH::Quat::sIdentity(), JPH::EMotionType::Dynamic, LAYER_MOVING);
+    BCS.mAllowedDOFs   = JPH::EAllowedDOFs::TranslationX |
+                         JPH::EAllowedDOFs::TranslationY |
+                         JPH::EAllowedDOFs::TranslationZ;
+    BCS.mFriction      = 0.1f;  // velocity-driven: friction only drags what
+    BCS.mRestitution   = 0.0f;  // the player stands on
+    BCS.mAllowSleeping = false; // always controlled
+    BCS.mGravityFactor = 0.0f;  // set per-frame by the movement mode
+
+    auto* B = g_bodyIf->CreateBody(BCS);
+    if (!B)
+        return;
+    g_bodyIf->AddBody(B->GetID(), JPH::EActivation::Activate);
+    g_playerBody = B->GetID();
+}
+
+// The grid platform as real physics: a slab matching the visible grid
+// extent (the lines run -20..20), top at world zero. Both the player and
+// physics objects land on it.
+static void syncFloorBody() {
+    if (!g_joltSystem)
+        return;
+
+    if (g_cfgGrid && g_floorBody.IsInvalid()) {
+        JPH::BoxShapeSettings SLAB(JPH::Vec3(20.0f, 0.5f, 20.0f));
+        SLAB.SetEmbedded();
+        auto RES = SLAB.Create();
+        if (RES.HasError())
+            return;
+
+        JPH::BodyCreationSettings BCS(
+            RES.Get(), JPH::RVec3(0.f, -0.5f, 0.f), JPH::Quat::sIdentity(),
+            JPH::EMotionType::Static, LAYER_STATIC);
+        auto* B = g_bodyIf->CreateBody(BCS);
+        if (!B)
+            return;
+        g_bodyIf->AddBody(B->GetID(), JPH::EActivation::DontActivate);
+        g_floorBody = B->GetID();
+    } else if (!g_cfgGrid && !g_floorBody.IsInvalid()) {
+        g_bodyIf->RemoveBody(g_floorBody);
+        g_bodyIf->DestroyBody(g_floorBody);
+        g_floorBody = JPH::BodyID();
+    }
+}
+
+// Ground probe: a short ray straight down from the body center (feet with
+// 0.15 slack). Back-face culling skips the capsule's own underside.
+static bool playerGrounded() {
+    if (!g_joltSystem || g_playerBody.IsInvalid())
+        return false;
+
+    const auto POS = g_bodyIf->GetPosition(g_playerBody);
+    const JPH::RRayCast RAY{
+        POS, JPH::Vec3(0.f, -(Camera::kBodyHeight * 0.5f + 0.15f), 0.f)};
+    JPH::RayCastResult HIT;
+    return g_joltSystem->GetNarrowPhaseQuery().CastRay(RAY, HIT);
 }
 
 // Euler (degrees, our RY*RX*RZ convention) -> Jolt quaternion.
@@ -609,7 +710,8 @@ static void joltSyncBodies() {
             JPH::BodyCreationSettings BCS(
                 SHAPE,
                 JPH::RVec3(OBJ.position.x, OBJ.position.y, OBJ.position.z),
-                eulerToQuat(OBJ.rotationDeg), MOTION, LAYER);
+                eulerToQuat(OBJ.rotationDeg), MOTION,
+                i == g_mapGrabIndex ? LAYER_GRABBED : LAYER);
             BCS.mLinearDamping  = 0.05f;
             BCS.mAngularDamping = 0.05f;
             BCS.mAllowSleeping  = true;
@@ -2071,8 +2173,15 @@ static void resetPointerGesture() {
     // A finished roll gesture restores the object's gravity.
     endModelRoll();
 
-    // Dropping a carried scene object: it re-enters the collision set at
-    // its current position (the SETUP fingerprint changes -> rebuild).
+    // Dropping a carried scene object: it re-enters every contact pair at
+    // its current position (and its BVH tree rebuilds for picking).
+    if (g_bodyIf && g_mapGrabIndex != SIZE_MAX &&
+        g_mapGrabIndex < g_joltBodies.size() &&
+        g_joltBodies[g_mapGrabIndex].valid)
+        g_bodyIf->SetObjectLayer(
+            g_joltBodies[g_mapGrabIndex].body,
+            g_sceneObjects[g_mapGrabIndex].dynamic ? LAYER_MOVING
+                                                    : LAYER_STATIC);
     g_mapGrabIndex = SIZE_MAX;
 }
 
@@ -2266,8 +2375,7 @@ static void enter3D() {
 
     resetMovementKeys();
 
-    g_grounded    = false;
-    g_verticalVel = 0.0f;
+    g_grounded = false;
 
     g_keyboardMode = EKeyboardMode::Space;
     g_altHeld      = false;
@@ -2366,6 +2474,9 @@ static float updateTransition() {
 // across frames so releasing the keys coasts down instead of cutting dead.
 static Vec3 s_moveVel{};
 
+// Computes the key-driven world-space velocity into s_moveVel (units/s)
+// with the move-inertia glide. The PLAYER BODY applies it -- Jolt owns the
+// pose, so this no longer moves the camera directly.
 static void applyCameraMovement(float dt) {
     float FORWARD  = (g_keyFwd ? 1.f : 0.f) - (g_keyBack ? 1.f : 0.f);
     float STRAFE   = (g_keyRight ? 1.f : 0.f) - (g_keyLeft ? 1.f : 0.f);
@@ -2374,7 +2485,7 @@ static void applyCameraMovement(float dt) {
     auto& CAM = g_scene.camera();
 
     // Walking mode: Shift does nothing (gravity owns vertical), Space is a
-    // jump impulse handled in the key handler.
+    // jump impulse queued in the key handler.
     if (!g_playerFlying)
         VERTICAL = 0.f;
 
@@ -2388,23 +2499,17 @@ static void applyCameraMovement(float dt) {
         }
     }
 
-    const bool MOVING = FORWARD != 0.f || STRAFE != 0.f || VERTICAL != 0.f;
+    const bool  MOVING = FORWARD != 0.f || STRAFE != 0.f || VERTICAL != 0.f;
+    const float tau    = g_cfgMoveInertia;
 
     if (!g_playerFlying) {
-        // --- walking: gravity owns the vertical axis, jump rides it ---
-        constexpr float GRAVITY  = 14.0f;
-        constexpr float TERMINAL = 40.0f;
-
-        g_verticalVel -= GRAVITY * dt;
-        if (g_verticalVel < -TERMINAL)
-            g_verticalVel = -TERMINAL;
-
-        const float    SPEED = CAM.moveSpeed * (g_keySprint ? 2.5f : 1.0f);
-        const Vec3     TARGET =
+        // --- walking: the keys own the horizontal plane; Jolt's gravity
+        // (system -14, the old player constant) owns the vertical one ---
+        const float SPEED = CAM.moveSpeed * (g_keySprint ? 2.5f : 1.0f);
+        const Vec3  TARGET =
             CAM.flatForward() * (FORWARD * SPEED) +
             CAM.right() * (STRAFE * SPEED);
 
-        const float tau = g_cfgMoveInertia;
         if (tau > 0.0f && dt > 0.0f)
             s_moveVel += (TARGET - s_moveVel) * (1.0f - std::exp(-dt / tau));
         else
@@ -2412,33 +2517,11 @@ static void applyCameraMovement(float dt) {
 
         const bool MOVING_H = FORWARD != 0.f || STRAFE != 0.f;
         if (!MOVING_H && std::fabs(s_moveVel.x) + std::fabs(s_moveVel.z) < 0.01f)
-            s_moveVel = Vec3{0.f, 0.f, s_moveVel.y};
-
-        const Vec3 STEP = s_moveVel + Vec3{0.f, g_verticalVel, 0.f};
-        CAM.displace(STEP, dt);
-        damageCurrentMonitor();
+            s_moveVel = {};
         return;
     }
 
-    const float tau = g_cfgMoveInertia;
-
-    if (tau <= 0.0f || dt <= 0.0f) {
-        s_moveVel = {};
-
-        if (!MOVING)
-            return;
-
-        const float BASE = CAM.moveSpeed;
-        CAM.moveSpeed = BASE * (g_keySprint ? 2.5f : 1.0f);
-        CAM.move(FORWARD, STRAFE, VERTICAL, dt);
-        CAM.moveSpeed = BASE;
-
-        damageCurrentMonitor();
-        return;
-    }
-
-    // Glide toward the key-driven velocity with tau as the time constant;
-    // with the keys released the target is zero, so motion decays smoothly.
+    // --- flying: all three axes are key-driven ---
     const float SPEED =
         CAM.moveSpeed * (g_keySprint ? 2.5f : 1.0f) * (MOVING ? 1.0f : 0.0f);
     const Vec3 TARGET =
@@ -2446,8 +2529,14 @@ static void applyCameraMovement(float dt) {
         CAM.right() * (STRAFE * SPEED) +
         Vec3{0.f, 1.f, 0.f} * (VERTICAL * SPEED);
 
-    s_moveVel += (TARGET - s_moveVel) *
-        (1.0f - std::exp(-dt / tau));
+    if (tau <= 0.0f || dt <= 0.0f) {
+        s_moveVel = TARGET;
+        return;
+    }
+
+    // Glide toward the key-driven velocity with tau as the time constant;
+    // with the keys released the target is zero, so motion decays smoothly.
+    s_moveVel += (TARGET - s_moveVel) * (1.0f - std::exp(-dt / tau));
 
     // Snap the decay tail off once it is far below a frame of movement, so
     // the glide always terminates.
@@ -2455,11 +2544,6 @@ static void applyCameraMovement(float dt) {
         std::fabs(s_moveVel.x) + std::fabs(s_moveVel.y) +
             std::fabs(s_moveVel.z) < 0.01f)
         s_moveVel = {};
-
-    if (s_moveVel.x != 0.f || s_moveVel.y != 0.f || s_moveVel.z != 0.f) {
-        CAM.displace(s_moveVel, dt);
-        damageCurrentMonitor();
-    }
 }
 
 static void update3D(float dt) {
@@ -2563,6 +2647,26 @@ static void update3D(float dt) {
             }
         }
 
+        // Player readback: the camera rides the body's eye point (the body
+        // owns the pose now). While a fullscreen transition animates
+        // (To2D/To3D) the transition owns the camera; its end pose resyncs
+        // the body on the first normal frame. (g_transition is the ROOM
+        // progress -- 1.0 in normal 3D -- it must NOT gate this.)
+        if (!g_playerBody.IsInvalid()) {
+            if (g_fsPhase == EFullscreenPhase::None) {
+                const auto PPOS = g_bodyIf->GetPosition(g_playerBody);
+                const Vec3 EYE{PPOS.GetX(), PPOS.GetY() + PLAYER_EYE_OFF,
+                               PPOS.GetZ()};
+                auto& CAM = g_scene.camera();
+                if (EYE.x != CAM.position.x || EYE.y != CAM.position.y ||
+                    EYE.z != CAM.position.z) {
+                    CAM.position = EYE;
+                    damageCurrentMonitor();
+                }
+            }
+            g_grounded = playerGrounded();
+        }
+
         g_msJolt = g_msJolt * 0.9 +
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - JOLT_T0).count() * 0.1;
@@ -2605,48 +2709,55 @@ static void update3D(float dt) {
         damageCurrentMonitor();
     }
 
-    const Vec3 PREMOVE = g_scene.camera().position;
-    applyCameraMovement(dt);
+    // ---- player physics body: input -> velocity, Jolt owns the pose ----
+    ensurePlayerBody();
+    syncFloorBody();
 
-    // Map collision: a vertical capsule (rounded hull) instead of a box --
-    // walls and seams slide past instead of snagging corners. The flat-floor
-    // clamp in Camera::move stays as the fallback.
-    std::vector<const CMapCollision*> TREES;
-
-    if (g_cfgGrid && g_platformBuilt)
-        TREES.push_back(&g_platform);
-
-    for (size_t i = 0; i < g_objTrees.size(); ++i)
-        if (g_sceneObjects[i].collision && i != g_mapGrabIndex &&
-            !g_objTrees[i].empty())
-            TREES.push_back(&g_objTrees[i]);
-
-    if (!TREES.empty()) {
+    if (!g_playerBody.IsInvalid()) {
         auto& CAM = g_scene.camera();
-        const Vec3 DELTA = CAM.position - PREMOVE;
 
-        bool grounded    = false;
-        bool hitCeiling  = false;
-
-        if (DELTA.x != 0.f || DELTA.y != 0.f || DELTA.z != 0.f) {
-            Vec3 feet{PREMOVE.x, PREMOVE.y - Camera::kEyeHeight, PREMOVE.z};
-            grounded = CMapCollision::moveCapsuleOn(
-                TREES, feet, DELTA, Camera::kBodyHalfWidth,
-                Camera::kBodyHeight, &hitCeiling);
-            CAM.position = Vec3{feet.x, feet.y + Camera::kEyeHeight, feet.z};
+        // The camera was moved by something else (spawn reset, fullscreen
+        // transition handoff): teleport the body under it. Skipped while a
+        // transition animates (To2D/To3D own the camera then); the
+        // transition's end pose resyncs on the first normal frame.
+        if (g_fsPhase == EFullscreenPhase::None) {
+            const auto CUR = g_bodyIf->GetPosition(g_playerBody);
+            const float DX = CAM.position.x - CUR.GetX();
+            const float DY = CAM.position.y - (CUR.GetY() + PLAYER_EYE_OFF);
+            const float DZ = CAM.position.z - CUR.GetZ();
+            if (DX * DX + DY * DY + DZ * DZ > 0.25f)
+                g_bodyIf->SetPositionAndRotationWhenChanged(
+                    g_playerBody,
+                    JPH::RVec3(CAM.position.x, CAM.position.y - PLAYER_EYE_OFF,
+                               CAM.position.z),
+                    JPH::Quat::sIdentity(), JPH::EActivation::Activate);
         }
 
-        g_grounded = grounded;
-        if (grounded && g_verticalVel < 0.f)
-            g_verticalVel = 0.f; // the floor owns the fall
+        applyCameraMovement(dt); // -> s_moveVel
 
-        // Head bump: a jump into a ceiling must die right there, or the
-        // leftover upward velocity keeps pressing the capsule into it and
-        // the player hangs there while gravity slowly wins.
-        if (hitCeiling && g_verticalVel > 0.f)
-            g_verticalVel = 0.f;
-    } else {
-        g_grounded = false;
+        // Flying: all three axes key-driven, gravity asleep. Walking: the
+        // keys own the horizontal plane, Jolt's gravity the vertical one.
+        if (g_playerFlying) {
+            g_bodyIf->SetGravityFactor(g_playerBody, 0.0f);
+            g_bodyIf->SetLinearVelocity(g_playerBody, JPH::Vec3(
+                s_moveVel.x, s_moveVel.y, s_moveVel.z));
+        } else {
+            g_bodyIf->SetGravityFactor(g_playerBody, 1.0f);
+
+            auto VEL = g_bodyIf->GetLinearVelocity(g_playerBody);
+            float VY = VEL.GetY();
+            if (VY < -40.0f) // terminal velocity, as before
+                VY = -40.0f;
+
+            if (g_playerJumpQueued) {
+                g_playerJumpQueued = false;
+                if (g_grounded)
+                    VY = 5.5f;
+            }
+
+            g_bodyIf->SetLinearVelocity(g_playerBody, JPH::Vec3(
+                s_moveVel.x, VY, s_moveVel.z));
+        }
     }
 
     // Map-drag carry: the grabbed object's CENTER rides the crosshair at
@@ -2705,6 +2816,9 @@ static void update3D(float dt) {
             g_joltBodies[g_mapGrabIndex].valid) {
             const auto JB = g_joltBodies[g_mapGrabIndex].body;
             g_bodyIf->SetLinearVelocity(JB, JPH::Vec3::sZero());
+            // Pose-driven while carried: no contact pairs, or the object
+            // would shove the player body around on the way.
+            g_bodyIf->SetObjectLayer(JB, LAYER_GRABBED);
             g_bodyIf->SetPositionAndRotationWhenChanged(
                 JB, JPH::RVec3(TARGET.x, TARGET.y, TARGET.z),
                 eulerToQuat(ROT), JPH::EActivation::Activate);
@@ -3757,10 +3871,8 @@ static void onKeyboardKey(
     // Walking mode: Space jumps off whatever the capsule stands on. The
     // held state still reaches setMovementSym, but the walking movement
     // path zeroes the vertical input, so holding Space does not fly.
-    if (PRESSED && SYM == XKB_KEY_space && !g_playerFlying && g_grounded) {
-        g_verticalVel = 5.5f;
-        g_grounded    = false;
-    }
+    if (PRESSED && SYM == XKB_KEY_space && !g_playerFlying && g_grounded)
+        g_playerJumpQueued = true; // applied to the body in update3D
 
     // F3 toggles the debug HUD (collision wireframe + info overlay) in both
     // keyboard modes: it never belongs to the focused window.

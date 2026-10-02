@@ -1866,8 +1866,12 @@ bool GLScene::render(
     const float aspect =
         static_cast<float>(width) / static_cast<float>(height);
 
+    const float ZFOV =
+        2.0f * std::atan(std::tan(kFovDeg * PI / 360.0f) /
+                         std::max(m_zoom, 0.01f));
+
     const Mat4 projection =
-        Mat4::perspective(kFovDeg * PI / 180.0f, aspect, 0.05f, 200.0f);
+        Mat4::perspective(ZFOV, aspect, 0.05f, 200.0f);
 
     m_width  = width;
     m_height = height;

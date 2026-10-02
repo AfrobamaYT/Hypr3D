@@ -358,6 +358,14 @@ static float  g_mapGrabDist  = 0.0f; // camera-to-object-CENTER distance
 static bool        g_debugHud = false;
 static float       g_debugFps = 0.0f;
 
+// C-key view zoom: g_zoomLevel glides toward the target (the wheel-adjusted
+// magnification while C is held, 1x when released). The wheel level resets
+// to kZoomBase on every press -- it does not survive the key release.
+static bool  g_zoomHeld  = false;
+static float g_zoomWheel = 2.0f;
+static float g_zoomLevel = 1.0f;
+static constexpr float kZoomBase = 2.0f;
+
 // Per-object collision trees (see update3D): one small BVH per scene
 // object, used by picking (modelRayHit). The static map's tree builds once;
 // the grid platform slab lives in Jolt (syncFloorBody).
@@ -2738,6 +2746,13 @@ static void update3D(float dt) {
         damageCurrentMonitor();
     }
 
+    // C-key view zoom glide: exponential toward the target (the wheel level
+    // while held, 1x when released), so both directions are smooth.
+    const float ZOOM_TARGET = g_zoomHeld ? g_zoomWheel : 1.0f;
+    g_zoomLevel += (ZOOM_TARGET - g_zoomLevel) *
+        (1.0f - std::exp(-8.0f * dt));
+    g_scene.setZoom(g_zoomLevel);
+
     // ---- player physics body: input -> velocity, Jolt owns the pose ----
     ensurePlayerBody();
     syncFloorBody();
@@ -3418,6 +3433,16 @@ static void onMouseAxis(
 
     g_diagLastZoomStep = STEPS;
 
+    // C-held view zoom: the wheel adjusts the magnification live
+    // (min 1x, no max). Wheel forward = zoom in.
+    if (g_zoomHeld) {
+        g_zoomWheel = std::max(
+            1.0f, g_zoomWheel * static_cast<float>(std::pow(1.06, STEPS)));
+        info.cancelled = true;
+        damageCurrentMonitor();
+        return;
+    }
+
     // During an LMB drag the wheel zooms the dragged window.
     if (g_pointerGesture == EPointerGesture::Move3D && g_pointerDown) {
         g_world.dragZoom(STEPS);
@@ -3973,6 +3998,16 @@ static void onKeyboardKey(
     // Window mode: every key reaches the focused window untouched.
     if (g_keyboardMode == EKeyboardMode::Window)
         return;
+
+    if (SYM == XKB_KEY_c) {
+        // View zoom: hold to magnify, release to ease back to 1x. The
+        // wheel level restarts at the base on every press.
+        g_zoomHeld = PRESSED;
+        if (PRESSED)
+            g_zoomWheel = kZoomBase;
+        info.cancelled = true;
+        return;
+    }
 
     if (!isMovementSym(SYM))
         return;

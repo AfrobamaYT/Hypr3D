@@ -103,6 +103,7 @@ world floor clamp -- off its edge you fall (bring a map floor or fly).
 | Space                         | Move up (flying) / Jump                        |
 | Shift                         | Move down (flying)                             |
 | Ctrl                          | Sprint                                         |
+| C (hold)                      | View zoom to 2x; wheel adjusts, min 1x         |
 | Super + Left click            | Drag window                                    |
 | Super + Right click           | Resize window                                  |
 | Super + Mouse wheel click     | rotate window                                  |

@@ -91,6 +91,12 @@ class GLScene {
     }
 
     // The base grid platform (world zero): visible + collidable.
+    // View zoom (the C key): magnification narrows the render fov
+    // symmetrically around the crosshair, so aiming stays exact.
+    void setZoom(float magnification) {
+        m_zoom = magnification > 0.01f ? magnification : 0.01f;
+    }
+
     void setGridVisible(bool on) {
         m_gridVisible = on;
     }
@@ -248,6 +254,7 @@ class GLScene {
     // F3 debug HUD state.
     bool                            m_debugOverlay = false;
     bool                            m_gridVisible  = true;
+    float                           m_zoom         = 1.0f;
     float                           m_debugFps     = 0.f;
 
     unsigned int                    m_textVAO = 0, m_textVBO = 0;

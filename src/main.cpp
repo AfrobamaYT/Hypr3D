@@ -17,6 +17,7 @@
 #include <Jolt/Physics/Collision/Shape/PlaneShape.h>
 #include <Jolt/Physics/Collision/CastResult.h>
 #include <Jolt/Physics/Collision/NarrowPhaseQuery.h>
+#include <Jolt/Physics/Body/BodyFilter.h>
 #include <Jolt/Physics/Collision/RayCast.h>
 
 #include <hyprland/src/event/EventBus.hpp>
@@ -574,7 +575,13 @@ static bool playerGrounded() {
     const JPH::RRayCast RAY{
         POS, JPH::Vec3(0.f, -(Camera::kBodyHeight * 0.5f + 0.15f), 0.f)};
     JPH::RayCastResult HIT;
-    return g_joltSystem->GetNarrowPhaseQuery().CastRay(RAY, HIT);
+    // The ray STARTS INSIDE the player capsule: unfiltered, the cast reports
+    // the player's own shape at fraction 0 and grounded is true for the
+    // whole flight (flappy-bird jumps). Exclude self.
+    const JPH::IgnoreSingleBodyFilter SKIP_SELF(g_playerBody);
+    return g_joltSystem->GetNarrowPhaseQuery().CastRay(
+        RAY, HIT, JPH::BroadPhaseLayerFilter(), JPH::ObjectLayerFilter(),
+        SKIP_SELF);
 }
 
 // Euler (degrees, our RY*RX*RZ convention) -> Jolt quaternion.

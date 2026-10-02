@@ -515,8 +515,16 @@ static void ensurePlayerBody() {
     BCS.mAllowedDOFs   = JPH::EAllowedDOFs::TranslationX |
                          JPH::EAllowedDOFs::TranslationY |
                          JPH::EAllowedDOFs::TranslationZ;
-    BCS.mFriction      = 0.1f;  // velocity-driven: friction only drags what
-    BCS.mRestitution   = 0.0f;  // the player stands on
+    BCS.mMotionQuality = JPH::EMotionQuality::LinearCast; // cast the step:
+                          // never tunnels the map's zero-thickness sheets
+    // Friction ZERO. The commanded into-wall velocity makes the solver
+    // cancel ~5 m/s every sub-step -- a normal force on the order of
+    // 450*m -- and any friction then lets the wall hold the player against
+    // gravity (measured: a -0.16 m/s creep instead of free fall) and
+    // stick-slip while sliding (the wall-press shaking). The player is
+    // velocity-driven: friction only ever hurt.
+    BCS.mFriction      = 0.0f;
+    BCS.mRestitution   = 0.0f;
     BCS.mAllowSleeping = false; // always controlled
     BCS.mGravityFactor = 0.0f;  // set per-frame by the movement mode
 
@@ -2617,7 +2625,12 @@ static void update3D(float dt) {
         static JPH::JobSystemThreadPool JOB_SYSTEM(
             JPH::cMaxPhysicsJobs, JPH::cMaxPhysicsBarriers, 0);
         const float SIM_DT = std::clamp(dt, 1.0f / 240.0f, 1.0f / 30.0f);
-        g_joltSystem->Update(SIM_DT, 1, &TEMP_ALLOC, &JOB_SYSTEM);
+        // Sub-step the sim. One step of up to 1/30 moves a 5 m/s body 16 cm
+        // -- enough to hop onto seam/trim geometry and fall back every few
+        // frames (the wall-press jitter; 8.8 cm of position bounce measured
+        // against the real map, zero with sub-steps). 3 sub-steps cap the
+        // effective step at 1/90.
+        g_joltSystem->Update(SIM_DT, 3, &TEMP_ALLOC, &JOB_SYSTEM);
 
         for (size_t i = 0; i < g_sceneObjects.size(); ++i) {
             auto& JB = g_joltBodies[i];
@@ -3230,6 +3243,18 @@ static void dumpStatus() {
     }
 
     out << "captureFrames=" << g_captureFrames << "\n";
+
+    // Player body trace: wall glue, stick-slip or a resync fight show up
+    // here directly (position/velocity vs the commanded velocity).
+    if (!g_playerBody.IsInvalid() && g_bodyIf) {
+        const auto PP = g_bodyIf->GetPosition(g_playerBody);
+        const auto PV = g_bodyIf->GetLinearVelocity(g_playerBody);
+        out << "player: pos=(" << PP.GetX() << "," << PP.GetY() << ","
+            << PP.GetZ() << ") vel=(" << PV.GetX() << "," << PV.GetY()
+            << "," << PV.GetZ() << ") moveVel=(" << s_moveVel.x << ","
+            << s_moveVel.y << "," << s_moveVel.z << ") grounded="
+            << g_grounded << " flying=" << g_playerFlying << "\n";
+    }
 }
 
 static void onRenderStage(eRenderStage stage) {

@@ -306,6 +306,7 @@ static float       g_cfgMoveInertia   = 0.05f;   // seconds, 0 = off
 static float       g_cfgMoveSpeed     = 4.0f;    // world units / second
 static float       g_cfgSensitivity   = 0.0025f; // radians per pointer count
 static bool        g_playerFlying     = true;    // false = walk / jump / gravity
+static bool        g_cfgWalkBob       = true;    // view-only walk bob (walking only)
 
 // Feet position; eyes ride kEyeHeight above (spawn 0,0,0 = standing on
 // the grid platform at world zero).
@@ -2489,6 +2490,14 @@ static float updateTransition() {
 // across frames so releasing the keys coasts down instead of cutting dead.
 static Vec3 s_moveVel{};
 
+// Walk bob (view-only): sine phase in radians + eased amplitude. The body
+// pose stays physical -- the offset rides on the camera each frame and is
+// re-derived from the clean eye point, so it never feeds back into Jolt.
+static float s_bobPhase = 0.0f;
+static float s_bobAmp   = 0.0f;
+static constexpr float kBobAmplitude = 0.035f; // meters at full walk speed
+static constexpr float kBobRate      = 6.0f;   // radians per meter walked
+
 // Computes the key-driven world-space velocity into s_moveVel (units/s)
 // with the move-inertia glide. The PLAYER BODY applies it -- Jolt owns the
 // pose, so this no longer moves the camera directly.
@@ -2778,6 +2787,24 @@ static void update3D(float dt) {
             g_bodyIf->SetLinearVelocity(g_playerBody, JPH::Vec3(
                 s_moveVel.x, VY, s_moveVel.z));
         }
+
+        // Walk bob (view-only, walking + grounded): a small vertical sway
+        // synced to the distance traveled. The amplitude eases in and out,
+        // so jumps, stops and the walk<->fly switch never pop.
+        const float BOB_SPEED = std::sqrt(s_moveVel.x * s_moveVel.x +
+                                          s_moveVel.z * s_moveVel.z);
+        const bool BOBING = g_cfgWalkBob && !g_playerFlying && g_grounded &&
+            g_fsPhase == EFullscreenPhase::None;
+        const float TARGET_AMP =
+            BOBING ? kBobAmplitude *
+                std::min(1.0f, BOB_SPEED / std::max(CAM.moveSpeed, 0.5f))
+                   : 0.0f;
+        s_bobAmp += (TARGET_AMP - s_bobAmp) * (1.0f - std::exp(-8.0f * dt));
+        if (BOBING)
+            s_bobPhase = std::fmod(s_bobPhase + BOB_SPEED * dt * kBobRate,
+                                   6.2831853f);
+        if (s_bobAmp > 0.0005f)
+            CAM.position.y += s_bobAmp * std::sin(s_bobPhase);
     }
 
     // Map-drag carry: the grabbed object's CENTER rides the crosshair at
@@ -3903,7 +3930,11 @@ static void onKeyboardKey(
     // Walking mode: Space jumps off whatever the capsule stands on. The
     // held state still reaches setMovementSym, but the walking movement
     // path zeroes the vertical input, so holding Space does not fly.
-    if (PRESSED && SYM == XKB_KEY_space && !g_playerFlying && g_grounded)
+    // SPACE KEYBOARD MODE ONLY: in Window mode the key belongs to the
+    // focused window -- a jump here would fire on every typed space.
+    if (PRESSED && SYM == XKB_KEY_space &&
+        g_keyboardMode == EKeyboardMode::Space &&
+        !g_playerFlying && g_grounded)
         g_playerJumpQueued = true; // applied to the body in update3D
 
     // F3 toggles the debug HUD (collision wireframe + info overlay) in both
@@ -3972,6 +4003,7 @@ static int luaConfig(lua_State* L) {
     //         spawn = { x = 0, y = 0, z = 0 }, -- FEET position
     //         flying = true,                -- false: gravity, Space jumps,
     //                                       -- Shift does nothing
+    //         walk_bob = true,              -- camera sway while walking
     //     },
     //     map = {
     //         path = "~/map.glb",
@@ -4152,6 +4184,8 @@ static int luaConfig(lua_State* L) {
             return luaL_error(L, "hypr3d.config: player.move_speed must be a number");
         if (!SET_BOOL(idx, "flying", g_playerFlying, "player.flying"))
             return luaL_error(L, "hypr3d.config: player.flying must be a boolean");
+        if (!SET_BOOL(idx, "walk_bob", g_cfgWalkBob, "player.walk_bob"))
+            return luaL_error(L, "hypr3d.config: player.walk_bob must be a boolean");
         if (!SET_VEC3(idx, "spawn", g_playerSpawn, "player.spawn"))
             return luaL_error(L, "hypr3d.config: player.spawn must be a table { x = .., y = .., z = .. }");
         // y is the FEET height; only guard against absurd values.

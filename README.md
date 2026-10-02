@@ -61,6 +61,7 @@ if hl.plugin.hypr3d then
             move_speed = 4.0,          -- walking speed, world units/sec
             spawn = { x = 0, y = 0, z = 0 }, -- FEET position (eyes ride +1.62)
             flying = true,             -- false: gravity, Space jumps, Shift idle
+            walk_bob = true,           -- camera sway while walking (walking only)
         },
         scene = {                 -- unlimited named glTF objects
             map = {               -- (any names; "map" is convention only)
@@ -134,6 +135,7 @@ if hl.plugin.hypr3d then
             move_speed = 4.0,          -- walking speed, m/s
             spawn = { x = 0, y = 0, z = 0 }, -- player position
             flying = true,             -- on alse: gravity, Space jumps off the ground, Shift does nothing
+            walk_bob = true,           -- camera sway while walking (walking only)
         },
         map = {
             path = "~/map.gltf",   -- glTF 2.0 map (.glb/.gltf)

@@ -581,6 +581,7 @@ bool CMapModel::load(const std::string& path, const Vec3& position,
 
     m_loaded = true;
     recomputeTriangles();
+    ++m_meshVersion;
     return true;
 }
 
@@ -612,6 +613,7 @@ void CMapModel::destroy() {
     m_localTriangles.clear();
     m_loaded = false;
     ++m_generation;
+    ++m_meshVersion;
 
     glDeleteBuffers(1, &m_debugVBO);
     glDeleteVertexArrays(1, &m_debugVAO);

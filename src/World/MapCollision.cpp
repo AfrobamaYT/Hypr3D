@@ -404,12 +404,27 @@ bool CMapCollision::triBoxOverlap(const STL& t, const Vec3& c, const Vec3& h) {
 
 bool CMapCollision::moveAABB(Vec3& position, const Vec3& delta,
                              const Vec3& half) const {
-    if (m_tris.empty())
-        return false;
+    std::vector<const CMapCollision*> self{this};
+    bool grounded = false;
+    moveAABBOn(self, position, delta, half, grounded);
+    return grounded;
+}
+
+void CMapCollision::moveAABBOn(const std::vector<const CMapCollision*>& trees,
+                               Vec3& position, const Vec3& delta,
+                               const Vec3& half, bool& groundedOut) {
+    bool anyTris = false;
+    for (const auto* T : trees)
+        if (T && !T->m_tris.empty())
+            anyTris = true;
+
+    if (!anyTris)
+        return;
 
     bool grounded = false;
 
-    std::vector<uint32_t> near_;
+    // (tree, triangle) candidates gathered from every tree per query.
+    std::vector<std::pair<const CMapCollision*, uint32_t>> near_;
 
     // Auto step-up: thresholds, floor seams and small lips must not stop the
     // walk. When a horizontal move was blocked, the whole move is retried
@@ -436,13 +451,18 @@ bool CMapCollision::moveAABB(Vec3& position, const Vec3& delta,
         (&hi.x)[axis] = std::max((&hi.x)[axis], BEFORE + (&half.x)[axis]);
 
         near_.clear();
-        query(lo, hi, near_);
+        for (const auto* T : trees) {
+            std::vector<uint32_t> local;
+            T->query(lo, hi, local);
+            for (const uint32_t I : local)
+                near_.push_back({T, I});
+        }
 
         const float AFTER = (&pos.x)[axis];
         const Vec3  CENTER{pos.x, pos.y, pos.z};
 
-        for (const auto I : near_) {
-            const auto& T = m_tris[I];
+        for (const auto& [TREE, I] : near_) {
+            const auto& T = TREE->m_tris[I];
             const auto TMIN = triMin(T);
             const auto TMAX = triMax(T);
 
@@ -518,7 +538,7 @@ bool CMapCollision::moveAABB(Vec3& position, const Vec3& delta,
         }
     }
 
-    return grounded;
+    groundedOut = grounded;
 }
 
 bool CMapCollision::moveCapsule(Vec3& feet, const Vec3& delta, float radius,

@@ -76,6 +76,14 @@ class CMapCollision {
     bool moveCapsule(Vec3& feet, const Vec3& delta, float radius,
                      float height, bool* ceiling = nullptr) const;
 
+    // Per-axis AABB mover against a LIST of trees: the center is moved by
+    // delta once, then clamped against every tree per axis (X, Z, Y).
+    // groundedOut = downward Y clamp happened (the box landed). This is the
+    // moving-object proxy step for scene-object physics.
+    static void moveAABBOn(const std::vector<const CMapCollision*>& trees,
+                           Vec3& center, const Vec3& delta, const Vec3& half,
+                           bool& groundedOut);
+
     // The same mover, but against a LIST of trees (the per-object collision
     // architecture: one tree per scene object + the grid platform -- a
     // released object rebuilds only ITS OWN small tree, the static map's

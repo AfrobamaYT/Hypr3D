@@ -82,6 +82,12 @@ class CMapModel {
         return m_generation;
     }
 
+    // Bumps only when the MESH CONTENT changes (load/destroy) -- generation
+    // also bumps on transform moves, which must not recreate physics bodies.
+    uint32_t meshVersion() const {
+        return m_meshVersion;
+    }
+
   private:
     // Node-space collision triangles; the world-space set (m_triangles) is
     // recomputed from these whenever the config transform changes.
@@ -118,6 +124,7 @@ class CMapModel {
     bool                    m_flat = true;
     bool                    m_loaded = false;
     uint32_t                m_generation = 0;
+    uint32_t                m_meshVersion = 0;
 
     // Collision wireframe.
     unsigned int            m_debugVAO = 0, m_debugVBO = 0;

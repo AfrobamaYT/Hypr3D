@@ -1,4 +1,19 @@
 #include <hyprland/src/plugins/PluginAPI.hpp>
+
+#include <Jolt/Jolt.h>
+#include <Jolt/RegisterTypes.h>
+#include <Jolt/Core/Factory.h>
+#include <Jolt/Physics/PhysicsSettings.h>
+#include <Jolt/Physics/PhysicsSystem.h>
+#include <Jolt/Physics/Body/BodyCreationSettings.h>
+#include <Jolt/Physics/Body/BodyInterface.h>
+#include <Jolt/Physics/Collision/Shape/MeshShape.h>
+#include <Jolt/Physics/Collision/Shape/ConvexHullShape.h>
+#include <Jolt/Core/TempAllocator.h>
+#include <Jolt/Core/JobSystemThreadPool.h>
+#include <Jolt/Physics/Collision/Shape/BoxShape.h>
+#include <Jolt/Physics/Collision/Shape/RotatedTranslatedShape.h>
+
 #include <hyprland/src/event/EventBus.hpp>
 #include <hyprland/src/render/OpenGL.hpp>
 #include <hyprland/src/render/Renderer.hpp>
@@ -76,6 +91,17 @@ static std::chrono::steady_clock::time_point g_lastTick =
 static bool g_renderedOnce = false;
 static bool g_reportedFramebufferError = false;
 static bool g_reportedRenderError = false;
+static std::string g_lastRenderGate;  // why the 3D pass was skipped last frame
+static double g_msUpdate3D = 0.0;     // per-section profiling (exponential avg)
+static double g_msJolt     = 0.0;
+static double g_msRender   = 0.0;
+static std::string g_lastError;        // last caught handler exception
+
+static void dumpErrorNow(const std::string& what) {
+    g_lastError = what;
+    std::ofstream out("/tmp/hypr3d-status.txt", std::ios::app);
+    out << "!!! EXCEPTION " << what << "\n";
+}
 static bool g_reportedPointerHookError = false;
 
 // Layout snapshot taken on entry; empty once the windows are back under the
@@ -135,6 +161,8 @@ static SResizeGesture g_resize{};
 // Guards against a snapshot triggering another copy of the plugin inside
 // Hyprland's nested offscreen render.
 static bool g_capturing = false;
+
+
 
 // Snapshot scheduling: the snapshot pass is the heaviest per-frame cost, so
 // windows whose committed buffer and box are unchanged skip it entirely
@@ -289,6 +317,7 @@ struct SSceneObjectCfg {
     bool        flat = true;
     bool        collision = true;
     bool        dynamic = false; // static = false -> grabbable with Super+LMB
+    bool        physics = false; // gravity + world collisions (dynamic only)
 };
 
 static std::vector<SSceneObjectCfg> g_sceneObjects;
@@ -296,6 +325,15 @@ static std::vector<SSceneObjectCfg> g_sceneObjects;
 
 // Index of the currently grabbed dynamic object, SIZE_MAX when none.
 static size_t g_mapGrabIndex = SIZE_MAX;
+
+// Per-object physics (scene object physics = true): fall velocity + the AABB
+// cache (recomputed when the object's generation changes).
+struct SObjPhys {
+    Vec3 vel{};
+};
+static std::vector<SObjPhys>   g_objPhys;
+static std::vector<Vec3>       g_objAABBLo, g_objAABBHi;
+static std::vector<uint32_t>   g_objAABBGens;
 
 // Super+wheel hover zoom for a dynamic scene object (the model-class twin of
 // the window hover zoom): the aimed object's center rides the zoomed
@@ -316,6 +354,243 @@ static bool                     g_platformBuilt = false;
 static std::vector<CMapCollision> g_objTrees;
 static std::vector<uint32_t>    g_objTreeGens;
 
+// --- Jolt Physics: rigid body simulation for scene objects ------------------
+// Object layers: static geometry vs moving bodies. Moving bodies collide
+// with everything; static-vs-static never (they cannot move anyway).
+constexpr JPH::ObjectLayer LAYER_STATIC = 0;
+constexpr JPH::ObjectLayer LAYER_MOVING = 1;
+constexpr JPH::ObjectLayer NUM_OBJECT_LAYERS = 2;
+
+constexpr JPH::BroadPhaseLayer BP_LAYER_STATIC(0);
+constexpr JPH::BroadPhaseLayer BP_LAYER_MOVING(1);
+
+class SBroadPhaseLayerInterface final : public JPH::BroadPhaseLayerInterface {
+  public:
+    SBroadPhaseLayerInterface() {
+        mObjectToBroadPhase[LAYER_STATIC] = BP_LAYER_STATIC;
+        m_objectToBroadPhase2[LAYER_MOVING] = BP_LAYER_MOVING;
+    }
+
+    JPH::uint GetNumBroadPhaseLayers() const override {
+        return 2;
+    }
+
+    JPH::BroadPhaseLayer GetBroadPhaseLayer(JPH::ObjectLayer layer) const override {
+        return layer == LAYER_STATIC ? BP_LAYER_STATIC : BP_LAYER_MOVING;
+    }
+
+  private:
+    JPH::BroadPhaseLayer m_objectToBroadPhase2[NUM_OBJECT_LAYERS];
+    JPH::BroadPhaseLayer mObjectToBroadPhase[NUM_OBJECT_LAYERS] = {};
+};
+
+class SObjectVsBroadPhase final : public JPH::ObjectVsBroadPhaseLayerFilter {
+  public:
+    bool ShouldCollide(JPH::ObjectLayer layer, JPH::BroadPhaseLayer bp) const override {
+        if (layer == LAYER_STATIC)
+            return bp == BP_LAYER_MOVING;
+        return true; // moving collides with everything
+    }
+};
+
+class SObjectLayerPair final : public JPH::ObjectLayerPairFilter {
+  public:
+    bool ShouldCollide(JPH::ObjectLayer a, JPH::ObjectLayer b) const override {
+        if (a == LAYER_STATIC)
+            return b == LAYER_MOVING;
+        return true; // moving vs moving and moving vs static
+    }
+};
+
+static SBroadPhaseLayerInterface g_bpLayers;
+static SObjectVsBroadPhase      g_objVsBp;
+static SObjectLayerPair         g_objPair;
+
+static JPH::PhysicsSystem*  g_joltSystem = nullptr;
+static JPH::BodyInterface*  g_bodyIf     = nullptr;
+
+// Per-scene-object Jolt body state (index-aligned with g_sceneObjects).
+struct SObjJolt {
+    JPH::BodyID body{};
+    uint32_t    meshGen = 0; // model generation the body was built from
+    bool        valid = false;
+};
+static std::vector<SObjJolt> g_joltBodies;
+
+// Creates/removes/teleports the Jolt body of each scene object so it
+// matches the config state. Body classes:
+//   static = true              -> Static body (the location's geometry)
+//   dynamic && physics         -> Dynamic body (the simulation owns it)
+//   dynamic && !physics        -> Kinematic body (grabbable, solid, inert)
+//   collision = false          -> no body (no occlusion, no collision)
+
+
+static bool joltInit() {
+    static bool done = false;
+    if (done)
+        return true;
+
+    JPH::RegisterDefaultAllocator();
+    JPH::Factory::sInstance = new JPH::Factory();
+    JPH::RegisterTypes();
+
+    g_joltSystem = new JPH::PhysicsSystem();
+    g_joltSystem->Init(512, 0, 1024, 1024, g_bpLayers, g_objVsBp, g_objPair);
+    // Same gravity as the player's walk physics.
+    g_joltSystem->SetGravity(JPH::Vec3(0.f, -14.f, 0.f));
+
+    g_bodyIf = &g_joltSystem->GetBodyInterface();
+    done = true;
+    return true;
+}
+
+static void joltShutdown() {
+    if (g_joltSystem) {
+        delete g_joltSystem;
+        g_joltSystem = nullptr;
+    }
+    if (JPH::Factory::sInstance) {
+        JPH::UnregisterTypes();
+        delete JPH::Factory::sInstance;
+        JPH::Factory::sInstance = nullptr;
+    }
+}
+
+// Euler (degrees, our RY*RX*RZ convention) -> Jolt quaternion.
+static JPH::Quat eulerToQuat(const Vec3& rotationDeg) {
+    constexpr float DEG = 3.14159265358979f / 180.0f;
+    const float Y = rotationDeg.y * DEG, X = rotationDeg.x * DEG,
+                Z = rotationDeg.z * DEG;
+
+    JPH::Quat Q = JPH::Quat::sRotation(JPH::Vec3::sAxisY(), Y);
+    Q = Q * JPH::Quat::sRotation(JPH::Vec3::sAxisX(), X);
+    Q = Q * JPH::Quat::sRotation(JPH::Vec3::sAxisZ(), Z);
+    return Q;
+}
+
+// Jolt quaternion -> Euler (degrees), the inverse of eulerToQuat: for
+// R = RY(yaw)*RX(pitch)*RZ(roll), pitch = asin(-R12), yaw = atan2(R02, R00),
+// roll = atan2(R10, R11) with R in math row-major.
+static Vec3 quatToEuler(const JPH::Quat& q) {
+    const JPH::Mat44 M = JPH::Mat44::sRotation(q);
+    const JPH::Vec3 C0 = M.GetColumn3(0);
+    const JPH::Vec3 C1 = M.GetColumn3(1);
+    const JPH::Vec3 C2 = M.GetColumn3(2);
+
+    constexpr float RAD = 180.0f / 3.14159265358979f;
+
+    return Vec3{
+        std::asin(std::clamp(-C2.GetY(), -1.0f, 1.0f)) * RAD,
+        std::atan2(C2.GetX(), C2.GetZ()) * RAD,
+        std::atan2(C0.GetY(), C1.GetY()) * RAD,
+    };
+}
+
+static void joltSyncBodies() {
+    g_joltBodies.resize(g_sceneObjects.size());
+
+    for (size_t i = 0; i < g_sceneObjects.size(); ++i) {
+        auto& JB = g_joltBodies[i];
+        const auto& OBJ = g_sceneObjects[i];
+        const auto* MODEL = g_scene.sceneModel(i);
+
+        const bool WANT = OBJ.collision && MODEL && MODEL->loaded() &&
+            !MODEL->triangles().empty();
+        const uint32_t MESH_VER = MODEL ? MODEL->meshVersion() : 0;
+
+        if (!WANT) {
+            if (JB.valid) {
+                g_bodyIf->RemoveBody(JB.body);
+                g_bodyIf->DestroyBody(JB.body);
+                JB = {};
+            }
+            continue;
+        }
+
+        // Rebuild ONLY on a mesh-content change: the generation also bumps
+        // on every transform move, and a falling object would otherwise
+        // recreate its ConvexHull every frame (the 0.5s-per-tick freeze).
+        if (!JB.valid || JB.meshGen != MESH_VER) {
+            if (JB.valid) {
+                g_bodyIf->RemoveBody(JB.body);
+                g_bodyIf->DestroyBody(JB.body);
+                JB = {};
+            }
+
+            JPH::TriangleList TL;
+            const auto& TRIS = MODEL->triangles();
+            TL.reserve(TRIS.size());
+            for (const auto& T : TRIS)
+                TL.push_back(JPH::Triangle(
+                    JPH::Float3(T.a.x, T.a.y, T.a.z),
+                    JPH::Float3(T.b.x, T.b.y, T.b.z),
+                    JPH::Float3(T.c.x, T.c.y, T.c.z)));
+
+            const bool DYN = OBJ.dynamic && OBJ.physics;
+            const JPH::EMotionType MOTION =
+                OBJ.dynamic ? (OBJ.physics ? JPH::EMotionType::Dynamic
+                                           : JPH::EMotionType::Kinematic)
+                            : JPH::EMotionType::Static;
+            const JPH::ObjectLayer LAYER =
+                MOTION == JPH::EMotionType::Static ? LAYER_STATIC : LAYER_MOVING;
+
+            JPH::Ref<JPH::Shape> SHAPE;
+            if (MOTION == JPH::EMotionType::Static) {
+                // Static meshes keep their exact triangle soup.
+                JPH::MeshShapeSettings SETTINGS(TL);
+                SETTINGS.SetEmbedded();
+                auto RES = SETTINGS.Create();
+                if (RES.HasError())
+                    continue;
+                SHAPE = RES.Get();
+            } else {
+                // Dynamic/kinematic bodies use a convex hull (Jolt requires
+                // it; the hull also tumbles believably).
+                JPH::Array<JPH::Vec3> POINTS;
+                POINTS.reserve(TRIS.size() * 3);
+                for (const auto& T : TRIS)
+                    for (const Vec3* P : {&T.a, &T.b, &T.c})
+                        POINTS.push_back(
+                            JPH::Vec3(P->x, P->y, P->z));
+
+                JPH::ConvexHullShapeSettings HS(POINTS);
+                HS.SetEmbedded();
+                auto RES = HS.Create();
+                if (RES.HasError())
+                    continue;
+                SHAPE = RES.Get();
+            }
+
+            JPH::BodyCreationSettings BCS(
+                SHAPE,
+                JPH::RVec3(OBJ.position.x, OBJ.position.y, OBJ.position.z),
+                eulerToQuat(OBJ.rotationDeg), MOTION, LAYER);
+            BCS.mLinearDamping  = 0.05f;
+            BCS.mAngularDamping = 0.05f;
+            BCS.mAllowSleeping  = true;
+            BCS.mFriction       = 0.6f;
+            BCS.mRestitution    = 0.05f;
+
+            JPH::Body* B = g_bodyIf->CreateBody(BCS);
+            g_bodyIf->AddBody(B->GetID(), JPH::EActivation::Activate);
+
+            JB.body    = B->GetID();
+            JB.meshGen = MESH_VER;
+            JB.valid   = true;
+        } else {
+            // Config-owned objects (static/kinematic/no-physics): follow the
+            // config transform if it moved (grab, config edit).
+            const auto WANT = JPH::RVec3(OBJ.position.x, OBJ.position.y,
+                                         OBJ.position.z);
+            const auto CUR = g_bodyIf->GetPosition(JB.body);
+
+            g_bodyIf->SetPositionAndRotationWhenChanged(
+                JB.body, WANT, eulerToQuat(OBJ.rotationDeg),
+                JPH::EActivation::DontActivate);
+        }
+    }
+}
+
 // Nearest scene-model hit of a ray. Occlusion (windows behind models lose
 // clicks/focus/aim) and the model gestures both go through this: collision-
 // enabled objects answer through their BVH trees (fast), a carried object is
@@ -333,6 +608,9 @@ static SModelRayHit modelRayHit(const Vec3& origin, const Vec3& dir,
     SModelRayHit R;
 
     for (size_t i = 0; i < g_sceneObjects.size(); ++i) {
+        if (i >= g_objTrees.size())
+            break; // config reloaded mid-frame: the trees lag one resize
+
         if (dynamicOnly && !g_sceneObjects[i].dynamic)
             continue;
         if (!g_sceneObjects[i].collision)
@@ -1616,6 +1894,12 @@ static void updateWheelRoll() {
         return;
 
     if (s_wheelRot.model) {
+        // A config reload can shrink the object list mid-roll.
+        if (s_wheelRot.modelIndex >= g_sceneObjects.size()) {
+            s_wheelRot.active = false;
+            return;
+        }
+
         auto* MODEL = g_scene.sceneModel(s_wheelRot.modelIndex);
         if (!MODEL || !MODEL->loaded()) {
             s_wheelRot.active = false;
@@ -2148,6 +2432,58 @@ static void update3D(float dt) {
     // The carried object's tree also rebuilds per frame (a prop is small)
     // but is EXCLUDED from the queries while carried, so the object the
     // player holds cannot push them around.
+    // --- Jolt: rigid body simulation for scene objects -------------------
+    // Bodies live in Jolt; transforms read back into the config objects (the
+    // render + collision layers follow the config as always). Jolt sleeps
+    // resting bodies, so a settled scene costs nothing.
+    const auto JOLT_T0 = std::chrono::steady_clock::now();
+    joltSyncBodies();
+
+    if (g_joltSystem) {
+        // All jobs execute on the main thread (0 workers), but through the
+        // FULL thread-pool job system: it handles the dependency graph of
+        // PhysicsSystem::Update, unlike JobSystemSingleThreaded, which
+        // asserts (SIGTRAP) as soon as a dynamic body creates dependent
+        // integration jobs.
+        static JPH::TempAllocatorMalloc TEMP_ALLOC;
+        static JPH::JobSystemThreadPool JOB_SYSTEM(
+            JPH::cMaxPhysicsJobs, JPH::cMaxPhysicsBarriers, 0);
+        const float SIM_DT = std::clamp(dt, 1.0f / 240.0f, 1.0f / 30.0f);
+        g_joltSystem->Update(SIM_DT, 1, &TEMP_ALLOC, &JOB_SYSTEM);
+
+        for (size_t i = 0; i < g_sceneObjects.size(); ++i) {
+            auto& JB = g_joltBodies[i];
+            auto& OBJ = g_sceneObjects[i];
+
+            if (!OBJ.dynamic || !OBJ.physics || !JB.valid || i == g_mapGrabIndex)
+                continue;
+
+            const auto POS = g_bodyIf->GetPosition(JB.body);
+            const auto ROT = g_bodyIf->GetRotation(JB.body);
+
+            const Vec3 NEW_POS{POS.GetX(), POS.GetY(), POS.GetZ()};
+            const Vec3 NEW_ROT = quatToEuler(ROT);
+
+            const bool CHANGED =
+                std::fabs(NEW_POS.x - OBJ.position.x) > 1e-6f ||
+                std::fabs(NEW_POS.y - OBJ.position.y) > 1e-6f ||
+                std::fabs(NEW_POS.z - OBJ.position.z) > 1e-6f ||
+                std::fabs(NEW_ROT.x - OBJ.rotationDeg.x) > 1e-4f ||
+                std::fabs(NEW_ROT.y - OBJ.rotationDeg.y) > 1e-4f ||
+                std::fabs(NEW_ROT.z - OBJ.rotationDeg.z) > 1e-4f;
+
+            if (CHANGED) {
+                OBJ.position    = NEW_POS;
+                OBJ.rotationDeg = NEW_ROT;
+                g_scene.setSceneObjectTransform(i, NEW_POS, NEW_ROT);
+            }
+        }
+
+        g_msJolt = g_msJolt * 0.9 +
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - JOLT_T0).count() * 0.1;
+    }
+
     g_objTrees.resize(g_sceneObjects.size());
     g_objTreeGens.resize(g_sceneObjects.size(), 0);
 
@@ -2155,12 +2491,21 @@ static void update3D(float dt) {
         const uint32_t GEN =
             g_scene.sceneModel(i) ? g_scene.sceneModel(i)->generation() : 0;
 
-        const bool SKIP = !g_sceneObjects[i].collision || g_mapGrabIndex == i;
+        // An AWAKE dynamic Jolt body moves every frame: its collision tree
+        // would cost O(n log n) per rebuild, so while it moves the tree is
+        // cleared and excluded from player queries; Jolt puts the body to
+        // sleep at rest and the tree then builds once.
+        const bool AWAKE =
+            g_sceneObjects[i].dynamic && g_joltBodies[i].valid && g_bodyIf &&
+            g_bodyIf->IsActive(g_joltBodies[i].body);
+
+        const bool SKIP = !g_sceneObjects[i].collision ||
+            g_mapGrabIndex == i || AWAKE;
 
         if (SKIP) {
-            // Collision off / object carried: its tree must be EMPTY (the
-            // clear belongs to this branch only -- clearing after a build
-            // wiped every just-built tree and killed all collision).
+            // Collision off / carried / still moving: the tree must be EMPTY
+            // (the clear belongs to this branch only -- clearing after a
+            // build wiped every just-built tree and killed all collision).
             if (!g_objTrees[i].empty())
                 g_objTrees[i].clear();
             g_objTreeGens[i] = GEN;
@@ -2169,34 +2514,6 @@ static void update3D(float dt) {
                 g_objTrees[i].build(MODEL->triangles());
             g_objTreeGens[i] = GEN;
         }
-    }
-
-    if (g_cfgGrid && !g_platformBuilt) {
-        // The visible grid platform as a real slab: top at world zero, half
-        // extent matching the drawn grid lines (20), 0.5 thick. Past its
-        // edge there is no collision -- the world has no floor clamp,
-        // falling off the platform is falling.
-        constexpr float H = 20.0f, T = 0.5f;
-        const Vec3 A{-H, 0, -H}, B{H, 0, -H}, C{H, 0, H}, D{-H, 0, H};
-        const Vec3 A2{-H, -T, -H}, B2{H, -T, -H}, C2{H, -T, H}, D2{-H, -T, H};
-
-        std::vector<CMapCollision::STL> TRIS_STORE;
-
-        const auto QUAD = [&](const Vec3& p1, const Vec3& p2,
-                              const Vec3& p3, const Vec3& p4) {
-            TRIS_STORE.push_back({p1, p2, p3});
-            TRIS_STORE.push_back({p1, p3, p4});
-        };
-
-        QUAD(A, D, C, B);     // top
-        QUAD(A2, B2, C2, D2); // bottom
-        QUAD(A, B, B2, A2);   // -z side
-        QUAD(B, C, C2, B2);   // +x side
-        QUAD(C, D, D2, C2);   // +z side
-        QUAD(D, A, A2, D2);   // -x side
-
-        g_platform.build(TRIS_STORE);
-        g_platformBuilt = true;
     }
 
     if (g_input.consumeLook(yawDelta, pitchDelta, dt)) {
@@ -2259,6 +2576,9 @@ static void update3D(float dt) {
     // the per-frame push compares equal and skips.
     if (g_pointerGesture == EPointerGesture::MapDrag && g_pointerDown &&
         g_mapGrabIndex != SIZE_MAX) {
+        if (g_mapGrabIndex >= g_sceneObjects.size()) {
+            g_mapGrabIndex = SIZE_MAX; // config reloaded mid-carry: drop it
+        } else {
         const auto& CAM = g_scene.camera();
         const Vec3 TARGET = CAM.position + CAM.centerRay() * g_mapGrabDist;
 
@@ -2292,7 +2612,18 @@ static void update3D(float dt) {
 
         g_sceneObjects[g_mapGrabIndex].position = TARGET;
         g_scene.setSceneObjectTransform(g_mapGrabIndex, TARGET, ROT);
+
+        if (g_bodyIf && g_mapGrabIndex < g_joltBodies.size() &&
+            g_joltBodies[g_mapGrabIndex].valid) {
+            const auto JB = g_joltBodies[g_mapGrabIndex].body;
+            g_bodyIf->SetLinearVelocity(JB, JPH::Vec3::sZero());
+            g_bodyIf->SetPositionAndRotationWhenChanged(
+                JB, JPH::RVec3(TARGET.x, TARGET.y, TARGET.z),
+                eulerToQuat(ROT), JPH::EActivation::Activate);
+        }
+
         damageCurrentMonitor();
+        }
     }
 
     // Super+wheel hover zoom: glide the window along its ray toward the
@@ -2383,32 +2714,30 @@ class CHypr3DPassElement final : public IPassElement {
         m_alpha(alpha), m_dt(dt) {}
 
     std::vector<UP<IPassElement>> draw() override {
-        if (!g_pHyprRenderer)
-            return {};
+        const auto GATE = [&](const std::string& why) {
+            g_lastRenderGate = why;
+            reportFramebufferErrorOnce(why);
+            return std::vector<UP<IPassElement>>{};
+        };
 
-        if (g_pHyprRenderer->type() != Render::IHyprRenderer::RT_GL) {
-            reportFramebufferErrorOnce("[hypr3d] renderer is not OpenGL");
-            return {};
-        }
+        if (!g_pHyprRenderer)
+            return GATE("[hypr3d] g_pHyprRenderer is null");
+
+        if (g_pHyprRenderer->type() != Render::IHyprRenderer::RT_GL)
+            return GATE("[hypr3d] renderer is not OpenGL");
 
         auto& renderData = g_pHyprRenderer->m_renderData;
 
-        if (!renderData.currentFB) {
-            reportFramebufferErrorOnce("[hypr3d] current framebuffer is null");
-            return {};
-        }
+        if (!renderData.currentFB)
+            return GATE("[hypr3d] current framebuffer is null");
 
         auto* framebuffer =
             dynamic_cast<Render::GL::CGLFramebuffer*>(
                 renderData.currentFB.get()
             );
 
-        if (!framebuffer) {
-            reportFramebufferErrorOnce(
-                "[hypr3d] current framebuffer is not CGLFramebuffer"
-            );
-            return {};
-        }
+        if (!framebuffer)
+            return GATE("[hypr3d] current framebuffer is not CGLFramebuffer");
 
         const int width = std::max(
             1,
@@ -2422,12 +2751,8 @@ class CHypr3DPassElement final : public IPassElement {
 
         const GLuint framebufferID = framebuffer->getFBID();
 
-        if (framebufferID == 0) {
-            reportFramebufferErrorOnce(
-                "[hypr3d] current framebuffer has ID 0"
-            );
-            return {};
-        }
+        if (framebufferID == 0)
+            return GATE("[hypr3d] current framebuffer has ID 0");
 
         if (!Render::GL::g_pHyprOpenGL) {
             reportFramebufferErrorOnce("[hypr3d] g_pHyprOpenGL is null");
@@ -2436,6 +2761,7 @@ class CHypr3DPassElement final : public IPassElement {
 
         Render::GL::g_pHyprOpenGL->makeEGLCurrent();
 
+        const auto R_T0 = std::chrono::steady_clock::now();
         const bool result = g_scene.render(
             framebufferID,
             width,
@@ -2444,6 +2770,9 @@ class CHypr3DPassElement final : public IPassElement {
             m_dt,
             g_renderWindows
         );
+        g_msRender = g_msRender * 0.9 +
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - R_T0).count() * 0.1;
 
         if (!result) {
             if (!g_reportedRenderError) {
@@ -2453,9 +2782,11 @@ class CHypr3DPassElement final : public IPassElement {
                     CHyprColor{1.0f, 0.2f, 0.2f, 1.0f}
                 );
             }
-
+            g_lastRenderGate = "GLScene::render returned false";
             return {};
         }
+
+        g_lastRenderGate.clear();
 
         if (!g_renderedOnce) {
             g_renderedOnce = true;
@@ -2620,6 +2951,17 @@ static void dumpStatus() {
         out << "scenePixel=unavailable\n";
 
     out << "renderWindows=" << g_renderWindows.size() << "\n";
+    out << "renderGate=" << (g_lastRenderGate.empty() ? "none" : g_lastRenderGate)
+        << "\n";
+    out << "renderer=" << (g_pHyprRenderer ? "ok" : "NULL")
+        << " rtype=" << (g_pHyprRenderer ? (int)g_pHyprRenderer->type() : -1)
+        << " (RT_GL=" << (int)Render::IHyprRenderer::RT_GL << ")\n";
+    out << "msUpdate3D=" << g_msUpdate3D << " msJolt=" << g_msJolt
+        << " msRender=" << g_msRender << "\n";
+    out << "lastError=" << (g_lastError.empty() ? "none" : g_lastError)
+        << "\n";
+    out << "sceneObjects=" << g_sceneObjects.size() << " joltBodies="
+        << g_joltBodies.size() << " objTrees=" << g_objTrees.size() << "\n";
 
     out << "fsPhase=" << static_cast<int>(g_fsPhase)
         << " fsWasOn=" << (g_fsWasOn ? 1 : 0)
@@ -2640,6 +2982,24 @@ static void dumpStatus() {
     } else {
         out << "fsWindow=none\n";
     }
+    // Scene-object physics state: one line per object.
+    for (size_t i = 0; i < g_sceneObjects.size() && i < g_objTrees.size(); ++i) {
+        const auto& OBJ = g_sceneObjects[i];
+        const auto& J = i < g_joltBodies.size() ? g_joltBodies[i]
+                                                : SObjJolt{};
+        out << "  obj" << i << "="
+            << OBJ.path.substr(OBJ.path.size() -
+                               std::min<size_t>(OBJ.path.size(), 24))
+            << " dyn=" << (OBJ.dynamic ? 1 : 0)
+            << " phys=" << (OBJ.physics ? 1 : 0)
+            << " col=" << (OBJ.collision ? 1 : 0)
+            << " pos=" << OBJ.position.x << "," << OBJ.position.y << ","
+            << OBJ.position.z
+            << " tree=" << (g_objTrees[i].empty() ? 0 : 1)
+            << " jolt=" << (J.valid ? 1 : 0)
+            << "\n";
+    }
+
     // Per-window channel alphas + Hyprland's remembered floating size:
     // the semi-transparency and the giant-size bugs live in THESE state
     // channels; the dump pins which one is stuck and for whom.
@@ -2703,7 +3063,11 @@ static void onRenderStage(eRenderStage stage) {
     if (g_fsPhase == EFullscreenPhase::In2D)
         return;
 
+    const auto U3_T0 = std::chrono::steady_clock::now();
     update3D(dt);
+    g_msUpdate3D = g_msUpdate3D * 0.9 +
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - U3_T0).count() * 0.1;
 
     g_diagAlpha = std::clamp(g_transition, 0.0f, 1.0f);
 
@@ -2847,6 +3211,17 @@ static void onMouseAxis(
             g_scene.setSceneObjectTransform(MRAY.index,
                                             g_sceneObjects[MRAY.index].position,
                                             MODEL->rotationDeg());
+
+            if (g_bodyIf && MRAY.index < g_joltBodies.size() &&
+                g_joltBodies[MRAY.index].valid)
+                g_bodyIf->SetPositionAndRotationWhenChanged(
+                    g_joltBodies[MRAY.index].body,
+                    JPH::RVec3(g_sceneObjects[MRAY.index].position.x,
+                               g_sceneObjects[MRAY.index].position.y,
+                               g_sceneObjects[MRAY.index].position.z),
+                    eulerToQuat(g_sceneObjects[MRAY.index].rotationDeg),
+                    JPH::EActivation::Activate);
+
             s_modelZoomDist = NEW_DIST;
 
             info.cancelled = true;
@@ -3582,6 +3957,13 @@ static int luaConfig(lua_State* L) {
             }
             OBJ.dynamic = !staticObj;
 
+            // physics = true: gravity + world collisions (dynamic only;
+            // ignored on static objects).
+            if (!SET_BOOL(OIDX, "physics", OBJ.physics, "scene.<name>.physics")) {
+                lua_pop(L, 1);
+                return luaL_error(L, "hypr3d.config: scene.<name>.physics must be a boolean");
+            }
+
             OBJECTS.push_back(OBJ);
             lua_pop(L, 1); // pop the value; the key remains for lua_next
         }
@@ -3635,6 +4017,8 @@ static int luaConfig(lua_State* L) {
                 return luaL_error(L, "hypr3d.config: map.flat must be a boolean");
             if (!SET_BOOL(idx, "collision", OBJ.collision, "map.collision"))
                 return luaL_error(L, "hypr3d.config: map.collision must be a boolean");
+            if (!SET_BOOL(idx, "physics", OBJ.physics, "map.physics"))
+                return luaL_error(L, "hypr3d.config: map.physics must be a boolean");
 
             g_sceneObjects.push_back(OBJ);
 
@@ -3680,6 +4064,8 @@ APICALL EXPORT std::string PLUGIN_API_VERSION() {
 }
 
 APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
+    joltInit();
+
     PHANDLE = handle;
 
     const std::string serverHash = __hyprland_api_get_hash();
@@ -3731,41 +4117,84 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "config", luaConfig))
         throw std::runtime_error("[hypr3d] failed to register Lua config");
 
+    // Every handler is wrapped: an exception must NEVER escape into
+    // Hyprland (std::terminate there kills the whole compositor). The
+    // exception text lands in the status dump instead.
     static auto renderPre =
         Event::bus()->m_events.render.pre.listen(
-            [](PHLMONITOR mon) { onRenderPre(mon); }
+            [](PHLMONITOR mon) {
+                try {
+                    onRenderPre(mon);
+                } catch (const std::exception& e) {
+                    dumpErrorNow(std::string{"renderPre: "} + e.what());
+                } catch (...) {
+                    dumpErrorNow("renderPre: unknown exception");
+                }
+            }
         );
 
     static auto renderStage =
         Event::bus()->m_events.render.stage.listen(
-            [](eRenderStage stage) { onRenderStage(stage); }
+            [](eRenderStage stage) {
+                try {
+                    onRenderStage(stage);
+                } catch (const std::exception& e) {
+                    dumpErrorNow(std::string{"renderStage: "} + e.what());
+                } catch (...) {
+                    dumpErrorNow("renderStage: unknown exception");
+                }
+            }
         );
 
     static auto mouseMove =
         Event::bus()->m_events.input.mouse.move.listen(
             [](Vector2D pos, Event::SCallbackInfo& info) {
-                onMouseMove(pos, info);
+                try {
+                    onMouseMove(pos, info);
+                } catch (const std::exception& e) {
+                    dumpErrorNow(std::string{"mouseMove: "} + e.what());
+                } catch (...) {
+                    dumpErrorNow("mouseMove: unknown exception");
+                }
             }
         );
 
     static auto mouseButton =
         Event::bus()->m_events.input.mouse.button.listen(
             [](IPointer::SButtonEvent event, Event::SCallbackInfo& info) {
-                onMouseButton(event, info);
+                try {
+                    onMouseButton(event, info);
+                } catch (const std::exception& e) {
+                    dumpErrorNow(std::string{"mouseButton: "} + e.what());
+                } catch (...) {
+                    dumpErrorNow("mouseButton: unknown exception");
+                }
             }
         );
 
     static auto mouseAxis =
         Event::bus()->m_events.input.mouse.axis.listen(
             [](IPointer::SAxisEvent event, Event::SCallbackInfo& info) {
-                onMouseAxis(event, info);
+                try {
+                    onMouseAxis(event, info);
+                } catch (const std::exception& e) {
+                    dumpErrorNow(std::string{"mouseAxis: "} + e.what());
+                } catch (...) {
+                    dumpErrorNow("mouseAxis: unknown exception");
+                }
             }
         );
 
     static auto keyboardKey =
         Event::bus()->m_events.input.keyboard.key.listen(
             [](IKeyboard::SKeyEvent event, Event::SCallbackInfo& info) {
-                onKeyboardKey(event, info);
+                try {
+                    onKeyboardKey(event, info);
+                } catch (const std::exception& e) {
+                    dumpErrorNow(std::string{"keyboardKey: "} + e.what());
+                } catch (...) {
+                    dumpErrorNow("keyboardKey: unknown exception");
+                }
             }
         );
 
@@ -3792,6 +4221,8 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
+    joltShutdown();
+
     g_active = false;
     stopFramePump();
     g_transition = 0.0f;

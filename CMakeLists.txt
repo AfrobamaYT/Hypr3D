@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.27)
 
-project(hypr3d25567 LANGUAGES CXX)
+project(hypr3d31227 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -61,12 +61,32 @@ endif()
 
 find_package(PkgConfig REQUIRED)
 
+# --- Jolt Physics: rigid body simulation for scene objects ------------------
+# Included directly via Jolt/Jolt.cmake (the source list + the Jolt target),
+# bypassing Jolt's top-level app build. Directory-scope link_libraries keeps
+# this working no matter what the plugin target is called.
+set(PHYSICS_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/Jolt")
+set(USE_ASSERTS OFF)
+set(INTERPROCEDURAL_OPTIMIZATION OFF) # keep plugin builds fast
+set(CROSS_PLATFORM_DETERMINISTIC OFF)
+include("${PHYSICS_REPO_ROOT}/Jolt/Jolt.cmake")
+# Hide Jolt's symbols inside the plugin .so: without this the archive
+# exports thousands of JPH:: symbols, and the plugin load collides with the
+# global symbol namespace ("multiply defined" on load).
+target_compile_options(Jolt PRIVATE -O2 -fvisibility=hidden -fvisibility-inlines-hidden)
+target_include_directories(Jolt PUBLIC "${PHYSICS_REPO_ROOT}")
+link_libraries(Jolt)
+
+# Jolt.cmake forces C++17 in directory scope; ours is C++23.
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 pkg_check_modules(PIXMAN REQUIRED IMPORTED_TARGET pixman-1)
 pkg_check_modules(LIBDRM REQUIRED IMPORTED_TARGET libdrm)
 pkg_check_modules(XKBCOMMON REQUIRED IMPORTED_TARGET xkbcommon)
 pkg_check_modules(HYPRGRAPHICS REQUIRED IMPORTED_TARGET hyprgraphics)
 
-add_library(hypr3d25567 SHARED
+add_library(hypr3d31227 SHARED
     src/main.cpp
     src/Render/GLScene.cpp
     src/Render/MapModel.cpp
@@ -81,7 +101,7 @@ add_library(hypr3d25567 SHARED
     src/HyprlandCompat/PointerHook.cpp
 )
 
-target_include_directories(hypr3d25567
+target_include_directories(hypr3d31227
     BEFORE PRIVATE
         "${HYPRLAND_INCLUDE}"
         "${HYPRLAND_ROOT}"
@@ -90,7 +110,7 @@ target_include_directories(hypr3d25567
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
 
-target_link_libraries(hypr3d25567 PRIVATE
+target_link_libraries(hypr3d31227 PRIVATE
     PkgConfig::HYPRGRAPHICS
     PkgConfig::PIXMAN
     PkgConfig::LIBDRM
@@ -100,7 +120,7 @@ target_link_libraries(hypr3d25567 PRIVATE
     dl
 )
 
-set_target_properties(hypr3d25567 PROPERTIES
+set_target_properties(hypr3d31227 PROPERTIES
     PREFIX ""
-    OUTPUT_NAME "hypr3d25567"
+    OUTPUT_NAME "hypr3d31227"
 )

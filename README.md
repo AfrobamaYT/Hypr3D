@@ -76,6 +76,8 @@ if hl.plugin.hypr3d then
                 static = true,        -- true: location geometry; false: the
                                       -- object is grabbable (Super+LMB carries
                                       -- it on the crosshair, release drops it)
+                physics = false,      -- gravity + world collisions for the
+                                      -- object (needs static = false)
             },
             -- prop = { path = "...", static = false, ... },
         },

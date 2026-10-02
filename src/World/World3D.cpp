@@ -242,6 +242,9 @@ void CWorld::updateDrag(
     ENTITY->yaw = smoothAngle(ENTITY->yaw, TARGET_YAW, dt, 9.0f);
     ENTITY->pitch = smoothAngle(ENTITY->pitch, TARGET_PITCH, dt, 9.0f);
     ENTITY->pitch = std::clamp(ENTITY->pitch, -1.5f, 1.5f);
+    // Full facing: the roll eases to zero as well. A dragged window with a
+    // leftover wheel-roll would face the player tilted.
+    ENTITY->roll = smoothAngle(ENTITY->roll, 0.0f, dt, 9.0f);
 
     const Vec3 GRAB_WORLD = rotateLocal(
         m_drag.grabLocal, ENTITY->yaw, ENTITY->pitch, ENTITY->roll

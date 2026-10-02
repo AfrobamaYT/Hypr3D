@@ -155,8 +155,11 @@ GLuint compileMapShader(GLenum type, const char* src) {
     return SH;
 }
 
+// Rotation around a local pivot: world = position + R * S * (local - pivot).
+// composeModel composes as R * (S * x - S * pivot) + position, so the model
+// matrix T * R * T(-S*pivot) * S places the PIVOT at `position`.
 Mat4 composeModel(const Vec3& position, const Vec3& rotationDeg,
-                  const Vec3& scale) {
+                  const Vec3& scale, const Vec3& pivot) {
     constexpr float DEG = 3.14159265358979f / 180.0f;
 
     const Mat4 T  = Mat4::translation(position);
@@ -165,8 +168,17 @@ Mat4 composeModel(const Vec3& position, const Vec3& rotationDeg,
     const Mat4 RZ = Mat4::rotationZ(rotationDeg.z * DEG);
     const Mat4 S  = Mat4::scale(scale);
 
+    const Vec3 PS =
+        Vec3{scale.x * pivot.x, scale.y * pivot.y, scale.z * pivot.z};
+
     // Same convention as the window model: RY * RX * RZ.
-    return T * RY * (RX * (RZ * S));
+    return T * RY * (RX * (RZ * (Mat4::translation(PS * -1.0f) * S)));
+}
+
+[[maybe_unused]] Mat4 composeModel(const Vec3& position,
+                                   const Vec3& rotationDeg,
+                                   const Vec3& scale) {
+    return composeModel(position, rotationDeg, scale, Vec3{0.f, 0.f, 0.f});
 }
 
 Vec3 transformPoint(const Mat4& m, const Vec3& p) {
@@ -580,6 +592,7 @@ bool CMapModel::load(const std::string& path, const Vec3& position,
             m_ownedTextures.push_back(T);
 
     m_loaded = true;
+    resolvePivot();
     recomputeTriangles();
     ++m_meshVersion;
     return true;
@@ -638,6 +651,37 @@ void CMapModel::destroy() {
 
 // --- transform / draw -------------------------------------------------------
 
+void CMapModel::setCenter(ECenter mode, const Vec3& offset) {
+    m_center       = mode;
+    m_centerOffset = offset;
+    if (m_loaded) {
+        resolvePivot();
+        recomputeTriangles(); // the pivot moved: world triangles follow
+        ++m_meshVersion;      // physics bodies rebuild at the new pivot --
+                              // without this the Jolt hull stayed at the
+                              // OLD offset while the visual shifted
+    }
+}
+
+void CMapModel::resolvePivot() {
+    // Logical = the LOCAL AABB center of the untransformed mesh.
+    if (m_center == ECenter::Logical && !m_localTriangles.empty()) {
+        Vec3 lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
+        for (const auto& T : m_localTriangles)
+            for (const Vec3* P : {&T.a, &T.b, &T.c}) {
+                lo = {std::min(lo.x, P->x), std::min(lo.y, P->y),
+                      std::min(lo.z, P->z)};
+                hi = {std::max(hi.x, P->x), std::max(hi.y, P->y),
+                      std::max(hi.z, P->z)};
+            }
+        m_pivot = Vec3{(lo.x + hi.x) * 0.5f, (lo.y + hi.y) * 0.5f,
+                       (lo.z + hi.z) * 0.5f};
+    } else {
+        m_pivot = Vec3{0.f, 0.f, 0.f};
+    }
+    m_pivot = m_pivot + m_centerOffset;
+}
+
 void CMapModel::setTransform(const Vec3& position, const Vec3& rotationDeg,
                              const Vec3& scale) {
     // Zero axes would collapse the map; clamp to a hair.
@@ -665,7 +709,8 @@ void CMapModel::setTransform(const Vec3& position, const Vec3& rotationDeg,
 }
 
 void CMapModel::recomputeTriangles() {
-    const Mat4 MODEL = composeModel(m_position, m_rotationDeg, m_scale);
+    const Mat4 MODEL =
+        composeModel(m_position, m_rotationDeg, m_scale, m_pivot);
 
     m_triangles.clear();
     m_triangles.reserve(m_localTriangles.size());
@@ -781,7 +826,8 @@ void CMapModel::draw(const Mat4& vp, const Vec3& cameraPos) const {
     if (!m_loaded || !m_program || m_primitives.empty())
         return;
 
-    const Mat4 MODEL = composeModel(m_position, m_rotationDeg, m_scale);
+    const Mat4 MODEL =
+        composeModel(m_position, m_rotationDeg, m_scale, m_pivot);
     const Mat4 MVP   = vp * MODEL;
 
     glUseProgram(m_program);

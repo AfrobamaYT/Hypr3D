@@ -103,6 +103,8 @@ class GLScene {
         Vec3 position{}, rotationDeg{}, scale{1.0f, 1.0f, 1.0f};
         float emissiveScale = 1.0f;
         bool flat = true;
+        CMapModel::ECenter center = CMapModel::ECenter::Logical;
+        Vec3 centerOffset{};
     };
 
     // Diff-apply the object list: new slots are created (files load lazily

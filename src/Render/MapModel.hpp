@@ -20,6 +20,8 @@ class CMapModel {
         Vec3 a, b, c;
     };
 
+    enum class ECenter : uint8_t { Logical, Origin };
+
     // rotationDeg is XYZ Euler angles in degrees. Re-loading with the same
     // path and transform is a cheap no-op (mtime is NOT checked here -- the
     // caller decides when the file changed).
@@ -34,6 +36,10 @@ class CMapModel {
     // The map's own transform, remembered for the draw pass.
     void setTransform(const Vec3& position, const Vec3& rotationDeg,
                       const Vec3& scale);
+
+    // The rotation pivot: Logical = the mesh's local AABB center, Origin =
+    // the mesh's own origin. centerOffset adds on top in local units.
+    void setCenter(ECenter mode, const Vec3& offset);
 
     // Global emissive multiplier (config); 0 = pure lambert, 1 = as authored.
     void setEmissiveScale(float s) {
@@ -77,6 +83,23 @@ class CMapModel {
         return m_triangles;
     }
 
+    // Node-space triangles (no transform). Physics bodies map these into
+    // BODY space (scale + pivot shift), so the body transform alone places
+    // them in the world exactly like the render matrix does.
+    const std::vector<STL>& localTriangles() const {
+        return m_localTriangles;
+    }
+
+    // The resolved local rotation pivot (center mode + offset applied) and
+    // the current scale -- both feed the body-space mapping above.
+    const Vec3& pivot() const {
+        return m_pivot;
+    }
+
+    const Vec3& scale() const {
+        return m_scale;
+    }
+
     // Bump this after every (re)load so collision can rebuild its BVH.
     uint32_t generation() const {
         return m_generation;
@@ -92,6 +115,9 @@ class CMapModel {
     // Node-space collision triangles; the world-space set (m_triangles) is
     // recomputed from these whenever the config transform changes.
     void recomputeTriangles();
+
+    // Resolves m_pivot from the center mode + offset (local units).
+    void resolvePivot();
 
     struct SPrimitive {
         unsigned int vao = 0, vbo = 0, ebo = 0;
@@ -120,6 +146,9 @@ class CMapModel {
     Vec3                    m_position{};
     Vec3                    m_rotationDeg{};
     Vec3                    m_scale{1.0f, 1.0f, 1.0f};
+    ECenter                 m_center = ECenter::Logical;
+    Vec3                    m_centerOffset{};
+    Vec3                    m_pivot{}; // resolved local pivot
     float                   m_emissiveScale = 1.0f;
     bool                    m_flat = true;
     bool                    m_loaded = false;

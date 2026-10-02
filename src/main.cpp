@@ -311,6 +311,7 @@ static float g_verticalVel = 0.0f;
 
 // --- scene: unlimited named glTF objects ------------------------------------
 struct SSceneObjectCfg {
+    std::string name; // the lua table key ("scene.<name>")
     std::string path;
     Vec3        position{}, rotationDeg{}, scale{1.0f, 1.0f, 1.0f};
     float       emissiveScale = 1.0f;
@@ -318,9 +319,13 @@ struct SSceneObjectCfg {
     bool        collision = true;
     bool        dynamic = false; // static = false -> grabbable with Super+LMB
     bool        physics = false; // gravity + world collisions (dynamic only)
+    CMapModel::ECenter center = CMapModel::ECenter::Logical;
+    Vec3        centerOffset{}; // extra pivot shift, local units
 };
 
 static std::vector<SSceneObjectCfg> g_sceneObjects;
+static std::vector<SSceneObjectCfg> g_sceneLuaState; // the last parsed config
+static bool g_sceneLuaValid = false;
 
 
 // Index of the currently grabbed dynamic object, SIZE_MAX when none.
@@ -413,9 +418,16 @@ static JPH::BodyInterface*  g_bodyIf     = nullptr;
 struct SObjJolt {
     JPH::BodyID body{};
     uint32_t    meshGen = 0; // model generation the body was built from
+    Vec3        builtScale{1.0f, 1.0f, 1.0f}; // body-space mapping used at
+    Vec3        builtPivot{};                 // build time (scale + pivot)
     bool        valid = false;
 };
 static std::vector<SObjJolt> g_joltBodies;
+
+// Gravity factor saved while a wheel-roll gesture suspends the object's
+// simulation (captured ONCE at grab -- re-reading it per frame would store
+// the suspended zero and never restore it).
+static float g_rolledGravity = 1.0f;
 
 // Creates/removes/teleports the Jolt body of each scene object so it
 // matches the config state. Body classes:
@@ -507,24 +519,56 @@ static void joltSyncBodies() {
             continue;
         }
 
-        // Rebuild ONLY on a mesh-content change: the generation also bumps
-        // on every transform move, and a falling object would otherwise
-        // recreate its ConvexHull every frame (the 0.5s-per-tick freeze).
-        if (!JB.valid || JB.meshGen != MESH_VER) {
+        // Rebuild ONLY on a mesh-content change (or a body-space mapping
+        // change: scale/pivot edits): the generation also bumps on every
+        // transform move, and a falling object would otherwise recreate its
+        // ConvexHull every frame (the 0.5s-per-tick freeze).
+        const Vec3 SCL = MODEL->scale();
+        const Vec3 PIV = MODEL->pivot();
+        const bool MAPPING_CHANGED =
+            JB.builtScale.x != SCL.x || JB.builtScale.y != SCL.y ||
+            JB.builtScale.z != SCL.z || JB.builtPivot.x != PIV.x ||
+            JB.builtPivot.y != PIV.y || JB.builtPivot.z != PIV.z;
+
+        if (!JB.valid || JB.meshGen != MESH_VER || MAPPING_CHANGED) {
             if (JB.valid) {
                 g_bodyIf->RemoveBody(JB.body);
                 g_bodyIf->DestroyBody(JB.body);
                 JB = {};
             }
 
+            // Body-space triangles: the mesh scaled, with the PIVOT at the
+            // body origin. The body transform (config position/rotation)
+            // then maps body space onto the world exactly like the render
+            // matrix does -- collision follows the visual for ANY config
+            // transform, and a center_offset edit only moves the pivot.
+            // (World-baked vertices here would apply the body transform a
+            // SECOND time: an object placed at {2,0,1} got its collision at
+            // {4,0,2}.)
+            const auto BODY_PT = [&](const Vec3& p) {
+                return Vec3{SCL.x * p.x - SCL.x * PIV.x,
+                            SCL.y * p.y - SCL.y * PIV.y,
+                            SCL.z * p.z - SCL.z * PIV.z};
+            };
+
+            const auto& LOCAL = MODEL->localTriangles();
             JPH::TriangleList TL;
-            const auto& TRIS = MODEL->triangles();
-            TL.reserve(TRIS.size());
-            for (const auto& T : TRIS)
+            // Two-sided: each triangle twice (both windings) -- Jolt's
+            // narrow phase ignores back faces, and single-sided authored
+            // geometry (ceilings!) would let bodies tunnel through.
+            TL.reserve(LOCAL.size() * 2);
+            for (const auto& T : LOCAL) {
+                const Vec3 A = BODY_PT(T.a), B = BODY_PT(T.b),
+                           C = BODY_PT(T.c);
                 TL.push_back(JPH::Triangle(
-                    JPH::Float3(T.a.x, T.a.y, T.a.z),
-                    JPH::Float3(T.b.x, T.b.y, T.b.z),
-                    JPH::Float3(T.c.x, T.c.y, T.c.z)));
+                    JPH::Float3(A.x, A.y, A.z),
+                    JPH::Float3(B.x, B.y, B.z),
+                    JPH::Float3(C.x, C.y, C.z)));
+                TL.push_back(JPH::Triangle(
+                    JPH::Float3(A.x, A.y, A.z),
+                    JPH::Float3(C.x, C.y, C.z),
+                    JPH::Float3(B.x, B.y, B.z)));
+            }
 
             const bool DYN = OBJ.dynamic && OBJ.physics;
             const JPH::EMotionType MOTION =
@@ -547,11 +591,12 @@ static void joltSyncBodies() {
                 // Dynamic/kinematic bodies use a convex hull (Jolt requires
                 // it; the hull also tumbles believably).
                 JPH::Array<JPH::Vec3> POINTS;
-                POINTS.reserve(TRIS.size() * 3);
-                for (const auto& T : TRIS)
-                    for (const Vec3* P : {&T.a, &T.b, &T.c})
-                        POINTS.push_back(
-                            JPH::Vec3(P->x, P->y, P->z));
+                POINTS.reserve(LOCAL.size() * 3);
+                for (const auto& T : LOCAL)
+                    for (const Vec3* P : {&T.a, &T.b, &T.c}) {
+                        const Vec3 Q = BODY_PT(*P);
+                        POINTS.push_back(JPH::Vec3(Q.x, Q.y, Q.z));
+                    }
 
                 JPH::ConvexHullShapeSettings HS(POINTS);
                 HS.SetEmbedded();
@@ -574,9 +619,11 @@ static void joltSyncBodies() {
             JPH::Body* B = g_bodyIf->CreateBody(BCS);
             g_bodyIf->AddBody(B->GetID(), JPH::EActivation::Activate);
 
-            JB.body    = B->GetID();
-            JB.meshGen = MESH_VER;
-            JB.valid   = true;
+            JB.body       = B->GetID();
+            JB.meshGen    = MESH_VER;
+            JB.builtScale = SCL;
+            JB.builtPivot = PIV;
+            JB.valid      = true;
         } else {
             // Config-owned objects (static/kinematic/no-physics): follow the
             // config transform if it moved (grab, config edit).
@@ -1885,6 +1932,21 @@ static void applyFullscreenAnimation() {
     }
 }
 
+// Ends a model roll gesture: restores the suspended gravity on every exit
+// path (button release, crosshair leaving, model vanishing) and WAKES the
+// body -- during the roll it was held motionless, so Jolt put it to sleep,
+// and a sleeping body would stay frozen forever even with gravity back.
+static void endModelRoll() {
+    if (s_wheelRot.model && s_wheelRot.modelIndex < g_joltBodies.size()) {
+        const auto BODY = g_joltBodies[s_wheelRot.modelIndex].body;
+        g_bodyIf->SetGravityFactor(BODY, g_rolledGravity);
+        g_bodyIf->ActivateBody(BODY);
+    }
+    s_wheelRot.model      = false;
+    s_wheelRot.active     = false;
+    s_wheelRot.modelIndex = SIZE_MAX;
+}
+
 // Per-frame roll gesture: rotate the window around its normal by the signed
 // angle the crosshair swept around the window center (measured in world
 // space around the normal -- invariant to the roll itself, so the gesture
@@ -1896,13 +1958,13 @@ static void updateWheelRoll() {
     if (s_wheelRot.model) {
         // A config reload can shrink the object list mid-roll.
         if (s_wheelRot.modelIndex >= g_sceneObjects.size()) {
-            s_wheelRot.active = false;
+            endModelRoll();
             return;
         }
 
         auto* MODEL = g_scene.sceneModel(s_wheelRot.modelIndex);
         if (!MODEL || !MODEL->loaded()) {
-            s_wheelRot.active = false;
+            endModelRoll();
             return;
         }
 
@@ -1923,6 +1985,25 @@ static void updateWheelRoll() {
 
         g_scene.setSceneObjectTransform(s_wheelRot.modelIndex,
                                         MODEL->position(), ROT);
+
+        // Rolling a physics object suspends its simulation: gravity off,
+        // velocities zeroed -- otherwise the falling/dragging motion fights
+        // the user's rotation and the behavior looks erratic. The new
+        // rotation is ALSO pushed into the body: the per-frame readback
+        // reads the body transform, and without this it would revert the
+        // roll every frame.
+        if (s_wheelRot.model && s_wheelRot.modelIndex < g_joltBodies.size()) {
+            const auto JB = g_joltBodies[s_wheelRot.modelIndex].body;
+            g_bodyIf->SetGravityFactor(JB, 0.f);
+            g_bodyIf->SetLinearVelocity(JB, JPH::Vec3::sZero());
+            g_bodyIf->SetAngularVelocity(JB, JPH::Vec3::sZero());
+            g_bodyIf->SetPositionAndRotationWhenChanged(
+                JB,
+                JPH::RVec3(MODEL->position().x, MODEL->position().y,
+                           MODEL->position().z),
+                eulerToQuat(ROT), JPH::EActivation::DontActivate);
+        }
+
         damageCurrentMonitor();
         return;
     }
@@ -1987,7 +2068,8 @@ static void resetPointerGesture() {
     g_pointerGesture = EPointerGesture::None;
     g_pointerButton = 0;
     g_resize = {};
-    s_wheelRot.active = false;
+    // A finished roll gesture restores the object's gravity.
+    endModelRoll();
 
     // Dropping a carried scene object: it re-enters the collision set at
     // its current position (the SETUP fingerprint changes -> rebuild).
@@ -2410,6 +2492,8 @@ static void update3D(float dt) {
         SPEC.scale         = OBJ.scale;
         SPEC.emissiveScale = OBJ.emissiveScale;
         SPEC.flat          = OBJ.flat;
+        SPEC.center        = OBJ.center;
+        SPEC.centerOffset  = OBJ.centerOffset;
         SPECS.push_back(SPEC);
     }
 
@@ -2606,6 +2690,10 @@ static void update3D(float dt) {
         const float K = 1.0f - std::exp(-10.0f * dt);
         curYaw += dYaw * K;
         curPitch += (TARGET_PITCH - curPitch) * K;
+
+        // Full facing on all three axes: the roll eases to zero as well,
+        // same exponential as yaw/pitch.
+        ROT.z += (0.0f - ROT.z) * K;
 
         ROT.x = curPitch / DEG;
         ROT.y = curYaw / DEG;
@@ -3165,6 +3253,19 @@ static void onMouseAxis(
         return;
     }
 
+    // Carrying a scene object: the wheel scales the grab distance, so the
+    // object approaches or recedes along the crosshair. (modelRayHit skips
+    // the carried object -- it is under the crosshair already -- so without
+    // this branch the wheel would do nothing during a carry.)
+    if (g_pointerGesture == EPointerGesture::MapDrag && g_pointerDown &&
+        g_mapGrabIndex != SIZE_MAX) {
+        g_mapGrabDist = std::max(
+            0.05f, g_mapGrabDist * static_cast<float>(std::pow(1.06, STEPS)));
+        info.cancelled = true;
+        damageCurrentMonitor();
+        return;
+    }
+
     // Any other time: Super + wheel over a window zooms it along the ray
     // from the camera through the window. Without Super the wheel reaches
     // the focused client unchanged (scroll).
@@ -3320,6 +3421,14 @@ static void onMouseButton(
                     s_wheelRot.reference  = PLANE_POINT - CENTER;
                     s_wheelRot.startRoll  = MODEL->rotationDeg().z *
                         (3.14159265358979f / 180.0f);
+
+                    // Capture the gravity factor ONCE: the per-frame update
+                    // sets it to 0 for the suspension, and re-reading it
+                    // there would store the zero and never restore it.
+                    if (MRAY.index < g_joltBodies.size() &&
+                        g_joltBodies[MRAY.index].valid)
+                        g_rolledGravity = g_bodyIf->GetGravityFactor(
+                            g_joltBodies[MRAY.index].body);
 
                     g_pointerGesture = EPointerGesture::WheelRoll;
                     g_pointerButton  = BTN_MIDDLE;
@@ -3802,16 +3911,44 @@ static int luaConfig(lua_State* L) {
             return false;
         }
 
+        const int T = lua_gettop(L);
+
+        // Positional form: { x, y, z } == { 1, 2, 3 }.
+        float pos[3] = {0.f, 0.f, 0.f};
+        bool havePos = false;
+        for (int k = 1; k <= 3; ++k) {
+            lua_rawgeti(L, T, k);
+            if (lua_isnil(L, -1)) {
+                lua_pop(L, 1);
+                continue;
+            }
+            if (!lua_isnumber(L, -1)) {
+                lua_pop(L, 1);
+                return false;
+            }
+            pos[k - 1] = static_cast<float>(lua_tonumber(L, -1));
+            havePos = true;
+            lua_pop(L, 1);
+        }
+
         const auto AXIS = [&](const char* name, float& v) {
-            lua_getfield(L, -1, name);
+            lua_getfield(L, T, name);
             if (lua_isnumber(L, -1))
                 v = static_cast<float>(lua_tonumber(L, -1));
             lua_pop(L, 1);
         };
 
-        AXIS("x", out.x);
-        AXIS("y", out.y);
-        AXIS("z", out.z);
+        float x = out.x, y = out.y, z = out.z;
+        AXIS("x", x);
+        AXIS("y", y);
+        AXIS("z", z);
+
+        // Positional wins when both forms are mixed in one table.
+        if (havePos)
+            out = Vec3{pos[0], pos[1], pos[2]};
+        else
+            out = Vec3{x, y, z};
+
         lua_pop(L, 1);
         return true;
     };
@@ -3898,6 +4035,19 @@ static int luaConfig(lua_State* L) {
             SSceneObjectCfg OBJ;
             const int OIDX = lua_gettop(L);
 
+            // The table key names the object. Reconciliation matches by
+            // NAME, not index: lua_next order is NOT stable across config
+            // parses (string hashes are seeded per lua state, so two parses
+            // of the SAME file can iterate the objects in opposite orders),
+            // and an index-matched reconcile cross-wired the objects -- the
+            // untouched static map inherited a dynamic object's fallen pose
+            // and rotated away out of view.
+            if (lua_type(L, OIDX - 1) == LUA_TSTRING) {
+                size_t KLEN = 0;
+                const char* KSTR = lua_tolstring(L, OIDX - 1, &KLEN);
+                OBJ.name.assign(KSTR, KLEN);
+            }
+
             if (!SET_STRING(OIDX, "path", OBJ.path, "scene.<name>.path")) {
                 lua_pop(L, 1);
                 return luaL_error(L, "hypr3d.config: scene.<name>.path must be a string");
@@ -3964,8 +4114,83 @@ static int luaConfig(lua_State* L) {
                 return luaL_error(L, "hypr3d.config: scene.<name>.physics must be a boolean");
             }
 
+            // Rotation pivot: "logical" rotates around the mesh's local AABB
+            // center, "origin" around its own origin; center_offset shifts
+            // the pivot on top in local units.
+            std::string CENTER = "logical";
+            if (!SET_STRING(OIDX, "center", CENTER, "scene.<name>.center")) {
+                lua_pop(L, 1);
+                return luaL_error(L, "hypr3d.config: scene.<name>.center must be a string");
+            }
+            OBJ.center = CENTER == "origin" ? CMapModel::ECenter::Origin
+                                            : CMapModel::ECenter::Logical;
+            if (!SET_VEC3(OIDX, "center_offset", OBJ.centerOffset,
+                          "scene.<name>.center_offset")) {
+                lua_pop(L, 1);
+                return luaL_error(L, "hypr3d.config: scene.<name>.center_offset must be a table { x = .., y = .., z = .. }");
+            }
+
             OBJECTS.push_back(OBJ);
             lua_pop(L, 1); // pop the value; the key remains for lua_next
+        }
+
+        // Canonical order: lua_next order varies between parses (seeded
+        // hashes), and every index-keyed structure downstream (GLScene
+        // slots, Jolt bodies, BVH trees) would churn -- or swap model files
+        // between slots -- on every reload. Sorting by name makes the
+        // parsed list deterministic.
+        std::sort(OBJECTS.begin(), OBJECTS.end(),
+                  [](const SSceneObjectCfg& A, const SSceneObjectCfg& B) {
+                      return A.name < B.name;
+                  });
+
+        // Snapshot the RAW parsed lua FIRST: this is the file's truth, and
+        // the next reload compares against it to tell "user edited the file"
+        // from "the simulation moved the object". (Snapshotting after the
+        // reconciliation below would record simulated positions as config
+        // values -- the following reload then saw a phantom change and kept
+        // teleporting carried/fallen objects back to the config placement.)
+        g_sceneLuaState = OBJECTS;
+        g_sceneLuaValid = true;
+
+        // Reconciliation, per field, matched BY NAME: a field whose lua
+        // value did not change keeps the simulated state (carry / zoom /
+        // roll / physics); a field edited in the file takes the new config
+        // value. Scale is never simulated, so it always comes from the
+        // config. Static objects are config-owned by definition -- they
+        // never move by simulation and never take simulated state, so a
+        // past parse glitch cannot persist through them either.
+        for (auto& NEW : OBJECTS) {
+            if (!NEW.dynamic)
+                continue;
+
+            const SSceneObjectCfg* OLD = nullptr;
+            for (const auto& O : g_sceneLuaState)
+                if (O.name == NEW.name) {
+                    OLD = &O;
+                    break;
+                }
+            if (!OLD)
+                continue;
+
+            const SSceneObjectCfg* SIM = nullptr;
+            for (const auto& O : g_sceneObjects)
+                if (O.name == NEW.name) {
+                    SIM = &O;
+                    break;
+                }
+            if (!SIM)
+                continue;
+
+            if (OLD->position.x == NEW.position.x &&
+                OLD->position.y == NEW.position.y &&
+                OLD->position.z == NEW.position.z)
+                NEW.position = SIM->position;
+
+            if (OLD->rotationDeg.x == NEW.rotationDeg.x &&
+                OLD->rotationDeg.y == NEW.rotationDeg.y &&
+                OLD->rotationDeg.z == NEW.rotationDeg.z)
+                NEW.rotationDeg = SIM->rotationDeg;
         }
 
         g_sceneObjects = std::move(OBJECTS);

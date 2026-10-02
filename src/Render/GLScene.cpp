@@ -1195,10 +1195,19 @@ void GLScene::setSceneObjects(const std::vector<SSceneSpec>& specs) {
             S.spec.scale.y != specs[i].scale.y ||
             S.spec.scale.z != specs[i].scale.z;
 
+        const bool CENTER_CHANGED =
+            S.spec.center != specs[i].center ||
+            S.spec.centerOffset.x != specs[i].centerOffset.x ||
+            S.spec.centerOffset.y != specs[i].centerOffset.y ||
+            S.spec.centerOffset.z != specs[i].centerOffset.z;
+
         S.spec = specs[i];
 
         S.model->setEmissiveScale(S.spec.emissiveScale);
         S.model->setFlat(S.spec.flat);
+
+        if (CENTER_CHANGED)
+            S.model->setCenter(S.spec.center, S.spec.centerOffset);
 
         if (TRANSFORM_CHANGED)
             S.model->setTransform(S.spec.position, S.spec.rotationDeg,

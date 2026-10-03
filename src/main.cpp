@@ -2506,6 +2506,7 @@ static float s_bobPhase = 0.0f;
 static float s_bobAmp   = 0.0f;
 static constexpr float kBobAmplitude = 0.035f; // meters at full walk speed
 static constexpr float kBobRate      = 6.0f;   // radians per meter walked
+static constexpr float kBobRoll      = 0.008f; // radians (~0.9 deg) head tilt
 
 // Computes the key-driven world-space velocity into s_moveVel (units/s)
 // with the move-inertia glide. The PLAYER BODY applies it -- Jolt owns the
@@ -2805,8 +2806,10 @@ static void update3D(float dt) {
         }
 
         // Walk bob (view-only, walking + grounded): a small vertical sway
-        // synced to the distance traveled. The amplitude eases in and out,
-        // so jumps, stops and the walk<->fly switch never pop.
+        // synced to the distance traveled, plus a head TILT at half the
+        // bob frequency (in a real gait the full left-right roll cycle
+        // spans two vertical bounces). The amplitude eases in and out, so
+        // jumps, stops and the walk<->fly switch never pop.
         const float BOB_SPEED = std::sqrt(s_moveVel.x * s_moveVel.x +
                                           s_moveVel.z * s_moveVel.z);
         const bool BOBING = g_cfgWalkBob && !g_playerFlying && g_grounded &&
@@ -2816,11 +2819,22 @@ static void update3D(float dt) {
                 std::min(1.0f, BOB_SPEED / std::max(CAM.moveSpeed, 0.5f))
                    : 0.0f;
         s_bobAmp += (TARGET_AMP - s_bobAmp) * (1.0f - std::exp(-8.0f * dt));
+
+        // The phase wraps at 4pi: two bob cycles, so sin(phase/2) walks a
+        // FULL tilt cycle (left, then right) and the wrap lands on zero.
         if (BOBING)
             s_bobPhase = std::fmod(s_bobPhase + BOB_SPEED * dt * kBobRate,
-                                   6.2831853f);
-        if (s_bobAmp > 0.0005f)
+                                   12.5663706f);
+
+        // Both offsets ride the same eased envelope: the roll fades out
+        // with the bob (walk_bob off, flight, air, transitions).
+        if (s_bobAmp > 0.0005f) {
             CAM.position.y += s_bobAmp * std::sin(s_bobPhase);
+            CAM.roll = (s_bobAmp * (1.0f / kBobAmplitude)) * kBobRoll *
+                std::sin(s_bobPhase * 0.5f);
+        } else {
+            CAM.roll = 0.0f;
+        }
     }
 
     // Map-drag carry: the grabbed object's CENTER rides the crosshair at

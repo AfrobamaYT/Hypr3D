@@ -136,7 +136,7 @@ Vectors can be written either way: `{ x = 1, y = 2, z = 3 }` or just `{ 1, 2, 3 
 | move_inertia     | float   | 0.05        | coasting after you stop walking in seconds (in seconds) |
 | move_speed       | float   | 4.0         | how fast you walk (m/s, running - 2.5x)                 |
 | spawn            | vector3 | { 0, 0, 0 } | player spawn point                                      |
-| flying           | bool    | true        | disables falling                                        |
+| flying           | bool    | false       | disables falling                                        |
 | walk_bob         | bool    | true        | simulate the rhythm of walking                          |
 
 ### Scene object
@@ -149,7 +149,7 @@ Vectors can be written either way: `{ x = 1, y = 2, z = 3 }` or just `{ 1, 2, 3 
 | flat           | bool      | true      | trust the model's lighting as-is                     |
 | collision      | bool      | true      | you can stand on it and bump into it                 |
 | static         | bool      | true      | you can't pick it up and carry it; suitable for maps |
-| physics        | bool      | false     | enable jolt physics                                  |
+| physics        | bool      | false     | enable jolt physics (only if static=false)           |
 | center         | string    | logical   | origin / logical                                     |
 | center_offset  | vector3   | {0, 0, 0} |                                                      |
 

@@ -183,7 +183,12 @@ Vec3 Camera::right() const {
 }
 
 Mat4 Camera::view() const {
-    return Mat4::lookAt(position, position + forward(), {0.f, 1.f, 0.f});
+    // Roll: rotate the up vector around the view axis (Rodrigues with
+    // axis=forward, and forward is perpendicular to world up, so
+    // up' = up*cos(r) + right*sin(r)).
+    const Vec3 U = Vec3{0.f, 1.f, 0.f} * std::cos(roll) +
+                   right() * std::sin(roll);
+    return Mat4::lookAt(position, position + forward(), U);
 }
 
 } // namespace H3D

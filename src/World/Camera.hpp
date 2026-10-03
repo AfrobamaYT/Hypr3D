@@ -62,6 +62,10 @@ class Camera {
     Vec3  position{0.f, 0.f, 12.f};
     float yaw   = 0.f;
     float pitch = 0.f;
+    // View-only roll (radians): the walk bob tilts the head around the
+    // view axis. Never touched by look/movement -- bob writes it, view()
+    // consumes it, everything else sees 0.
+    float roll  = 0.f;
     float moveSpeed = 8.f;
     float mouseSensitivity = 0.0025f;
 

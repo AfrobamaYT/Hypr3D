@@ -1296,7 +1296,19 @@ void GLScene::drawPanorama(float aspect) {
     const Vec3 FWD   = m_camera.forward();
     const Vec3 RIGHT = m_camera.right();
     const Vec3 UP    = cross(RIGHT, FWD);
-    const float TANY = std::tan(kFovDeg * PI / 360.0f);
+    // Zoomed fov (C key): the panorama must narrow with the scene, so its
+    // half-tangent divides by the magnification exactly like the render
+    // projection's fov does.
+    const float TANY =
+        std::tan(kFovDeg * PI / 360.0f) / std::max(m_zoom, 0.01f);
+
+    // Roll (walk bob): rotate the pixel->ray basis around the view axis by
+    // the SAME angle the view matrix tilts its up vector, or the panorama
+    // stays level while the scene rolls. Matches Camera::view(): screen up
+    // = UP*cos(r) + RIGHT*sin(r), screen right = RIGHT*cos(r) - UP*sin(r).
+    const float RROLL = m_camera.roll;
+    const Vec3 RRIGHT = RIGHT * std::cos(RROLL) - UP * std::sin(RROLL);
+    const Vec3 RUP    = UP * std::cos(RROLL) + RIGHT * std::sin(RROLL);
 
     // Analytic mip level: texels per screen pixel at the view centre. The
     // panorama is W texels around 2*pi radians; one screen pixel spans about
@@ -1312,8 +1324,8 @@ void GLScene::drawPanorama(float aspect) {
     }
 
     glUniform3f(m_panoramaFwd, FWD.x, FWD.y, FWD.z);
-    glUniform3f(m_panoramaRight, RIGHT.x, RIGHT.y, RIGHT.z);
-    glUniform3f(m_panoramaUp, UP.x, UP.y, UP.z);
+    glUniform3f(m_panoramaRight, RRIGHT.x, RRIGHT.y, RRIGHT.z);
+    glUniform3f(m_panoramaUp, RUP.x, RUP.y, RUP.z);
     glUniform1f(m_panoramaTanX, TANY * aspect);
     glUniform1f(m_panoramaTanY, TANY);
     glUniform1f(m_panoramaLod, lod);

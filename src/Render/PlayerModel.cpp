@@ -83,6 +83,7 @@ in vec3 vWorld;
 
 uniform sampler2D uTex;
 uniform bool uHasTex;
+uniform bool uFlat;
 uniform vec4 uColor;
 uniform vec3 uCamPos;
 
@@ -91,7 +92,8 @@ out vec4 fragColor;
 void main() {
     vec3 N = normalize(vNrm);
     vec3 L = normalize(uCamPos - vWorld);
-    float diff = dot(N, L) * 0.5 + 0.5; // half-lambert
+    // flat: the texture carries all lighting (baked/toon characters)
+    float diff = uFlat ? 1.0 : dot(N, L) * 0.5 + 0.5; // half-lambert
     vec4 base = uHasTex ? texture(uTex, vUv) : vec4(1.0);
     fragColor = vec4(base.rgb * uColor.rgb * diff, base.a * uColor.a);
 }

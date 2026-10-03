@@ -7,8 +7,8 @@ A Hyprland plugin that turns your workspace into a walkable 3D space
 
 > Experimental, pinned to Hyprland 0.56.2.
 
-## Installation
-### Hyprpm
+# Installation
+## Hyprpm
 
 ```bash
 # Install latest
@@ -21,7 +21,7 @@ hyprpm update
 
 
 
-### Manual
+## Manual
 
 ```bash
 # Build
@@ -43,56 +43,8 @@ hyprctl eval 'hl.plugin.hypr3d.toggle()'
 Or bind in lua config:
 
 ```lua
-if hl.plugin.hypr3d then
-    hl.bind("SUPER + F12", hl.plugin.hypr3d.toggle)
-    hl.plugin.hypr3d.config({
-        world = {
-            panorama = "~/Pictures/room.png", -- 360° background (equirectangular)
-            grid = true,                      -- base grid platform at world zero
-        },
-        windows = {
-            window_scale = 0.5,   -- window size multiplier (real px at 100 px/unit)
-            spawn_distance = 5,   -- distance from the camera new windows spawn at
-        },
-        player = {
-            look_sensitivity = 0.0025, -- mouse look, radians per pointer count
-            look_inertia = 0.03,       -- look glide after the mouse stops, sec
-            move_inertia = 0.05,       -- walk glide after keys release, sec
-            move_speed = 4.0,          -- walking speed, world units/sec
-            spawn = { x = 0, y = 0, z = 0 }, -- FEET position (eyes ride +1.62)
-            flying = true,             -- false: gravity, Space jumps, Shift idle
-            walk_bob = true,           -- camera sway while walking (walking only)
-        },
-        scene = {                 -- unlimited named glTF objects
-            map = {               -- (any names; "map" is convention only)
-                path = "~/map.glb",
-                transform = {
-                    position = { x = 0, y = 0, z = 0 },
-                    rotation = { x = 0, y = 0, z = 0 }, -- degrees, XYZ
-                    scale    = { x = 1, y = 1, z = 1 }, -- per-axis
-                },
-                emissive_scale = 1.0, -- baked-light multiplier (0 = off)
-                flat = true,          -- baked-map look (textures carry light)
-                collision = true,     -- collide with the player
-                static = true,        -- true: location geometry; false: the
-                                      -- object is grabbable (Super+LMB carries
-                                      -- it on the crosshair, release drops it)
-                physics = false,      -- gravity + world collisions for the
-                                      -- object (needs static = false)
-            },
-            -- prop = { path = "...", static = false, ... },
-        },
-    })
-end
+hl.bind("SUPER + F12", hl.plugin.hypr3d.toggle)
 ```
-
-Every key is optional: missing keys keep their current value, wrong-typed
-keys raise a lua error, and values are clamped to sane ranges on set.
-Object names inside `scene` are free-form. The legacy `map = {...}` section
-still works as a single-object scene (a `scene` table wins when both exist).
-
-The grid platform spans 40x40 world units centered on zero; there is no
-world floor clamp -- off its edge you fall (bring a map floor or fly).
 
 ## Controls
 
@@ -103,7 +55,7 @@ world floor clamp -- off its edge you fall (bring a map floor or fly).
 | Space                         | Move up (flying) / Jump                        |
 | Shift                         | Move down (flying)                             |
 | Ctrl                          | Sprint                                         |
-| C (hold)                      | View zoom to 2x; wheel adjusts, min 1x         |
+| C                             | Zoom, wheel adjusts                            |
 | Super + Left click            | Drag window                                    |
 | Super + Right click           | Resize window                                  |
 | Super + Mouse wheel click     | rotate window                                  |
@@ -111,45 +63,109 @@ world floor clamp -- off its edge you fall (bring a map floor or fly).
 | Super + Left Alt              | Toggle keyboard mode (movement / window input) |
 | F3                            | Toggle debug HUD                               |
 
-## Configuration
-### Lua config example:
+# Configuration
+## Lua config example:
 
 ```lua
 if hl.plugin.hypr3d then
-    -- binds
     hl.bind("SUPER + F12", hl.plugin.hypr3d.toggle)
-    -- parameters
     hl.plugin.hypr3d.config({
-        -- every key is optional
         world = {
-            panorama = "~/Pictures/room.png", -- 360° room background (equirectangular)
-            grid = true,                      -- base 40x40 grid platform
+            panorama = "~/Pictures/room.png",
+            grid = true,
         },
         windows = {
-            window_scale = 0.5,   -- window size multiplier (real px at 100 px/m)
-            spawn_distance = 5,   -- distance from the camera new windows spawn at
+            window_scale = 0.5,
+            spawn_distance = 5,
         },
         player = {
-            look_sensitivity = 0.0025, -- mouse look, radians per pointer count
-            look_inertia = 0.03,       -- look glide after the mouse stops, sec
-            move_inertia = 0.05,       -- walk glide after keys release, sec
-            move_speed = 4.0,          -- walking speed, m/s
-            spawn = { x = 0, y = 0, z = 0 }, -- player position
-            flying = true,             -- on alse: gravity, Space jumps off the ground, Shift does nothing
-            walk_bob = true,           -- camera sway while walking (walking only)
+            look_sensitivity = 0.0025,
+            look_inertia = 0.03,
+            move_inertia = 0.05,
+            move_speed = 4.0,
+            spawn = { x = 0, y = 0, z = 0 },
+            flying = true, 
+            walk_bob = true
         },
-        map = {
-            path = "~/map.gltf",   -- glTF 2.0 map (.glb/.gltf)
-            transform = {
-                position = { x = 0, y = 0, z = 0 },
-                rotation = { x = 0, y = 0, z = 0 },
-                scale    = { x = 1, y = 1, z = 1 },
+        scene = { -- as many models as you like, any names
+            map = {
+                path = "~/map.glb",
+                transform = {
+                    position = { 0, 0, 0 },
+                    rotation = { 0, 0, 0 },
+                    scale    = { 1, 1, 1 },
+                },
+                collision = true,
+                static = true,
+                physics = false,
             },
-            emissive_scale = 1.0, -- emission multiplier
-            flat = true,          -- textures carry all lighting
-            collision = true,     -- collide with the map
+            -- name = { path = "...", static = false, physics = true },
         },
     })
     -- That's all for now :p
 end
 ```
+
+
+
+## Parameters
+
+Everything is optional -- only set what you want to change. 
+Vectors can be written either way: `{ x = 1, y = 2, z = 3 }` or just `{ 1, 2, 3 }`.
+
+### World
+
+| Option   | Type   | Default | Description                             |
+| ----------| --------| ---------| -----------------------------------------|
+| panorama | string | ""      | 360° background image (equirectangular) |
+| grid     | bool   | true    | the starting 40x40 platform             |
+
+### Windows
+
+| Option         | Type  | Default | Description                             |
+| ----------------| -------| ---------| -----------------------------------------|
+| window_scale   | float | 0.5     | window size multiplier (at 100 px/m)    |
+| spawn_distance | float | 5.0     | how far from you new windows appear (m) |
+
+### Player
+
+| Option           | Type    | Default     | Description                                             |
+| ------------------| ---------| -------------| ---------------------------------------------------------|
+| look_sensitivity | float   | 0.0025      | how fast the camera turns (radians per pointer count)   |
+| look_inertia     | float   | 0.03        | camera coasting after you stop the mouse (in seconds)   |
+| move_inertia     | float   | 0.05        | coasting after you stop walking in seconds (in seconds) |
+| move_speed       | float   | 4.0         | how fast you walk (m/s, running - 2.5x)                 |
+| spawn            | vector3 | { 0, 0, 0 } | player spawn point                                      |
+| flying           | bool    | true        | disables falling                                        |
+| walk_bob         | bool    | true        | simulate the rhythm of walking                          |
+
+### Scene object
+
+| Option         | Type      | Default   | Description                                          |
+| ----------------| -----------| -----------| ------------------------------------------------------|
+| path           | string    | ""        | the model file to load (.glb/.gltf)                  |
+| transform      | transform | see below | idk                                                  |
+| emissive_scale | float     | 1.0       | how bright the model's own light is                  |
+| flat           | bool      | true      | trust the model's lighting as-is                     |
+| collision      | bool      | true      | you can stand on it and bump into it                 |
+| static         | bool      | true      | you can't pick it up and carry it; suitable for maps |
+| physics        | bool      | false     | enable jolt physics                                  |
+| center         | string    | logical   | origin / logical                                     |
+| center_offset  | vector3   | {0, 0, 0} |                                                      |
+
+Want only part of a model to be solid? Rename those nodes in Blender to
+start with `nocol` -- they'll still render, but you'll walk right through.
+
+### Transform
+
+| Option   | Type    | Default   | Description     |
+| ----------| ---------| -----------| -----------------|
+| position | vector3 | {0, 0, 0} | idk             |
+| rotation | vector3 | {0, 0, 0} | idk, in degrees |
+| scale    | vector3 | {1, 1, 1} | idkk            |
+
+# Screenshots
+![alt text](images/Screenshot5.png)
+![alt text](images/Screenshot4.png)
+![alt text](images/Screenshot2.png)
+![alt text](images/Screenshot3.png)

@@ -670,6 +670,13 @@ bool CPlayerModel::load(const std::string& path) {
         SAnim       AN;
         AN.name = A.name ? A.name : "";
 
+        // Samplers of ALL animations share one flat vector; a channel's
+        // sampler pointer indexes its OWN animation's array, so the base
+        // offset must be added -- without it every animation after the
+        // first read the FIRST animation's curves (all states playing the
+        // same clip).
+        const int SAMPLER_BASE = static_cast<int>(m_samplers.size());
+
         for (cgltf_size s = 0; s < A.samplers_count; ++s) {
             const auto& S = A.samplers[s];
             SSampler SAM;
@@ -695,7 +702,9 @@ bool CPlayerModel::load(const std::string& path) {
             const auto& C = A.channels[c];
             SChannel CH;
             CH.node    = NODE_IDX(C.target_node);
-            CH.sampler = C.sampler ? static_cast<int>(C.sampler - A.samplers) : -1;
+            CH.sampler = C.sampler
+                ? SAMPLER_BASE + static_cast<int>(C.sampler - A.samplers)
+                : -1;
             switch (C.target_path) {
                 case cgltf_animation_path_type_translation: CH.path = 0; break;
                 case cgltf_animation_path_type_rotation: CH.path = 1; break;

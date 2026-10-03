@@ -66,6 +66,10 @@ class Camera {
     // view axis. Never touched by look/movement -- bob writes it, view()
     // consumes it, everything else sees 0.
     float roll  = 0.f;
+
+    // Third-person front view: view() and centerRay() look BACK along the
+    // look axis while movement and the look state stay unchanged.
+    bool  mirrorView = false;
     float moveSpeed = 8.f;
     float mouseSensitivity = 0.0025f;
 
@@ -95,7 +99,9 @@ class Camera {
 
     // The picking ray: through the centre of the screen, i.e. the crosshair.
     // Deliberately independent of where the OS cursor happens to be.
-    Vec3 centerRay() const { return forward(); }
+    Vec3 centerRay() const {
+        return mirrorView ? forward() * -1.0f : forward();
+    }
 
     Mat4 view() const;
 };

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Render/MapModel.hpp"
+#include "Render/PlayerModel.hpp"
 #include "World/Camera.hpp"
 #include "World/Picking.hpp"
 
@@ -97,6 +98,35 @@ class GLScene {
         m_zoom = magnification > 0.01f ? magnification : 0.01f;
     }
 
+    // The player's own character (player.model). Config and pose come from
+    // main; the animation clock runs inside render().
+    struct SPlayerCfg {
+        std::string path;
+        float       scale = 1.0f;
+        float       turnDeg = 0.0f;
+        // idle, walk, run, jump: animation index or name (name wins)
+        int         animIdx[CPlayerModel::kStateCount] = {-1, -1, -1, -1};
+        std::string animName[CPlayerModel::kStateCount];
+    };
+
+    void setPlayerConfig(const SPlayerCfg& cfg) {
+        m_playerCfg = cfg;
+        m_playerPath.clear(); // forces a (re)load attempt
+    }
+
+    void setPlayerPose(const Vec3& feet, float yawRad) {
+        m_playerFeet = feet;
+        m_playerYaw  = yawRad;
+    }
+
+    void setPlayerVisible(bool on) {
+        m_playerVisible = on;
+    }
+
+    CPlayerModel* player() {
+        return &m_player;
+    }
+
     void setGridVisible(bool on) {
         m_gridVisible = on;
     }
@@ -155,6 +185,7 @@ class GLScene {
     bool ensureSceneFramebuffer(int width, int height);
 
     void refreshScene();
+    void refreshPlayer();
 
     void drawDebugOverlay(int width, int height);
 
@@ -255,6 +286,14 @@ class GLScene {
     bool                            m_debugOverlay = false;
     bool                            m_gridVisible  = true;
     float                           m_zoom         = 1.0f;
+    CPlayerModel                    m_player;
+    SPlayerCfg                      m_playerCfg;
+    std::string                     m_playerPath;      // tilde-expanded
+    std::filesystem::file_time_type m_playerMtime{};
+    bool                            m_playerMtimeValid = false;
+    bool                            m_playerVisible    = false;
+    Vec3                            m_playerFeet{};
+    float                           m_playerYaw        = 0.f;
     float                           m_debugFps     = 0.f;
 
     unsigned int                    m_textVAO = 0, m_textVBO = 0;

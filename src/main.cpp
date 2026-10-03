@@ -308,6 +308,7 @@ static float       g_cfgMoveSpeed     = 4.0f;    // world units / second
 static float       g_cfgSensitivity   = 0.0025f; // radians per pointer count
 static bool        g_playerFlying     = true;    // false = walk / jump / gravity
 static bool        g_cfgWalkBob       = true;    // view-only walk bob (walking only)
+static GLScene::SPlayerCfg g_playerCfg;          // the player character
 
 // Feet position; eyes ride kEyeHeight above (spawn 0,0,0 = standing on
 // the grid platform at world zero).
@@ -366,6 +367,10 @@ static bool  g_zoomHeld  = false;
 static float g_zoomWheel = 2.0f;
 static float g_zoomLevel = 1.0f;
 static constexpr float kZoomBase = 2.0f;
+
+// F5 view modes: 0 first person, 1 third person behind, 2 third person front.
+static int g_viewMode = 0;
+static constexpr float kThirdDist = 2.5f;
 
 // Per-object collision trees (see update3D): one small BVH per scene
 // object, used by picking (modelRayHit). The static map's tree builds once;
@@ -2401,6 +2406,9 @@ static void enter3D() {
     resetMovementKeys();
 
     g_grounded = false;
+    g_viewMode = 0;
+    g_scene.camera().mirrorView = false;
+    g_scene.setPlayerVisible(false);
 
     g_keyboardMode = EKeyboardMode::Space;
     g_altHeld      = false;
@@ -2686,24 +2694,57 @@ static void update3D(float dt) {
             }
         }
 
-        // Player readback: the camera rides the body's eye point (the body
-        // owns the pose now). While a fullscreen transition animates
-        // (To2D/To3D) the transition owns the camera; its end pose resyncs
-        // the body on the first normal frame. (g_transition is the ROOM
-        // progress -- 1.0 in normal 3D -- it must NOT gate this.)
+        // Player readback: the camera derives from the body's eye point --
+        // first person, or third person behind/front (F5) along the look
+        // axes (the front view looks back at the character). While a
+        // fullscreen transition animates the transition owns the camera.
+        // (g_transition is the ROOM progress -- 1.0 in normal 3D -- it must
+        // NOT gate this.)
         if (!g_playerBody.IsInvalid()) {
+            const auto PPOS = g_bodyIf->GetPosition(g_playerBody);
+            const Vec3 EYE{PPOS.GetX(), PPOS.GetY() + PLAYER_EYE_OFF,
+                           PPOS.GetZ()};
+            auto& CAM = g_scene.camera();
+
             if (g_fsPhase == EFullscreenPhase::None) {
-                const auto PPOS = g_bodyIf->GetPosition(g_playerBody);
-                const Vec3 EYE{PPOS.GetX(), PPOS.GetY() + PLAYER_EYE_OFF,
-                               PPOS.GetZ()};
-                auto& CAM = g_scene.camera();
-                if (EYE.x != CAM.position.x || EYE.y != CAM.position.y ||
-                    EYE.z != CAM.position.z) {
-                    CAM.position = EYE;
+                CAM.mirrorView = g_viewMode == 2;
+
+                Vec3 WANT = EYE;
+                if (g_viewMode == 1)
+                    WANT = EYE - CAM.forward() * kThirdDist;
+                else if (g_viewMode == 2)
+                    WANT = EYE + CAM.forward() * kThirdDist;
+
+                if (WANT.x != CAM.position.x || WANT.y != CAM.position.y ||
+                    WANT.z != CAM.position.z) {
+                    CAM.position = WANT;
                     damageCurrentMonitor();
                 }
             }
+
             g_grounded = playerGrounded();
+
+            // The character renders in third person only.
+            g_scene.setPlayerVisible(g_viewMode != 0);
+
+            // Character state + pose: air = jump (plays once and holds),
+            // grounded = walk/run by horizontal speed, else idle.
+            if (g_scene.player()->loaded()) {
+                const auto VEL = g_bodyIf->GetLinearVelocity(g_playerBody);
+                const float HSP = std::sqrt(VEL.GetX() * VEL.GetX() +
+                                            VEL.GetZ() * VEL.GetZ());
+                const auto ST = !g_grounded
+                    ? CPlayerModel::EState::Jump
+                    : HSP > 0.4f ? (g_keySprint ? CPlayerModel::EState::Run
+                                                : CPlayerModel::EState::Walk)
+                                 : CPlayerModel::EState::Idle;
+                g_scene.player()->setState(ST);
+                g_scene.setPlayerPose(
+                    Vec3{PPOS.GetX(),
+                         PPOS.GetY() - Camera::kBodyHeight * 0.5f,
+                         PPOS.GetZ()},
+                    CAM.yaw);
+            }
         }
 
         g_msJolt = g_msJolt * 0.9 +
@@ -2765,8 +2806,9 @@ static void update3D(float dt) {
         // The camera was moved by something else (spawn reset, fullscreen
         // transition handoff): teleport the body under it. Skipped while a
         // transition animates (To2D/To3D own the camera then); the
-        // transition's end pose resyncs on the first normal frame.
-        if (g_fsPhase == EFullscreenPhase::None) {
+        // transition's end pose resyncs on the first normal frame. First
+        // person only: in third person the camera is DERIVED from the body.
+        if (g_fsPhase == EFullscreenPhase::None && g_viewMode == 0) {
             const auto CUR = g_bodyIf->GetPosition(g_playerBody);
             const float DX = CAM.position.x - CUR.GetX();
             const float DY = CAM.position.y - (CUR.GetY() + PLAYER_EYE_OFF);
@@ -2813,7 +2855,7 @@ static void update3D(float dt) {
         const float BOB_SPEED = std::sqrt(s_moveVel.x * s_moveVel.x +
                                           s_moveVel.z * s_moveVel.z);
         const bool BOBING = g_cfgWalkBob && !g_playerFlying && g_grounded &&
-            g_fsPhase == EFullscreenPhase::None;
+            g_fsPhase == EFullscreenPhase::None && g_viewMode == 0;
         const float TARGET_AMP =
             BOBING ? kBobAmplitude *
                 std::min(1.0f, BOB_SPEED / std::max(CAM.moveSpeed, 0.5f))
@@ -4014,6 +4056,15 @@ static void onKeyboardKey(
     if (g_keyboardMode == EKeyboardMode::Window)
         return;
 
+    // F5: cycle the view -- first person, third person behind, third
+    // person in front.
+    if (PRESSED && SYM == XKB_KEY_F5) {
+        g_viewMode = (g_viewMode + 1) % 3;
+        info.cancelled = true;
+        damageCurrentMonitor();
+        return;
+    }
+
     if (SYM == XKB_KEY_c) {
         // View zoom: hold to magnify, release to ease back to 1x. The
         // wheel level restarts at the base on every press.
@@ -4236,6 +4287,40 @@ static int luaConfig(lua_State* L) {
             return luaL_error(L, "hypr3d.config: player.flying must be a boolean");
         if (!SET_BOOL(idx, "walk_bob", g_cfgWalkBob, "player.walk_bob"))
             return luaL_error(L, "hypr3d.config: player.walk_bob must be a boolean");
+
+        // The player character: model path, scale, facing offset, and one
+        // animation per state (an index OR an animation name).
+        if (!SET_STRING(idx, "model", g_playerCfg.path, "player.model"))
+            return luaL_error(L, "hypr3d.config: player.model must be a string");
+        if (!SET_NUM(idx, "model_scale", g_playerCfg.scale, "player.model_scale"))
+            return luaL_error(L, "hypr3d.config: player.model_scale must be a number");
+        if (!SET_NUM(idx, "model_turn", g_playerCfg.turnDeg, "player.model_turn"))
+            return luaL_error(L, "hypr3d.config: player.model_turn must be a number");
+
+        const auto SET_ANIM = [&](const char* key, int slot) -> bool {
+            lua_getfield(L, idx, key);
+            if (lua_isnil(L, -1)) {
+                lua_pop(L, 1);
+                return true;
+            }
+            if (lua_isnumber(L, -1)) {
+                g_playerCfg.animIdx[slot] = static_cast<int>(lua_tonumber(L, -1));
+                g_playerCfg.animName[slot].clear();
+            } else if (lua_isstring(L, -1)) {
+                size_t LEN = 0;
+                const char* STR = lua_tolstring(L, -1, &LEN);
+                g_playerCfg.animName[slot].assign(STR, LEN);
+                g_playerCfg.animIdx[slot] = -1;
+            } else {
+                lua_pop(L, 1);
+                return false;
+            }
+            lua_pop(L, 1);
+            return true;
+        };
+        if (!SET_ANIM("anim_idle", 0) || !SET_ANIM("anim_walk", 1) ||
+            !SET_ANIM("anim_run", 2) || !SET_ANIM("anim_jump", 3))
+            return luaL_error(L, "hypr3d.config: player.anim_* must be an animation index or name");
         if (!SET_VEC3(idx, "spawn", g_playerSpawn, "player.spawn"))
             return luaL_error(L, "hypr3d.config: player.spawn must be a table { x = .., y = .., z = .. }");
         lua_pop(L, 1);
@@ -4417,6 +4502,8 @@ static int luaConfig(lua_State* L) {
         g_sceneObjects = std::move(OBJECTS);
         lua_pop(L, 1);
     }
+
+    g_scene.setPlayerConfig(g_playerCfg);
 
     return 0;
 }

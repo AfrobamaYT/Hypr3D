@@ -1287,6 +1287,54 @@ void GLScene::refreshScene() {
     }
 }
 
+// Loads (or reloads) the player character when the config path or the
+// file's mtime changed; applies the per-state animation assignment after a
+// successful load. Runs inside render() so the EGL context is current.
+void GLScene::refreshPlayer() {
+    const std::string& CFG_PATH = m_playerCfg.path;
+
+    if (CFG_PATH.empty()) {
+        if (m_player.loaded())
+            m_player.destroy();
+        m_playerPath.clear();
+        return;
+    }
+
+    std::string path = CFG_PATH;
+    if (path.starts_with('~')) {
+        if (const char* HOME = getenv("HOME"))
+            path = std::string{HOME} + path.substr(1);
+    }
+
+    std::error_code ec;
+    const auto MTIME = std::filesystem::last_write_time(path, ec);
+
+    const bool UNCHANGED = m_player.loaded() && m_playerPath == path &&
+        !ec && m_playerMtimeValid && MTIME == m_playerMtime;
+    if (UNCHANGED)
+        return;
+
+    m_playerPath       = path;
+    m_playerMtime      = MTIME;
+    m_playerMtimeValid = !ec;
+
+    if (ec) {
+        if (m_player.loaded())
+            m_player.destroy();
+        return;
+    }
+
+    if (m_player.load(path)) {
+        for (int s = 0; s < CPlayerModel::kStateCount; ++s) {
+            const auto ST = static_cast<CPlayerModel::EState>(s);
+            if (!m_playerCfg.animName[s].empty())
+                m_player.setAnim(ST, m_playerCfg.animName[s]);
+            else
+                m_player.setAnim(ST, m_playerCfg.animIdx[s]);
+        }
+    }
+}
+
 void GLScene::drawPanorama(float aspect) {
     if (!m_panoramaTex || !m_panoramaProgram)
         return;
@@ -1905,6 +1953,17 @@ bool GLScene::render(
 
         // Red x-ray wireframe of the collision triangles (debug).
         S.model->drawDebug(vp);
+    }
+
+    // The player's character (hidden in first person): animated inside
+    // render -- the clock and the vertex upload need the EGL context.
+    refreshPlayer();
+    if (m_playerVisible && m_player.loaded()) {
+        m_player.setPose(m_playerFeet,
+                         m_playerYaw + m_playerCfg.turnDeg * PI / 180.0f,
+                         m_playerCfg.scale);
+        m_player.update(dt);
+        m_player.draw(vp, m_camera.position);
     }
 
     if (m_gridVisible) {

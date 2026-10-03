@@ -393,7 +393,7 @@ void CPlayerModel::update(float dt) {
             : 0.f;
 
     if (dt > 0.f)
-        m_time += dt;
+        m_time += dt * m_animSpeed[static_cast<int>(m_state)];
 
     if (DUR > 0.f) {
         if (m_state == EState::Jump)
@@ -413,7 +413,7 @@ void CPlayerModel::update(float dt) {
                 ? m_anims[PANIM].duration
                 : 0.f;
         if (dt > 0.f)
-            m_prevTime += dt;
+            m_prevTime += dt * m_animSpeed[static_cast<int>(m_prevState)];
         if (PDUR > 0.f) {
             if (m_prevState == EState::Jump)
                 m_prevTime = std::min(m_prevTime, PDUR);

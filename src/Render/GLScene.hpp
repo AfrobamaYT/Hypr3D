@@ -92,6 +92,12 @@ class GLScene {
     }
 
     // The base grid platform (world zero): visible + collidable.
+    // F3 debug: the player's collision capsule outline (world space).
+    void setPlayerDebugCapsule(const Vec3& center, bool on) {
+        m_pDbgCenter = center;
+        m_pDbgOn     = on;
+    }
+
     // View zoom (the C key): magnification narrows the render fov
     // symmetrically around the crosshair, so aiming stays exact.
     void setZoom(float magnification) {
@@ -111,9 +117,11 @@ class GLScene {
         std::string center;       // parsed for format parity; the player
         Vec3        centerOffset{}; // rotates around its anchor, so only
                                   // center_offset (the anchor shift) applies
-        // idle, walk, run, jump: animation index or name (name wins)
+        // idle, walk, run, jump: animation index or name (name wins),
+        // plus the playback speed multiplier (1 = as authored).
         int         animIdx[CPlayerModel::kStateCount] = {-1, -1, -1, -1};
         std::string animName[CPlayerModel::kStateCount];
+        float       animSpeed[CPlayerModel::kStateCount] = {1.f, 1.f, 1.f, 1.f};
     };
 
     void setPlayerConfig(const SPlayerCfg& cfg) {
@@ -294,6 +302,13 @@ class GLScene {
     bool                            m_gridVisible  = true;
     float                           m_zoom         = 1.0f;
     CPlayerModel                    m_player;
+    // Player debug capsule (F3).
+    unsigned int                    m_pDbgProgram = 0, m_pDbgVAO = 0, m_pDbgVBO = 0;
+    int                             m_pDbgMVP = -1;
+    int                             m_pDbgVerts = 0;
+    bool                            m_pDbgOn = false;
+    Vec3                            m_pDbgCenter{};
+    void drawPlayerDebugCapsule(const Mat4& vp);
     SPlayerCfg                      m_playerCfg;
     std::string                     m_playerPath;      // tilde-expanded
     std::filesystem::file_time_type m_playerMtime{};

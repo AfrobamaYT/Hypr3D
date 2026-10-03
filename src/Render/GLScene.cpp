@@ -8,6 +8,11 @@
 
 #include <GLES3/gl32.h>
 
+// The test stubs carry only a subset of the GL constants.
+#ifndef GL_STREAM_DRAW
+#define GL_STREAM_DRAW 0x88E0
+#endif
+
 #include <hyprgraphics/image/Image.hpp>
 
 #include <algorithm>
@@ -1287,6 +1292,96 @@ void GLScene::refreshScene() {
     }
 }
 
+// The player's collision capsule outline (F3): three circles + four
+// verticals, rebuilt every drawn frame (a couple hundred floats).
+void GLScene::drawPlayerDebugCapsule(const Mat4& vp) {
+    if (!m_pDbgProgram) {
+        static const char* VS = R"GLSL(
+#version 320 es
+layout(location = 0) in vec3 aPos;
+uniform mat4 uMVP;
+void main() { gl_Position = uMVP * vec4(aPos, 1.0); }
+)GLSL";
+        static const char* FS = R"GLSL(
+#version 320 es
+precision mediump float;
+out vec4 fragColor;
+void main() { fragColor = vec4(0.2, 1.0, 0.3, 1.0); }
+)GLSL";
+        const GLuint VSx = glCreateShader(GL_VERTEX_SHADER);
+        glShaderSource(VSx, 1, &VS, nullptr);
+        glCompileShader(VSx);
+        const GLuint FSx = glCreateShader(GL_FRAGMENT_SHADER);
+        glShaderSource(FSx, 1, &FS, nullptr);
+        glCompileShader(FSx);
+        const GLuint P = glCreateProgram();
+        glAttachShader(P, VSx);
+        glAttachShader(P, FSx);
+        glLinkProgram(P);
+        glDeleteShader(VSx);
+        glDeleteShader(FSx);
+        m_pDbgProgram = P;
+        m_pDbgMVP     = glGetUniformLocation(P, "uMVP");
+    }
+
+    const float R = 0.3f;             // Camera::kBodyHalfWidth
+    const float CY = m_pDbgCenter.y;  // the Jolt body center (feet + 0.9)
+    const float HH = 0.6f;            // the cylinder half height (0.9 - r)
+    const int SEG = 24;
+
+    std::vector<float> V;
+    V.reserve(3 * (3 * SEG * 2 + 8));
+    const auto CIRCLE = [&](float y) {
+        for (int s = 0; s < SEG; ++s) {
+            const float A0 = float(s) / SEG * 6.2831853f;
+            const float A1 = float(s + 1) / SEG * 6.2831853f;
+            V.push_back(m_pDbgCenter.x + std::cos(A0) * R);
+            V.push_back(CY + y);
+            V.push_back(m_pDbgCenter.z + std::sin(A0) * R);
+            V.push_back(m_pDbgCenter.x + std::cos(A1) * R);
+            V.push_back(CY + y);
+            V.push_back(m_pDbgCenter.z + std::sin(A1) * R);
+        }
+    };
+    CIRCLE(-HH);
+    CIRCLE(0.f);
+    CIRCLE(HH);
+    for (int s = 0; s < 4; ++s) {
+        const float A = float(s) / 4 * 6.2831853f + 0.3926991f;
+        const float X = m_pDbgCenter.x + std::cos(A) * R;
+        const float Z = m_pDbgCenter.z + std::sin(A) * R;
+        V.push_back(X); V.push_back(CY - HH); V.push_back(Z);
+        V.push_back(X); V.push_back(CY + HH); V.push_back(Z);
+    }
+    m_pDbgVerts = static_cast<int>(V.size() / 3);
+
+    if (!m_pDbgVAO) {
+        glGenVertexArrays(1, &m_pDbgVAO);
+        glGenBuffers(1, &m_pDbgVBO);
+        glBindVertexArray(m_pDbgVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, m_pDbgVBO);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float),
+                              reinterpret_cast<void*>(0));
+        glBindVertexArray(0);
+    }
+
+    glUseProgram(m_pDbgProgram);
+    glUniformMatrix4fv(m_pDbgMVP, 1, GL_FALSE, vp.m.data());
+    glBindVertexArray(m_pDbgVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_pDbgVBO);
+    glBufferData(GL_ARRAY_BUFFER,
+                 static_cast<GLsizeiptr>(V.size() * sizeof(float)),
+                 V.data(), GL_STREAM_DRAW);
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glDrawArrays(GL_LINES, 0, m_pDbgVerts);
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_TRUE);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindVertexArray(0);
+}
+
 // Loads (or reloads) the player character when the config path or the
 // file's mtime changed; applies the per-state animation assignment after a
 // successful load. Runs inside render() so the EGL context is current.
@@ -1331,6 +1426,7 @@ void GLScene::refreshPlayer() {
                 m_player.setAnim(ST, m_playerCfg.animName[s]);
             else
                 m_player.setAnim(ST, m_playerCfg.animIdx[s]);
+            m_player.setAnimSpeed(ST, m_playerCfg.animSpeed[s]);
         }
     }
 }
@@ -1958,6 +2054,8 @@ bool GLScene::render(
     // The player's character (hidden in first person): animated inside
     // render -- the clock and the vertex upload need the EGL context.
     refreshPlayer();
+    if (m_pDbgOn)
+        drawPlayerDebugCapsule(vp);
     if (m_playerVisible && m_player.loaded()) {
         m_player.setPose(m_playerFeet,
                          m_playerYaw + m_playerCfg.turnDeg * PI / 180.0f,

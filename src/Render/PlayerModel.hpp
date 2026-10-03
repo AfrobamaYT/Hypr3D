@@ -117,6 +117,13 @@ class CPlayerModel {
     void setFlat(bool flat) {
         m_flat = flat;
     }
+
+    // Playback speed multiplier for a state's clip (1 = as authored).
+    void setAnimSpeed(EState state, float speed) {
+        if (state >= EState::Idle && state <= EState::Jump &&
+            speed > 0.01f && std::isfinite(speed))
+            m_animSpeed[static_cast<int>(state)] = speed;
+    }
     void setEmissiveScale(float s) {
         m_emissiveScale = s > 0.f ? s : 0.f;
     }
@@ -249,6 +256,7 @@ class CPlayerModel {
     float  m_prevTime   = 0.f;
     float  m_blend      = 1.f; // 0 = the previous pose, 1 = the current
     int    m_animFor[kStateCount] = {-1, -1, -1, -1};
+    float  m_animSpeed[kStateCount] = {1.f, 1.f, 1.f, 1.f};
     float  m_time = 0.f;
     Vec3   m_feet{};
     float  m_yaw = 0.f;

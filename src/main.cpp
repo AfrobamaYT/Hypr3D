@@ -311,6 +311,7 @@ static bool        g_playerCollision  = true;    // reserved: the capsule is
         // the movement system, so this only gates future per-object contact
 static bool        g_cfgWalkBob       = true;    // view-only walk bob (walking only)
 static GLScene::SPlayerCfg g_playerCfg;          // the player character
+static float        g_playerAnimSpeed[4] = {1.f, 1.f, 1.f, 1.f};
 
 // Feet position; eyes ride kEyeHeight above (spawn 0,0,0 = standing on
 // the grid platform at world zero).
@@ -372,6 +373,7 @@ static constexpr float kZoomBase = 2.0f;
 
 // F5 view modes: 0 first person, 1 third person behind, 2 third person front.
 static int g_viewMode = 0;
+static float g_playerModelYaw = 0.f; // smoothed model facing (radians)
 static constexpr float kThirdDist = 2.5f;
 
 // Per-object collision trees (see update3D): one small BVH per scene
@@ -2409,8 +2411,10 @@ static void enter3D() {
 
     g_grounded = false;
     g_viewMode = 0;
+    g_playerModelYaw = 3.14159265f - g_scene.camera().yaw;
     g_scene.camera().mirrorView = false;
     g_scene.setPlayerVisible(false);
+    g_scene.setPlayerDebugCapsule(Vec3{}, false);
 
     g_keyboardMode = EKeyboardMode::Space;
     g_altHeld      = false;
@@ -2726,11 +2730,17 @@ static void update3D(float dt) {
 
             g_grounded = playerGrounded();
 
-            // The character renders in third person only.
+            // The character renders in third person only; F3 adds the
+            // capsule outline.
             g_scene.setPlayerVisible(g_viewMode != 0);
+            g_scene.setPlayerDebugCapsule(
+                Vec3{PPOS.GetX(), PPOS.GetY(), PPOS.GetZ()}, g_debugHud);
 
-            // Character state + pose: air = jump (plays once and holds),
-            // grounded = walk/run by horizontal speed, else idle.
+            // Character state: air = jump (plays once and holds), grounded =
+            // walk/run by horizontal speed, else idle. The POSE (the facing)
+            // is applied after this frame's look update below -- applying it
+            // here would render the model one camera-frame behind, stepping
+            // after the mouse on every turn.
             if (g_scene.player()->loaded()) {
                 const auto VEL = g_bodyIf->GetLinearVelocity(g_playerBody);
                 const float HSP = std::sqrt(VEL.GetX() * VEL.GetX() +
@@ -2741,14 +2751,6 @@ static void update3D(float dt) {
                                                 : CPlayerModel::EState::Walk)
                                  : CPlayerModel::EState::Idle;
                 g_scene.player()->setState(ST);
-                // Character files face +Z; the look direction is
-                // (sin yaw, 0, -cos yaw) -- RY(pi - yaw) maps one onto the
-                // other, so the model faces where the camera looks.
-                g_scene.setPlayerPose(
-                    Vec3{PPOS.GetX(),
-                         PPOS.GetY() - Camera::kBodyHeight * 0.5f,
-                         PPOS.GetZ()},
-                    3.14159265f - CAM.yaw);
             }
         }
 
@@ -2808,6 +2810,12 @@ static void update3D(float dt) {
     if (!g_playerBody.IsInvalid()) {
         auto& CAM = g_scene.camera();
 
+        // collision = false: the capsule joins no contact pair at all --
+        // it flies/falls through everything (the honest noclip).
+        g_bodyIf->SetObjectLayer(
+            g_playerBody,
+            g_playerCollision ? LAYER_MOVING : LAYER_GRABBED);
+
         // The camera was moved by something else (spawn reset, fullscreen
         // transition handoff): teleport the body under it. Skipped while a
         // transition animates (To2D/To3D own the camera then); the
@@ -2827,6 +2835,26 @@ static void update3D(float dt) {
         }
 
         applyCameraMovement(dt); // -> s_moveVel
+
+        // The character's facing: RY(pi - yaw) maps the authored +Z front
+        // onto the look direction; the facing glides (wrap-aware) instead
+        // of snapping. Applied AFTER this frame's look update so the model
+        // turns synchronously with the camera, never a frame behind.
+        {
+            const float TARGET_YAW = 3.14159265f - CAM.yaw;
+            float D = TARGET_YAW - g_playerModelYaw;
+            while (D > 3.14159265f)
+                D -= 6.28318531f;
+            while (D < -3.14159265f)
+                D += 6.28318531f;
+            g_playerModelYaw += D * (1.0f - std::exp(-18.0f * dt));
+
+            const auto PPOS = g_bodyIf->GetPosition(g_playerBody);
+            g_scene.setPlayerPose(
+                Vec3{PPOS.GetX(), PPOS.GetY() - Camera::kBodyHeight * 0.5f,
+                     PPOS.GetZ()},
+                g_playerModelYaw);
+        }
 
         // Flying: all three axes key-driven, gravity asleep. Walking: the
         // keys own the horizontal plane, Jolt's gravity the vertical one.
@@ -4388,6 +4416,62 @@ static int luaConfig(lua_State* L) {
         if (!SET_ANIM("anim_idle", 0) || !SET_ANIM("anim_walk", 1) ||
             !SET_ANIM("anim_run", 2) || !SET_ANIM("anim_jump", 3))
             return luaL_error(L, "hypr3d.config: player.anim_* must be an animation index or name");
+
+        // animations = { idle = {source = "Idle" | 0, duration_scale = 1.0},
+        //                ... } -- source is a clip name or an index;
+        // duration_scale is the playback SPEED multiplier (1 = as authored).
+        static const char* const STATE_KEYS[4] = {"idle", "walk", "run", "jump"};
+        lua_getfield(L, idx, "animations");
+        if (lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+        } else if (!lua_istable(L, -1)) {
+            lua_pop(L, 1);
+            return luaL_error(L, "hypr3d.config: player.animations must be a table");
+        } else {
+            const int AT = lua_gettop(L);
+            for (int slot = 0; slot < 4; ++slot) {
+                lua_getfield(L, AT, STATE_KEYS[slot]);
+                if (lua_isnil(L, -1)) {
+                    lua_pop(L, 1);
+                    continue;
+                }
+                if (!lua_istable(L, -1)) {
+                    lua_pop(L, 1);
+                    return luaL_error(L,
+                        "hypr3d.config: player.animations.%s must be a table",
+                        STATE_KEYS[slot]);
+                }
+                const int ST = lua_gettop(L);
+
+                lua_getfield(L, ST, "source");
+                if (lua_isnumber(L, -1)) {
+                    g_playerCfg.animIdx[slot] = static_cast<int>(lua_tonumber(L, -1));
+                    g_playerCfg.animName[slot].clear();
+                } else if (lua_isstring(L, -1)) {
+                    size_t LEN = 0;
+                    const char* STR = lua_tolstring(L, -1, &LEN);
+                    g_playerCfg.animName[slot].assign(STR, LEN);
+                    g_playerCfg.animIdx[slot] = -1;
+                } else {
+                    lua_pop(L, 2);
+                    return luaL_error(L,
+                        "hypr3d.config: player.animations.%s.source must be a clip name or index",
+                        STATE_KEYS[slot]);
+                }
+                lua_pop(L, 1); // source
+
+                float SPEED = 1.0f;
+                if (!SET_NUM(ST, "duration_scale", SPEED,
+                             "player.animations.<state>.duration_scale"))
+                    return luaL_error(L,
+                        "hypr3d.config: player.animations.<state>.duration_scale must be a number");
+                g_playerAnimSpeed[slot] = SPEED;
+                g_playerCfg.animSpeed[slot] = SPEED;
+
+                lua_pop(L, 1); // the state table
+            }
+            lua_pop(L, 1); // animations
+        }
         if (!SET_VEC3(idx, "spawn", g_playerSpawn, "player.spawn"))
             return luaL_error(L, "hypr3d.config: player.spawn must be a table { x = .., y = .., z = .. }");
         lua_pop(L, 1);
@@ -4612,6 +4696,9 @@ static int luaConfig(lua_State* L) {
     }
 
     g_scene.setPlayerConfig(g_playerCfg);
+    for (int slot = 0; slot < 4; ++slot)
+        g_scene.player()->setAnimSpeed(static_cast<CPlayerModel::EState>(slot),
+                                       g_playerAnimSpeed[slot]);
 
     return 0;
 }

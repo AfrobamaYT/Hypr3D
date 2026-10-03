@@ -306,8 +306,10 @@ bool CPlayerModel::setAnim(EState state, const std::string& name) {
 // --- pose / evaluation --------------------------------------------------------
 
 void CPlayerModel::setPose(const Vec3& feet, float yawRad,
-                           const Vec3& scale, const Vec3& offset) {
+                           const Vec3& scale, const Vec3& offset,
+                           const Vec3& rotDeg) {
     m_offset = offset;
+    m_rotDeg = rotDeg;
     m_feet = feet;
     m_yaw  = yawRad;
     m_scale = Vec3{scale.x > 0.0001f ? scale.x : 0.0001f,
@@ -997,9 +999,14 @@ void CPlayerModel::draw(const Mat4& vp, const Vec3& cameraPos) const {
     if (!m_loaded || !m_program || m_prims.empty())
         return;
 
+    // The authored-facing correction is a LOCAL XYZ rotation (all three
+    // axes -- exports face any direction), applied inside the camera yaw.
+    constexpr float DEG = 3.14159265358979f / 180.0f;
+    const Mat4 LROT = Mat4::rotationX(m_rotDeg.x * DEG) *
+        (Mat4::rotationY(m_rotDeg.y * DEG) * Mat4::rotationZ(m_rotDeg.z * DEG));
     const Mat4 MODEL = Mat4::translation(m_feet) *
         (Mat4::rotationY(m_yaw) *
-         (Mat4::translation(m_offset) * Mat4::scale(m_scale)));
+         (Mat4::translation(m_offset) * (LROT * Mat4::scale(m_scale))));
     const Mat4 MVP = vp * MODEL;
 
     glUseProgram(m_program);

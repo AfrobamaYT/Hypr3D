@@ -373,7 +373,6 @@ static constexpr float kZoomBase = 2.0f;
 
 // F5 view modes: 0 first person, 1 third person behind, 2 third person front.
 static int g_viewMode = 0;
-static float g_playerModelYaw = 0.f; // smoothed model facing (radians)
 static constexpr float kThirdDist = 2.5f;
 
 // Per-object collision trees (see update3D): one small BVH per scene
@@ -2411,7 +2410,6 @@ static void enter3D() {
 
     g_grounded = false;
     g_viewMode = 0;
-    g_playerModelYaw = 3.14159265f - g_scene.camera().yaw;
     g_scene.camera().mirrorView = false;
     g_scene.setPlayerVisible(false);
     g_scene.setPlayerDebugCapsule(Vec3{}, false);
@@ -2712,21 +2710,19 @@ static void update3D(float dt) {
                            PPOS.GetZ()};
             auto& CAM = g_scene.camera();
 
-            if (g_fsPhase == EFullscreenPhase::None) {
-                CAM.mirrorView = g_viewMode == 2;
-
-                Vec3 WANT = EYE;
-                if (g_viewMode == 1)
-                    WANT = EYE - CAM.forward() * kThirdDist;
-                else if (g_viewMode == 2)
-                    WANT = EYE + CAM.forward() * kThirdDist;
-
-                if (WANT.x != CAM.position.x || WANT.y != CAM.position.y ||
-                    WANT.z != CAM.position.z) {
-                    CAM.position = WANT;
+            if (g_fsPhase == EFullscreenPhase::None && g_viewMode == 0) {
+                // First person: the camera IS the eye. The third-person
+                // orbit is applied AFTER this frame's look update (see the
+                // movement block) -- computing it here would position the
+                // camera by the OLD yaw while the view points by the NEW
+                // one, and the whole world would step on every turn.
+                if (EYE.x != CAM.position.x || EYE.y != CAM.position.y ||
+                    EYE.z != CAM.position.z) {
+                    CAM.position = EYE;
                     damageCurrentMonitor();
                 }
             }
+            CAM.mirrorView = g_viewMode == 2;
 
             g_grounded = playerGrounded();
 
@@ -2837,23 +2833,39 @@ static void update3D(float dt) {
         applyCameraMovement(dt); // -> s_moveVel
 
         // The character's facing: RY(pi - yaw) maps the authored +Z front
-        // onto the look direction; the facing glides (wrap-aware) instead
-        // of snapping. Applied AFTER this frame's look update so the model
-        // turns synchronously with the camera, never a frame behind.
+        // onto the look direction. Applied AFTER this frame's look update
+        // and assigned DIRECTLY -- any smoothing here is second-order on
+        // top of the look inertia and reads as a staircase on fast turns.
         {
-            const float TARGET_YAW = 3.14159265f - CAM.yaw;
-            float D = TARGET_YAW - g_playerModelYaw;
-            while (D > 3.14159265f)
-                D -= 6.28318531f;
-            while (D < -3.14159265f)
-                D += 6.28318531f;
-            g_playerModelYaw += D * (1.0f - std::exp(-18.0f * dt));
-
             const auto PPOS = g_bodyIf->GetPosition(g_playerBody);
             g_scene.setPlayerPose(
                 Vec3{PPOS.GetX(), PPOS.GetY() - Camera::kBodyHeight * 0.5f,
                      PPOS.GetZ()},
-                g_playerModelYaw);
+                3.14159265f - CAM.yaw);
+
+            // The third-person camera SPHERICALLY orbits the player: yaw
+            // sweeps the horizontal ring, pitch lifts/drops the camera
+            // around the anchor (behind on 0 pitch, above on negative,
+            // below on positive), at the same eye level as first person on
+            // the zero pitch.
+            if (g_viewMode != 0) {
+                const Vec3 ORBIT_EYE{PPOS.GetX(),
+                                     PPOS.GetY() + PLAYER_EYE_OFF,
+                                     PPOS.GetZ()};
+                const Vec3 FLAT = CAM.flatForward();
+                const float P = CAM.pitch;
+                const Vec3 DIR =
+                    FLAT * (-std::cos(P)) + Vec3{0.f, 1.f, 0.f} * (-std::sin(P));
+                Vec3 WANT = ORBIT_EYE + DIR * kThirdDist;
+                if (g_viewMode == 2)
+                    WANT = ORBIT_EYE - DIR * kThirdDist;
+
+                if (WANT.x != CAM.position.x || WANT.y != CAM.position.y ||
+                    WANT.z != CAM.position.z) {
+                    CAM.position = WANT;
+                    damageCurrentMonitor();
+                }
+            }
         }
 
         // Flying: all three axes key-driven, gravity asleep. Walking: the
@@ -4369,13 +4381,11 @@ static int luaConfig(lua_State* L) {
             return luaL_error(L, "hypr3d.config: player.mesh must be a table");
         } else {
             const int MT = lua_gettop(L);
-            Vec3 ROT{};
-            if (!PARSE_MESH(MT, g_playerCfg.path, g_playerCfg.posOffset, ROT,
-                            g_playerCfg.scale, g_playerCfg.emissiveScale,
-                            g_playerCfg.flat, g_playerCfg.center,
-                            g_playerCfg.centerOffset))
+            if (!PARSE_MESH(MT, g_playerCfg.path, g_playerCfg.posOffset,
+                            g_playerCfg.rotDeg, g_playerCfg.scale,
+                            g_playerCfg.emissiveScale, g_playerCfg.flat,
+                            g_playerCfg.center, g_playerCfg.centerOffset))
                 return luaL_error(L, "hypr3d.config: player.mesh is invalid");
-            g_playerCfg.turnDeg = ROT.y;
             lua_pop(L, 1);
         }
 
@@ -4389,7 +4399,7 @@ static int luaConfig(lua_State* L) {
                 return luaL_error(L, "hypr3d.config: player.model_scale must be a number");
             g_playerCfg.scale = Vec3{SCALE_F, SCALE_F, SCALE_F};
         }
-        if (!SET_NUM(idx, "model_turn", g_playerCfg.turnDeg, "player.model_turn"))
+        if (!SET_NUM(idx, "model_turn", g_playerCfg.rotDeg.y, "player.model_turn"))
             return luaL_error(L, "hypr3d.config: player.model_turn must be a number");
 
         const auto SET_ANIM = [&](const char* key, int slot) -> bool {

@@ -113,7 +113,7 @@ class CPlayerModel {
     // per-axis scale. Also the material overrides from the shared mesh
     // description.
     void setPose(const Vec3& feet, float yawRad, const Vec3& scale,
-                 const Vec3& offset);
+                 const Vec3& offset, const Vec3& rotDeg);
     void setFlat(bool flat) {
         m_flat = flat;
     }
@@ -262,6 +262,7 @@ class CPlayerModel {
     float  m_yaw = 0.f;
     Vec3   m_offset{};
     Vec3   m_scale{1.f, 1.f, 1.f};
+    Vec3   m_rotDeg{}; // authored-facing correction, XYZ degrees
     bool   m_flat = false;
     float  m_emissiveScale = 1.0f;
 

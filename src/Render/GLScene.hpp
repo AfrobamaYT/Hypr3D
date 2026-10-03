@@ -110,7 +110,7 @@ class GLScene {
     struct SPlayerCfg {
         std::string path;
         Vec3        posOffset{};   // model anchor offset from the feet
-        float       turnDeg = 0.f; // authored facing correction (Y, degrees)
+        Vec3        rotDeg{};      // authored facing correction, XYZ degrees
         Vec3        scale{1.f, 1.f, 1.f};
         float       emissiveScale = 1.0f;
         bool        flat = false;  // true: raw texture, no headlight shading

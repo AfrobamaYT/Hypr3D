@@ -291,7 +291,8 @@ static bool g_hookInstalled = false;
 
 // Plugin settings, set from lua via hl.plugin.hypr3d.config({...}). Missing
 // keys keep their current value, so a partial config only touches what it
-// names; wrong-typed keys raise a lua error. Everything is clamped on set.
+// names; wrong-typed keys raise a lua error. No value ranges: what you
+// write is what the plugin uses.
 // --- world ------------------------------------------------------------------
 static std::string g_cfgPanorama;                // panorama image path
 static bool        g_cfgGrid = true;             // base grid platform on/off
@@ -1250,11 +1251,11 @@ static float fsRawProgress() {
         0.0f, 1.0f);
 }
 
-// The room's uniform window scale, clamped. Shared by syncWorld (quad size)
-// and the fullscreen animation (its endpoints must match what the room
-// renders, or the transition visibly jumps).
+// The room's uniform window scale. Shared by syncWorld (quad size) and the
+// fullscreen animation (its endpoints must match what the room renders, or
+// the transition visibly jumps).
 static float configWindowScale() {
-    return std::clamp(g_cfgWindowScale, 0.1f, 8.0f);
+    return g_cfgWindowScale;
 }
 
 static void syncWorld(const PHLMONITOR& mon, float dt) {
@@ -4060,7 +4061,7 @@ static int luaConfig(lua_State* L) {
 
     // Field accessors. TIDX = stack index of the section table (0 = absent).
     const auto SET_NUM = [&](int tidx, const char* key, float& out,
-                             float lo, float hi, const char* path) -> bool {
+                             const char* path) -> bool {
         lua_getfield(L, tidx, key);
         if (lua_isnil(L, -1)) {
             lua_pop(L, 1);
@@ -4070,7 +4071,7 @@ static int luaConfig(lua_State* L) {
             lua_pop(L, 1);
             return false;
         }
-        out = std::clamp(static_cast<float>(lua_tonumber(L, -1)), lo, hi);
+        out = static_cast<float>(lua_tonumber(L, -1));
         lua_pop(L, 1);
         return true;
     };
@@ -4192,10 +4193,10 @@ static int luaConfig(lua_State* L) {
     if (idx == -1)
         return luaL_error(L, "hypr3d.config: windows must be a table");
     if (idx > 0) {
-        if (!SET_NUM(idx, "window_scale", g_cfgWindowScale, 0.1f, 8.0f,
+        if (!SET_NUM(idx, "window_scale", g_cfgWindowScale,
                      "windows.window_scale"))
             return luaL_error(L, "hypr3d.config: windows.window_scale must be a number");
-        if (!SET_NUM(idx, "spawn_distance", g_cfgSpawnDistance, 1.0f, 100.0f,
+        if (!SET_NUM(idx, "spawn_distance", g_cfgSpawnDistance,
                      "windows.spawn_distance"))
             return luaL_error(L, "hypr3d.config: windows.spawn_distance must be a number");
         lua_pop(L, 1);
@@ -4205,16 +4206,16 @@ static int luaConfig(lua_State* L) {
     if (idx == -1)
         return luaL_error(L, "hypr3d.config: player must be a table");
     if (idx > 0) {
-        if (!SET_NUM(idx, "look_sensitivity", g_cfgSensitivity, 0.0001f, 0.05f,
+        if (!SET_NUM(idx, "look_sensitivity", g_cfgSensitivity,
                      "player.look_sensitivity"))
             return luaL_error(L, "hypr3d.config: player.look_sensitivity must be a number");
-        if (!SET_NUM(idx, "look_inertia", g_cfgLookInertia, 0.0f, 1.0f,
+        if (!SET_NUM(idx, "look_inertia", g_cfgLookInertia,
                      "player.look_inertia"))
             return luaL_error(L, "hypr3d.config: player.look_inertia must be a number");
-        if (!SET_NUM(idx, "move_inertia", g_cfgMoveInertia, 0.0f, 1.0f,
+        if (!SET_NUM(idx, "move_inertia", g_cfgMoveInertia,
                      "player.move_inertia"))
             return luaL_error(L, "hypr3d.config: player.move_inertia must be a number");
-        if (!SET_NUM(idx, "move_speed", g_cfgMoveSpeed, 0.5f, 50.0f,
+        if (!SET_NUM(idx, "move_speed", g_cfgMoveSpeed,
                      "player.move_speed"))
             return luaL_error(L, "hypr3d.config: player.move_speed must be a number");
         if (!SET_BOOL(idx, "flying", g_playerFlying, "player.flying"))
@@ -4223,8 +4224,6 @@ static int luaConfig(lua_State* L) {
             return luaL_error(L, "hypr3d.config: player.walk_bob must be a boolean");
         if (!SET_VEC3(idx, "spawn", g_playerSpawn, "player.spawn"))
             return luaL_error(L, "hypr3d.config: player.spawn must be a table { x = .., y = .., z = .. }");
-        // y is the FEET height; only guard against absurd values.
-        g_playerSpawn.y = std::clamp(g_playerSpawn.y, -1000.0f, 1000.0f);
         lua_pop(L, 1);
     }
 
@@ -4289,15 +4288,10 @@ static int luaConfig(lua_State* L) {
                               "scene.<name>.transform.scale"))
                     return luaL_error(L, "hypr3d.config: scene.<name>.transform.scale must be a table { x = .., y = .., z = .. }");
 
-                // Zero axes would collapse the object to a plane hair.
-                OBJ.scale.x = std::clamp(OBJ.scale.x, 0.05f, 10.0f);
-                OBJ.scale.y = std::clamp(OBJ.scale.y, 0.05f, 10.0f);
-                OBJ.scale.z = std::clamp(OBJ.scale.z, 0.05f, 10.0f);
-
                 lua_pop(L, 1);
             }
 
-            if (!SET_NUM(OIDX, "emissive_scale", OBJ.emissiveScale, 0.0f, 20.0f,
+            if (!SET_NUM(OIDX, "emissive_scale", OBJ.emissiveScale,
                          "scene.<name>.emissive_scale")) {
                 lua_pop(L, 1);
                 return luaL_error(L, "hypr3d.config: scene.<name>.emissive_scale must be a number");
@@ -4408,60 +4402,6 @@ static int luaConfig(lua_State* L) {
 
         g_sceneObjects = std::move(OBJECTS);
         lua_pop(L, 1);
-    }
-
-    // Legacy single-map section: folded into the scene as one object (a
-    // scene = { map = ... } entry supersedes it -- scene wins when both
-    // exist).
-    if (g_sceneObjects.empty()) {
-        idx = SECTION("map", "map");
-        if (idx == -1)
-            return luaL_error(L, "hypr3d.config: map must be a table");
-        if (idx > 0) {
-            SSceneObjectCfg OBJ;
-
-            if (!SET_STRING(idx, "path", OBJ.path, "map.path"))
-                return luaL_error(L, "hypr3d.config: map.path must be a string");
-
-            // transform = { position, rotation, scale } -- nested, same as
-            // the scene objects.
-            lua_getfield(L, idx, "transform");
-            if (lua_isnil(L, -1)) {
-                lua_pop(L, 1);
-            } else if (!lua_istable(L, -1)) {
-                lua_pop(L, 1);
-                return luaL_error(L, "hypr3d.config: map.transform must be a table with position/rotation/scale");
-            } else {
-                const int TIDX = lua_gettop(L);
-
-                if (!SET_VEC3(TIDX, "position", OBJ.position, "map.transform.position"))
-                    return luaL_error(L, "hypr3d.config: map.transform.position must be a table { x = .., y = .., z = .. }");
-                if (!SET_VEC3(TIDX, "rotation", OBJ.rotationDeg, "map.transform.rotation"))
-                    return luaL_error(L, "hypr3d.config: map.transform.rotation must be a table { x = .., y = .., z = .. } (degrees)");
-                if (!SET_VEC3(TIDX, "scale", OBJ.scale, "map.transform.scale"))
-                    return luaL_error(L, "hypr3d.config: map.transform.scale must be a table { x = .., y = .., z = .. }");
-
-                OBJ.scale.x = std::clamp(OBJ.scale.x, 0.05f, 10.0f);
-                OBJ.scale.y = std::clamp(OBJ.scale.y, 0.05f, 10.0f);
-                OBJ.scale.z = std::clamp(OBJ.scale.z, 0.05f, 10.0f);
-
-                lua_pop(L, 1);
-            }
-
-            if (!SET_NUM(idx, "emissive_scale", OBJ.emissiveScale, 0.0f, 20.0f,
-                         "map.emissive_scale"))
-                return luaL_error(L, "hypr3d.config: map.emissive_scale must be a number");
-            if (!SET_BOOL(idx, "flat", OBJ.flat, "map.flat"))
-                return luaL_error(L, "hypr3d.config: map.flat must be a boolean");
-            if (!SET_BOOL(idx, "collision", OBJ.collision, "map.collision"))
-                return luaL_error(L, "hypr3d.config: map.collision must be a boolean");
-            if (!SET_BOOL(idx, "physics", OBJ.physics, "map.physics"))
-                return luaL_error(L, "hypr3d.config: map.physics must be a boolean");
-
-            g_sceneObjects.push_back(OBJ);
-
-            lua_pop(L, 1);
-        }
     }
 
     return 0;

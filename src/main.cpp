@@ -307,6 +307,8 @@ static float       g_cfgMoveInertia   = 0.05f;   // seconds, 0 = off
 static float       g_cfgMoveSpeed     = 4.0f;    // world units / second
 static float       g_cfgSensitivity   = 0.0025f; // radians per pointer count
 static bool        g_playerFlying     = true;    // false = walk / jump / gravity
+static bool        g_playerCollision  = true;    // reserved: the capsule is
+        // the movement system, so this only gates future per-object contact
 static bool        g_cfgWalkBob       = true;    // view-only walk bob (walking only)
 static GLScene::SPlayerCfg g_playerCfg;          // the player character
 
@@ -2739,11 +2741,14 @@ static void update3D(float dt) {
                                                 : CPlayerModel::EState::Walk)
                                  : CPlayerModel::EState::Idle;
                 g_scene.player()->setState(ST);
+                // Character files face +Z; the look direction is
+                // (sin yaw, 0, -cos yaw) -- RY(pi - yaw) maps one onto the
+                // other, so the model faces where the camera looks.
                 g_scene.setPlayerPose(
                     Vec3{PPOS.GetX(),
                          PPOS.GetY() - Camera::kBodyHeight * 0.5f,
                          PPOS.GetZ()},
-                    CAM.yaw);
+                    3.14159265f - CAM.yaw);
             }
         }
 
@@ -4287,13 +4292,75 @@ static int luaConfig(lua_State* L) {
             return luaL_error(L, "hypr3d.config: player.flying must be a boolean");
         if (!SET_BOOL(idx, "walk_bob", g_cfgWalkBob, "player.walk_bob"))
             return luaL_error(L, "hypr3d.config: player.walk_bob must be a boolean");
+        if (!SET_BOOL(idx, "collision", g_playerCollision, "player.collision"))
+            return luaL_error(L, "hypr3d.config: player.collision must be a boolean");
 
-        // The player character: model path, scale, facing offset, and one
-        // animation per state (an index OR an animation name).
+        // The shared mesh-block parser: path + transform + material
+        // overrides -- the SAME description for the player and the scene
+        // objects. transform.position anchors the mesh, rotation.y corrects
+        // the authored facing, scale stretches it.
+        const auto PARSE_MESH = [&](int MT, std::string& path, Vec3& pos,
+                                    Vec3& rotDeg, Vec3& scale,
+                                    float& emissive, bool& flat,
+                                    std::string& center,
+                                    Vec3& centerOff) -> bool {
+            if (!SET_STRING(MT, "path", path, "mesh.path"))
+                return false;
+
+            lua_getfield(L, MT, "transform");
+            if (lua_isnil(L, -1)) {
+                lua_pop(L, 1);
+            } else if (!lua_istable(L, -1)) {
+                lua_pop(L, 1);
+                return false;
+            } else {
+                const int TIDX = lua_gettop(L);
+                if (!SET_VEC3(TIDX, "position", pos, "mesh.transform.position") ||
+                    !SET_VEC3(TIDX, "rotation", rotDeg, "mesh.transform.rotation") ||
+                    !SET_VEC3(TIDX, "scale", scale, "mesh.transform.scale"))
+                    return false;
+                lua_pop(L, 1);
+            }
+
+            if (!SET_NUM(MT, "emissive_scale", emissive, "mesh.emissive_scale") ||
+                !SET_BOOL(MT, "flat", flat, "mesh.flat") ||
+                !SET_STRING(MT, "center", center, "mesh.center") ||
+                !SET_VEC3(MT, "center_offset", centerOff, "mesh.center_offset"))
+                return false;
+            return true;
+        };
+
+        // player.mesh: the character's visual, described exactly like a
+        // scene object's mesh. The transform.position anchors the model
+        // relative to the feet, rotation.y corrects the authored facing.
+        lua_getfield(L, idx, "mesh");
+        if (lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+        } else if (!lua_istable(L, -1)) {
+            lua_pop(L, 1);
+            return luaL_error(L, "hypr3d.config: player.mesh must be a table");
+        } else {
+            const int MT = lua_gettop(L);
+            Vec3 ROT{};
+            if (!PARSE_MESH(MT, g_playerCfg.path, g_playerCfg.posOffset, ROT,
+                            g_playerCfg.scale, g_playerCfg.emissiveScale,
+                            g_playerCfg.flat, g_playerCfg.center,
+                            g_playerCfg.centerOffset))
+                return luaL_error(L, "hypr3d.config: player.mesh is invalid");
+            g_playerCfg.turnDeg = ROT.y;
+            lua_pop(L, 1);
+        }
+
+        // Legacy single keys, kept as a fallback for older configs (the
+        // mesh block above overrides them).
         if (!SET_STRING(idx, "model", g_playerCfg.path, "player.model"))
             return luaL_error(L, "hypr3d.config: player.model must be a string");
-        if (!SET_NUM(idx, "model_scale", g_playerCfg.scale, "player.model_scale"))
-            return luaL_error(L, "hypr3d.config: player.model_scale must be a number");
+        {
+            float SCALE_F = g_playerCfg.scale.x;
+            if (!SET_NUM(idx, "model_scale", SCALE_F, "player.model_scale"))
+                return luaL_error(L, "hypr3d.config: player.model_scale must be a number");
+            g_playerCfg.scale = Vec3{SCALE_F, SCALE_F, SCALE_F};
+        }
         if (!SET_NUM(idx, "model_turn", g_playerCfg.turnDeg, "player.model_turn"))
             return luaL_error(L, "hypr3d.config: player.model_turn must be a number");
 
@@ -4435,6 +4502,47 @@ static int luaConfig(lua_State* L) {
                 lua_pop(L, 1);
                 return luaL_error(L, "hypr3d.config: scene.<name>.center_offset must be a table { x = .., y = .., z = .. }");
             }
+
+            // mesh = { ... }: the shared visual description -- overrides
+            // the legacy flat keys when present.
+            lua_getfield(L, OIDX, "mesh");
+            if (lua_istable(L, -1)) {
+                const int MT = lua_gettop(L);
+                std::string CENTER = "origin";
+                Vec3 MROT{};
+                bool MFLAT = OBJ.flat;
+                float MEMIS = OBJ.emissiveScale;
+                if (!SET_STRING(MT, "path", OBJ.path, "mesh.path") ||
+                    !SET_VEC3(MT, "center_offset", OBJ.centerOffset,
+                              "mesh.center_offset") ||
+                    !SET_NUM(MT, "emissive_scale", MEMIS, "mesh.emissive_scale") ||
+                    !SET_BOOL(MT, "flat", MFLAT, "mesh.flat") ||
+                    !SET_STRING(MT, "center", CENTER, "mesh.center"))
+                    return luaL_error(L, "hypr3d.config: scene.<name>.mesh is invalid");
+                OBJ.emissiveScale = MEMIS;
+                OBJ.flat = MFLAT;
+                OBJ.center = CENTER == "origin"
+                    ? CMapModel::ECenter::Origin : CMapModel::ECenter::Logical;
+
+                lua_getfield(L, MT, "transform");
+                if (lua_isnil(L, -1)) {
+                    lua_pop(L, 1);
+                } else if (!lua_istable(L, -1)) {
+                    lua_pop(L, 1);
+                    return luaL_error(L, "hypr3d.config: scene.<name>.mesh.transform must be a table");
+                } else {
+                    const int TIDX = lua_gettop(L);
+                    if (!SET_VEC3(TIDX, "position", OBJ.position,
+                                  "mesh.transform.position") ||
+                        !SET_VEC3(TIDX, "rotation", OBJ.rotationDeg,
+                                  "mesh.transform.rotation") ||
+                        !SET_VEC3(TIDX, "scale", OBJ.scale,
+                                  "mesh.transform.scale"))
+                        return luaL_error(L, "hypr3d.config: scene.<name>.mesh.transform is invalid");
+                    lua_pop(L, 1);
+                }
+            }
+            lua_pop(L, 1); // pop mesh (or its nil)
 
             OBJECTS.push_back(OBJ);
             lua_pop(L, 1); // pop the value; the key remains for lua_next

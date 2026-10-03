@@ -305,18 +305,20 @@ bool CPlayerModel::setAnim(EState state, const std::string& name) {
 
 // --- pose / evaluation --------------------------------------------------------
 
-void CPlayerModel::setPose(const Vec3& feet, float yawRad, float scale) {
-    m_feet  = feet;
-    m_yaw   = yawRad;
-    m_scale = scale > 0.0001f ? scale : 0.0001f;
+void CPlayerModel::setPose(const Vec3& feet, float yawRad,
+                           const Vec3& scale, const Vec3& offset) {
+    m_offset = offset;
+    m_feet = feet;
+    m_yaw  = yawRad;
+    m_scale = Vec3{scale.x > 0.0001f ? scale.x : 0.0001f,
+                   scale.y > 0.0001f ? scale.y : 0.0001f,
+                   scale.z > 0.0001f ? scale.z : 0.0001f};
 }
 
-void CPlayerModel::evaluateNodes() {
-    // Local TRS per node: start from the rest pose, then the current
-    // animation's channels override components.
-    std::vector<Vec3>  T(m_nodes.size());
-    std::vector<SQuat> R(m_nodes.size());
-    std::vector<Vec3>  S(m_nodes.size());
+void CPlayerModel::evalLocals(EState state, float time,
+                              std::vector<Vec3>& T, std::vector<SQuat>& R,
+                              std::vector<Vec3>& S) const {
+    // Rest TRS, then the state's animation channels override components.
     for (size_t i = 0; i < m_nodes.size(); ++i) {
         T[i] = m_nodes[i].t;
         R[i] = SQuat{m_nodes[i].r[0], m_nodes[i].r[1], m_nodes[i].r[2],
@@ -324,26 +326,52 @@ void CPlayerModel::evaluateNodes() {
         S[i] = m_nodes[i].s;
     }
 
-    const int ANIM = m_animFor[static_cast<int>(m_state)];
-    if (ANIM >= 0 && ANIM < static_cast<int>(m_anims.size())) {
-        const auto& A = m_anims[ANIM];
-        for (const auto& C : A.channels) {
-            if (C.node < 0 || C.node >= static_cast<int>(m_nodes.size()) ||
-                C.sampler < 0 || C.sampler >= static_cast<int>(m_samplers.size()))
-                continue;
+    const int ANIM = m_animFor[static_cast<int>(state)];
+    if (ANIM < 0 || ANIM >= static_cast<int>(m_anims.size()))
+        return; // no clip for this state: the rest pose stands
 
-            float V[4];
-            m_samplers[C.sampler].sample(m_time, V);
+    const auto& A = m_anims[ANIM];
+    for (const auto& C : A.channels) {
+        if (C.node < 0 || C.node >= static_cast<int>(m_nodes.size()) ||
+            C.sampler < 0 || C.sampler >= static_cast<int>(m_samplers.size()))
+            continue;
 
-            switch (C.path) {
-                case 0: T[C.node] = {V[0], V[1], V[2]}; break;
-                case 1: R[C.node] = {V[0], V[1], V[2], V[3]}; break;
-                case 2: S[C.node] = {V[0], V[1], V[2]}; break;
-            }
+        float V[4];
+        m_samplers[C.sampler].sample(time, V);
+
+        switch (C.path) {
+            case 0: T[C.node] = {V[0], V[1], V[2]}; break;
+            case 1: R[C.node] = {V[0], V[1], V[2], V[3]}; break;
+            case 2: S[C.node] = {V[0], V[1], V[2]}; break;
+        }
+    }
+}
+
+void CPlayerModel::evaluateNodes() {
+    const size_t NN = m_nodes.size();
+
+    std::vector<Vec3>  T(NN);
+    std::vector<SQuat> R(NN);
+    std::vector<Vec3>  S(NN);
+    evalLocals(m_state, m_time, T, R, S);
+
+    // Crossfade: while the blend runs, the previous state keeps playing and
+    // its pose lerps/slerps into the current one.
+    if (m_blend < 1.f && m_prevState != m_state) {
+        std::vector<Vec3>  TP(NN);
+        std::vector<SQuat> RP(NN);
+        std::vector<Vec3>  SP(NN);
+        evalLocals(m_prevState, m_prevTime, TP, RP, SP);
+
+        const float B = m_blend;
+        for (size_t i = 0; i < NN; ++i) {
+            T[i] = TP[i] + (T[i] - TP[i]) * B;
+            S[i] = SP[i] + (S[i] - SP[i]) * B;
+            R[i] = SQuat::slerp(RP[i], R[i], B);
         }
     }
 
-    m_world.assign(m_nodes.size(), Mat4::identity());
+    m_world.assign(NN, Mat4::identity());
     for (const int I : m_order) {
         const Mat4 LOCAL = Mat4::translation(T[I]) * (quatToMat4(R[I]) *
             (Mat4::scale(S[I])));
@@ -372,6 +400,26 @@ void CPlayerModel::update(float dt) {
             m_time = std::min(m_time, DUR); // hold the landing pose
         else
             m_time = std::fmod(m_time, DUR);
+    }
+
+    // The crossfade: the previous clip keeps playing while the blend eases
+    // from its pose into the current one (0.25 s).
+    if (m_blend < 1.f) {
+        m_blend = std::min(1.f, m_blend + dt / 0.25f);
+
+        const int PANIM = m_animFor[static_cast<int>(m_prevState)];
+        const float PDUR =
+            (PANIM >= 0 && PANIM < static_cast<int>(m_anims.size()))
+                ? m_anims[PANIM].duration
+                : 0.f;
+        if (dt > 0.f)
+            m_prevTime += dt;
+        if (PDUR > 0.f) {
+            if (m_prevState == EState::Jump)
+                m_prevTime = std::min(m_prevTime, PDUR);
+            else
+                m_prevTime = std::fmod(m_prevTime, PDUR);
+        }
     }
 
     evaluateNodes();
@@ -901,6 +949,7 @@ bool CPlayerModel::load(const std::string& path) {
             m_uJoints    = glGetUniformLocation(P, "uJoints");
             m_uSkinned   = glGetUniformLocation(P, "uSkinned");
             m_uMeshWorld = glGetUniformLocation(P, "uMeshWorld");
+            m_uFlat      = glGetUniformLocation(P, "uFlat");
         }
         glDeleteShader(VS);
         glDeleteShader(FS);
@@ -949,13 +998,15 @@ void CPlayerModel::draw(const Mat4& vp, const Vec3& cameraPos) const {
         return;
 
     const Mat4 MODEL = Mat4::translation(m_feet) *
-        (Mat4::rotationY(m_yaw) * Mat4::scale(Vec3{m_scale, m_scale, m_scale}));
+        (Mat4::rotationY(m_yaw) *
+         (Mat4::translation(m_offset) * Mat4::scale(m_scale)));
     const Mat4 MVP = vp * MODEL;
 
     glUseProgram(m_program);
     glUniformMatrix4fv(m_uMVP, 1, GL_FALSE, MVP.m.data());
     glUniformMatrix4fv(m_uModel, 1, GL_FALSE, MODEL.m.data());
     glUniform1i(m_uTex, 0);
+    glUniform1i(m_uFlat, m_flat);
     glUniform3f(m_uCamPos, cameraPos.x, cameraPos.y, cameraPos.z);
 
     glActiveTexture(GL_TEXTURE0);
@@ -978,7 +1029,9 @@ void CPlayerModel::draw(const Mat4& vp, const Vec3& cameraPos) const {
             glUniform1i(m_uSkinned, 0);
         }
 
-        glUniform4f(m_uColor, P.color[0], P.color[1], P.color[2], P.color[3]);
+        glUniform4f(m_uColor, P.color[0] * m_emissiveScale,
+                    P.color[1] * m_emissiveScale,
+                    P.color[2] * m_emissiveScale, P.color[3]);
         glUniform1i(m_uHasTex, P.texture != 0);
         glBindTexture(GL_TEXTURE_2D, P.texture);
         glBindVertexArray(P.vao);

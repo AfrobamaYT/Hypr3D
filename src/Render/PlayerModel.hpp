@@ -17,6 +17,7 @@ class CPlayerModel {
   public:
     enum class EState : uint8_t { Idle, Walk, Run, Jump };
     static constexpr int kStateCount = 4;
+    static constexpr float kBlendDuration = 0.25f; // state crossfade, s
 
     // Quaternion (glTF rotation channels); minimal, test-visible.
     struct SQuat {
@@ -107,17 +108,34 @@ class CPlayerModel {
     void setAnim(EState state, int index);
     bool setAnim(EState state, const std::string& name);
 
-    // World placement of the model's ORIGIN (feet for character exports)
-    // and its facing (yaw radians).
-    void setPose(const Vec3& feet, float yawRad, float scale);
+    // World placement of the model's ORIGIN (feet for character exports):
+    // anchor offset (rotates with the model), facing (yaw radians),
+    // per-axis scale. Also the material overrides from the shared mesh
+    // description.
+    void setPose(const Vec3& feet, float yawRad, const Vec3& scale,
+                 const Vec3& offset);
+    void setFlat(bool flat) {
+        m_flat = flat;
+    }
+    void setEmissiveScale(float s) {
+        m_emissiveScale = s > 0.f ? s : 0.f;
+    }
 
     // Switch the animated state; Jump restarts and HOLDS its last frame,
-    // the looped states wrap.
+    // the looped states wrap. The previous state keeps playing and the two
+    // poses crossfade over kBlendDuration, so state changes never pop.
     void setState(EState state) {
-        if (m_state != state) {
-            m_state = state;
-            m_time  = 0.f;
-        }
+        if (m_state == state)
+            return;
+        m_prevState = m_state;
+        m_prevTime  = m_time;
+        m_state     = state;
+        m_time      = 0.f;
+        m_blend     = 0.f;
+    }
+
+    float blend() const {
+        return m_blend;
     }
 
     // Advance the clock and evaluate the animation into the vertex buffers.
@@ -206,6 +224,10 @@ class CPlayerModel {
         std::vector<Mat4> invBind;  // per joint (as authored)
     };
 
+    // Rest TRS + one state's animation channels -> local transforms.
+    void evalLocals(EState state, float time, std::vector<Vec3>& T,
+                    std::vector<SQuat>& R, std::vector<Vec3>& S) const;
+
     // Local TRS -> world matrix pass, parents first (m_order).
     void evaluateNodes();
 
@@ -222,12 +244,18 @@ class CPlayerModel {
     std::vector<std::vector<Mat4>> m_skinMats; // jointWorld * invBind, per skin
     std::vector<SPrim>     m_prims;
 
-    EState m_state = EState::Idle;
+    EState m_state      = EState::Idle;
+    EState m_prevState  = EState::Idle;
+    float  m_prevTime   = 0.f;
+    float  m_blend      = 1.f; // 0 = the previous pose, 1 = the current
     int    m_animFor[kStateCount] = {-1, -1, -1, -1};
     float  m_time = 0.f;
     Vec3   m_feet{};
     float  m_yaw = 0.f;
-    float  m_scale = 1.0f;
+    Vec3   m_offset{};
+    Vec3   m_scale{1.f, 1.f, 1.f};
+    bool   m_flat = false;
+    float  m_emissiveScale = 1.0f;
 
     bool   m_loaded = false;
     std::string m_path;
@@ -235,7 +263,7 @@ class CPlayerModel {
     unsigned int m_program = 0;
     int          m_uMVP = -1, m_uModel = -1, m_uColor = -1, m_uTex = -1,
         m_uHasTex = -1, m_uCamPos = -1, m_uJoints = -1, m_uSkinned = -1,
-        m_uMeshWorld = -1;
+        m_uMeshWorld = -1, m_uFlat = -1;
 };
 
 } // namespace H3D

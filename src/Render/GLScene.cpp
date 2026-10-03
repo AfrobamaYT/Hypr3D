@@ -1961,7 +1961,10 @@ bool GLScene::render(
     if (m_playerVisible && m_player.loaded()) {
         m_player.setPose(m_playerFeet,
                          m_playerYaw + m_playerCfg.turnDeg * PI / 180.0f,
-                         m_playerCfg.scale);
+                         m_playerCfg.scale,
+                         m_playerCfg.posOffset + m_playerCfg.centerOffset);
+        m_player.setFlat(m_playerCfg.flat);
+        m_player.setEmissiveScale(m_playerCfg.emissiveScale);
         m_player.update(dt);
         m_player.draw(vp, m_camera.position);
     }

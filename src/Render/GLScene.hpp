@@ -98,12 +98,19 @@ class GLScene {
         m_zoom = magnification > 0.01f ? magnification : 0.01f;
     }
 
-    // The player's own character (player.model). Config and pose come from
-    // main; the animation clock runs inside render().
+    // The player's own character (player.mesh). The SAME mesh description
+    // the scene objects use: path, transform, material overrides. Config
+    // and pose come from main; the animation clock runs inside render().
     struct SPlayerCfg {
         std::string path;
-        float       scale = 1.0f;
-        float       turnDeg = 0.0f;
+        Vec3        posOffset{};   // model anchor offset from the feet
+        float       turnDeg = 0.f; // authored facing correction (Y, degrees)
+        Vec3        scale{1.f, 1.f, 1.f};
+        float       emissiveScale = 1.0f;
+        bool        flat = false;  // true: raw texture, no headlight shading
+        std::string center;       // parsed for format parity; the player
+        Vec3        centerOffset{}; // rotates around its anchor, so only
+                                  // center_offset (the anchor shift) applies
         // idle, walk, run, jump: animation index or name (name wins)
         int         animIdx[CPlayerModel::kStateCount] = {-1, -1, -1, -1};
         std::string animName[CPlayerModel::kStateCount];

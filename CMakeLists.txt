@@ -120,7 +120,7 @@ target_link_libraries(hypr3d PRIVATE
     dl
 )
 
-set_target_properties(hypr3d20971 PROPERTIES
+set_target_properties(hypr3d PROPERTIES
     PREFIX ""
     OUTPUT_NAME "hypr3d20971"
 )

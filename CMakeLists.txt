@@ -122,5 +122,5 @@ target_link_libraries(hypr3d PRIVATE
 
 set_target_properties(hypr3d PROPERTIES
     PREFIX ""
-    OUTPUT_NAME "hypr3d20971"
+    OUTPUT_NAME "hypr3d"
 )

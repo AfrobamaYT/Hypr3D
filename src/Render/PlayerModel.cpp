@@ -2,6 +2,9 @@
 
 #include "../../third_party/cgltf.h"
 
+#define STB_IMAGE_IMPLEMENTATION
+#include "../../third_party/stb_image.h"
+
 #include <GLES3/gl32.h>
 
 // The test stubs carry only a subset of the GL constants.
@@ -149,12 +152,68 @@ Vec3 transformDir(const Mat4& m, const Vec3& p) {
     };
 }
 
+unsigned int uploadGLTex(const std::vector<unsigned char>& pixels, int W,
+                         int H) {
+    if (W <= 0 || H <= 0 || pixels.empty())
+        return 0;
+
+    unsigned int tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                 pixels.data());
+    glGenerateMipmap(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    return tex;
+}
+
 unsigned int uploadTexture(const std::string& modelDir, const cgltf_image* image) {
+    // Primary path: stb_image. It decodes JPEG/PNG/BMP/TGA/... straight
+    // into RGBA -- glTF models in the wild embed JPEG far more often than
+    // PNG, and straight alpha avoids cairo's premultiplied-ARGB traps.
+    if (image) {
+        std::vector<unsigned char> PIX;
+        int W = 0, H = 0;
+
+        if (image->buffer_view && image->buffer_view->buffer &&
+            image->buffer_view->buffer->data) {
+            // Embedded texture (.glb): the image bytes live in the buffer
+            // view.
+            const auto* BV = image->buffer_view;
+            const auto* DATA =
+                static_cast<const uint8_t*>(BV->buffer->data) + BV->offset;
+            int COMP = 0;
+            unsigned char* DECODED = stbi_load_from_memory(
+                DATA, static_cast<int>(BV->size), &W, &H, &COMP, 4);
+            if (DECODED) {
+                PIX.assign(DECODED, DECODED + static_cast<size_t>(W) * H * 4);
+                stbi_image_free(DECODED);
+            }
+        } else if (image->uri &&
+                   !std::string_view{image->uri}.starts_with("data:")) {
+            int COMP = 0;
+            unsigned char* DECODED = stbi_load(
+                (modelDir + "/" + image->uri).c_str(), &W, &H, &COMP, 4);
+            if (DECODED) {
+                PIX.assign(DECODED, DECODED + static_cast<size_t>(W) * H * 4);
+                stbi_image_free(DECODED);
+            }
+        }
+
+        if (!PIX.empty())
+            return uploadGLTex(PIX, W, H);
+        // stb failed: fall through to the cairo path (exotic formats).
+    }
+
+    // Fallback: hyprgraphics/cairo.
     std::unique_ptr<Hyprgraphics::CImage> img;
 
     if (image && image->buffer_view && image->buffer_view->buffer &&
         image->buffer_view->buffer->data) {
-        // Embedded texture (.glb): the image bytes live in the buffer view.
         const auto* BV = image->buffer_view;
         const auto* DATA = static_cast<const uint8_t*>(BV->buffer->data) + BV->offset;
         img = std::make_unique<Hyprgraphics::CImage>(
@@ -189,18 +248,7 @@ unsigned int uploadTexture(const std::string& modelDir, const cgltf_image* image
         }
     }
 
-    unsigned int tex = 0;
-    glGenTextures(1, &tex);
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE,
-                 pixels.data());
-    glGenerateMipmap(GL_TEXTURE_2D);
-    glBindTexture(GL_TEXTURE_2D, 0);
-    return tex;
+    return uploadGLTex(pixels, W, H);
 }
 
 } // namespace

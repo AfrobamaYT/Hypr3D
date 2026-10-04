@@ -62,6 +62,7 @@ hl.bind("SUPER + F12", hl.plugin.hypr3d.toggle)
 | Super + Mouse wheel scrolling | Zoom window                                    |
 | Super + Left Alt              | Toggle keyboard mode (movement / window input) |
 | F3                            | Toggle debug HUD                               |
+| F5                            | Switch camera view                             |
 
 # Configuration
 ## Lua config example:

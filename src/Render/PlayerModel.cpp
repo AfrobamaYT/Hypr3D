@@ -1049,14 +1049,14 @@ void CPlayerModel::draw(const Mat4& vp, const Vec3& cameraPos) const {
     if (!m_loaded || !m_program || m_prims.empty())
         return;
 
-    // The authored-facing correction is a LOCAL XYZ rotation (all three
-    // axes -- exports face any direction), applied inside the camera yaw.
+    // The transform semantics match the scene objects: POSITION is a
+    // world-space anchor shift (does NOT swing with the camera), ROTATION
+    // and SCALE are local, around the anchor.
     constexpr float DEG = 3.14159265358979f / 180.0f;
     const Mat4 LROT = Mat4::rotationX(m_rotDeg.x * DEG) *
         (Mat4::rotationY(m_rotDeg.y * DEG) * Mat4::rotationZ(m_rotDeg.z * DEG));
-    const Mat4 MODEL = Mat4::translation(m_feet) *
-        (Mat4::rotationY(m_yaw) *
-         (Mat4::translation(m_offset) * (LROT * Mat4::scale(m_scale))));
+    const Mat4 MODEL = Mat4::translation(m_feet + m_offset) *
+        (Mat4::rotationY(m_yaw) * (LROT * Mat4::scale(m_scale)));
     const Mat4 MVP = vp * MODEL;
 
     glUseProgram(m_program);

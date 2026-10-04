@@ -150,7 +150,7 @@ class CMapModel {
     Vec3                    m_centerOffset{};
     Vec3                    m_pivot{}; // resolved local pivot
     float                   m_emissiveScale = 1.0f;
-    bool                    m_flat = true;
+    bool                    m_flat = false; // false = headlight shading
     bool                    m_loaded = false;
     uint32_t                m_generation = 0;
     uint32_t                m_meshVersion = 0;

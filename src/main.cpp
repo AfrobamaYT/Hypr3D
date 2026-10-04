@@ -326,7 +326,7 @@ struct SSceneObjectCfg {
     std::string path;
     Vec3        position{}, rotationDeg{}, scale{1.0f, 1.0f, 1.0f};
     float       emissiveScale = 1.0f;
-    bool        flat = true;
+    bool        flat = false; // false = headlight half-lambert shading
     bool        collision = true;
     bool        dynamic = false; // static = false -> grabbable with Super+LMB
     bool        physics = false; // gravity + world collisions (dynamic only)
@@ -4419,18 +4419,36 @@ static int luaConfig(lua_State* L) {
             lua_pop(L, 1);
         }
 
-        // Legacy single keys, kept as a fallback for older configs (the
-        // mesh block above overrides them).
-        if (!SET_STRING(idx, "model", g_playerCfg.path, "player.model"))
-            return luaL_error(L, "hypr3d.config: player.model must be a string");
-        {
+        // Legacy single keys, kept as a fallback for older configs. Applied
+        // ONLY when the key is actually present: model_scale used to rebuild
+        // the scale as {x, x, x} on every parse, silently collapsing the
+        // mesh block's per-axis transform.scale.
+        lua_getfield(L, idx, "model");
+        if (!lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+            if (!SET_STRING(idx, "model", g_playerCfg.path, "player.model"))
+                return luaL_error(L, "hypr3d.config: player.model must be a string");
+        } else {
+            lua_pop(L, 1);
+        }
+        lua_getfield(L, idx, "model_scale");
+        if (!lua_isnil(L, -1)) {
+            lua_pop(L, 1);
             float SCALE_F = g_playerCfg.scale.x;
             if (!SET_NUM(idx, "model_scale", SCALE_F, "player.model_scale"))
                 return luaL_error(L, "hypr3d.config: player.model_scale must be a number");
             g_playerCfg.scale = Vec3{SCALE_F, SCALE_F, SCALE_F};
+        } else {
+            lua_pop(L, 1);
         }
-        if (!SET_NUM(idx, "model_turn", g_playerCfg.rotDeg.y, "player.model_turn"))
-            return luaL_error(L, "hypr3d.config: player.model_turn must be a number");
+        lua_getfield(L, idx, "model_turn");
+        if (!lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+            if (!SET_NUM(idx, "model_turn", g_playerCfg.rotDeg.y, "player.model_turn"))
+                return luaL_error(L, "hypr3d.config: player.model_turn must be a number");
+        } else {
+            lua_pop(L, 1);
+        }
 
         const auto SET_ANIM = [&](const char* key, int slot) -> bool {
             lua_getfield(L, idx, key);

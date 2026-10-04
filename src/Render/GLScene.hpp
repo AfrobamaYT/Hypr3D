@@ -153,7 +153,7 @@ class GLScene {
         std::string path;
         Vec3 position{}, rotationDeg{}, scale{1.0f, 1.0f, 1.0f};
         float emissiveScale = 1.0f;
-        bool flat = true;
+        bool flat = false; // false = headlight half-lambert shading
         CMapModel::ECenter center = CMapModel::ECenter::Logical;
         Vec3 centerOffset{};
     };

@@ -373,6 +373,7 @@ static constexpr float kZoomBase = 2.0f;
 
 // F5 view modes: 0 first person, 1 third person behind, 2 third person front.
 static int g_viewMode = 0;
+static float g_playerCamDist = 0.f; // smoothed third-person distance
 static constexpr float kThirdDist = 2.5f;
 
 // Per-object collision trees (see update3D): one small BVH per scene
@@ -2847,18 +2848,47 @@ static void update3D(float dt) {
             // sweeps the horizontal ring, pitch lifts/drops the camera
             // around the anchor (behind on 0 pitch, above on negative,
             // below on positive), at the same eye level as first person on
-            // the zero pitch.
+            // the zero pitch. Collision-aware: a ray from the head toward
+            // the orbit position pulls the camera in front of walls.
             if (g_viewMode != 0) {
                 const Vec3 ORBIT_EYE{PPOS.GetX(),
                                      PPOS.GetY() + PLAYER_EYE_OFF,
                                      PPOS.GetZ()};
                 const Vec3 FLAT = CAM.flatForward();
                 const float P = CAM.pitch;
-                const Vec3 DIR =
+                Vec3 DIR =
                     FLAT * (-std::cos(P)) + Vec3{0.f, 1.f, 0.f} * (-std::sin(P));
-                Vec3 WANT = ORBIT_EYE + DIR * kThirdDist;
                 if (g_viewMode == 2)
-                    WANT = ORBIT_EYE - DIR * kThirdDist;
+                    DIR.x *= -1.f, DIR.y *= -1.f, DIR.z *= -1.f;
+
+                // The distance glides toward the full orbit radius, but is
+                // CLAMPED by the ray each frame: the ray probes the FULL
+                // orbit distance, and the camera never sits beyond the hit
+                // (a hand's width before the wall). Turning changes the hit
+                // distance gradually, so the camera slides along walls; the
+                // pop-out glides; the push-in can never cross.
+                g_playerCamDist += (kThirdDist - g_playerCamDist) *
+                    (1.0f - std::exp(-8.0f * dt));
+
+                if (kThirdDist > 1e-4f) {
+                    const JPH::RRayCast RAY{
+                        JPH::RVec3(ORBIT_EYE.x, ORBIT_EYE.y, ORBIT_EYE.z),
+                        JPH::Vec3(DIR.x * kThirdDist, DIR.y * kThirdDist,
+                                  DIR.z * kThirdDist)};
+                    JPH::RayCastResult HIT;
+                    const JPH::IgnoreSingleBodyFilter SKIP_SELF(g_playerBody);
+                    if (g_joltSystem->GetNarrowPhaseQuery().CastRay(
+                            RAY, HIT, JPH::BroadPhaseLayerFilter(),
+                            JPH::ObjectLayerFilter(), SKIP_SELF)) {
+                        g_playerCamDist = std::min(
+                            g_playerCamDist,
+                            std::max(0.05f,
+                                     HIT.mFraction * kThirdDist - 0.15f));
+                    }
+                }
+                g_playerCamDist = std::max(g_playerCamDist, 0.05f);
+
+                const Vec3 WANT = ORBIT_EYE + DIR * g_playerCamDist;
 
                 if (WANT.x != CAM.position.x || WANT.y != CAM.position.y ||
                     WANT.z != CAM.position.z) {

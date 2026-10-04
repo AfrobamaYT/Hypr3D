@@ -1,6 +1,6 @@
 # Hypr3D =^..^=
 
-![alt text](images/Screenshot.png)
+![alt text](images/Screenshot1.png)
 
 **A new perspective on window management -- literally.**
 A Hyprland plugin that turns your workspace into a walkable 3D space

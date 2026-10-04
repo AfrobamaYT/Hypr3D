@@ -1437,9 +1437,9 @@ void GLScene::drawPanorama(float aspect) {
 
     glUseProgram(m_panoramaProgram);
 
-    const Vec3 FWD   = m_camera.forward();
-    const Vec3 RIGHT = m_camera.right();
-    const Vec3 UP    = cross(RIGHT, FWD);
+    Vec3 FWD   = m_camera.forward();
+    Vec3 RIGHT = m_camera.right();
+    Vec3 UP    = cross(RIGHT, FWD);
     // Zoomed fov (C key): the panorama must narrow with the scene, so its
     // half-tangent divides by the magnification exactly like the render
     // projection's fov does.
@@ -1451,8 +1451,16 @@ void GLScene::drawPanorama(float aspect) {
     // stays level while the scene rolls. Matches Camera::view(): screen up
     // = UP*cos(r) + RIGHT*sin(r), screen right = RIGHT*cos(r) - UP*sin(r).
     const float RROLL = m_camera.roll;
-    const Vec3 RRIGHT = RIGHT * std::cos(RROLL) - UP * std::sin(RROLL);
-    const Vec3 RUP    = UP * std::cos(RROLL) + RIGHT * std::sin(RROLL);
+    Vec3 RRIGHT = RIGHT * std::cos(RROLL) - UP * std::sin(RROLL);
+    Vec3 RUP    = UP * std::cos(RROLL) + RIGHT * std::sin(RROLL);
+
+    // The front third-person view looks BACK along the look axis: the view
+    // matrix and the world flip with it, and the panorama's pixel->ray
+    // basis must flip too (direction and screen right; the up stays).
+    if (m_camera.mirrorView) {
+        FWD   = FWD * -1.0f;
+        RRIGHT = RRIGHT * -1.0f;
+    }
 
     // Analytic mip level: texels per screen pixel at the view centre. The
     // panorama is W texels around 2*pi radians; one screen pixel spans about

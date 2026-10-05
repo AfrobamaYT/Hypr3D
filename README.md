@@ -154,6 +154,7 @@ Everything is optional -- only set what you want to change.
 | ----------| --------| ---------| -----------------------------------------|
 | panorama | string | ""      | 360° background image (equirectangular) |
 | grid     | bool   | true    | the starting 40x40 platform             |
+| monitor  | string | ""      | render the 3D view on this monitor (e.g. "DP-1") instead of the focused one |
 
 ### Windows
 
@@ -161,7 +162,7 @@ Everything is optional -- only set what you want to change.
 | ----------------| -------| ---------| -----------------------------------------|
 | window_scale   | float | 0.5     | window size multiplier (at 100 px/m)    |
 | spawn_distance | float | 5.0     | how far from you new windows appear (m) |
-| depth          |    float   |  0.05       |                                         |
+| depth          | float | 0.05    | window slab thickness in world units (0 = flat quads); the walls follow the window's rounded corners and are painted with the texture's edge colors |
 
 ### Player
 

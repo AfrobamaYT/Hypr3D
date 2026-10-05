@@ -1532,11 +1532,20 @@ void GLScene::drawWindows(
     // World-space polygons for the visible windows (the unit quad's corners
     // run through each window's model matrix; uvRect is folded into the
     // corner UVs). A depth slab adds the back face and one wall quad per
-    // silhouette segment to the same list, so the BSP orders everything
-    // (including walls crossing a neighbouring window's plane) and the
-    // blend order stays per-pixel correct.
-    std::vector<SWPoly> polys;
-    const Vec3 EYE = m_camera.position;
+    // silhouette segment; the slab's interior is kept SEPARATE from the
+    // content face and assembled after all faces -- see the invariant at
+    // the assembly below.
+    struct SWinSlab {
+        SWPoly              front{}; // the content face
+        SWPoly              back{};  // the mirrored content face
+        std::vector<SWPoly> inner;   // the walls
+        float               dist = 0.f;
+        bool                fromBehind = false; // eye on the back side
+    };
+    std::vector<SWinSlab> slabs;
+    slabs.reserve(windows.size());
+
+    const Vec3 eye = m_camera.position;
 
     for (const auto& window : windows) {
         if (!window.texture)
@@ -1570,9 +1579,9 @@ void GLScene::drawWindows(
         const float LX[4] = {-0.5f, 0.5f, 0.5f, -0.5f};
         const float LY[4] = {-0.5f, -0.5f, 0.5f, 0.5f};
 
-        SWPoly poly;
-        poly.tex   = window.texture;
-        poly.alpha = window.alpha;
+        SWinSlab slab;
+        slab.front.tex   = window.texture;
+        slab.front.alpha = window.alpha;
 
         for (int c = 0; c < 4; ++c) {
             SWVert V{
@@ -1580,8 +1589,15 @@ void GLScene::drawWindows(
                 window.u0 + (window.u1 - window.u0) * CU[c],
                 window.v0 + (window.v1 - window.v0) * CV[c],
             };
-            poly.verts.push_back(V);
+            slab.front.verts.push_back(V);
         }
+
+        // Which side of the window the eye is on: the slab's painter order
+        // flips with it (see the assembly below).
+        const Vec3 NORMAL =
+            normalize(Vec3{model.m[8], model.m[9], model.m[10]});
+        slab.fromBehind =
+            dot(eye - Vec3{window.x, window.y, window.z}, NORMAL) < 0.0f;
 
         // --- depth slab -----------------------------------------------------
         // Extruded backwards along the window's normal: the front face keeps
@@ -1591,14 +1607,14 @@ void GLScene::drawWindows(
         // samples its silhouette texel -- the window texture's edge colors
         // paint the whole side.
         if (window.depth > 0.0f) {
-            const Vec3 NORMAL =
-                normalize(Vec3{model.m[8], model.m[9], model.m[10]});
             const float DEPTH = window.depth;
 
-            // Back face: the slab's rear side, sampling the same subrect.
-            SWPoly back;
-            back.tex   = window.texture;
-            back.alpha = window.alpha;
+            // Back face: the mirrored content quad at the rear plane. It
+            // renders ONLY for an eye on the back side (see the assembly):
+            // each content face is visible exclusively from its own side,
+            // so the two never stack through a translucent window.
+            slab.back.tex   = window.texture;
+            slab.back.alpha = window.alpha;
 
             for (int c = 0; c < 4; ++c) {
                 SWVert V{
@@ -1606,10 +1622,8 @@ void GLScene::drawWindows(
                     window.u0 + (window.u1 - window.u0) * CU[c],
                     window.v0 + (window.v1 - window.v0) * CV[c],
                 };
-                back.verts.push_back(V);
+                slab.back.verts.push_back(V);
             }
-
-            polys.push_back(std::move(back));
 
             const auto SUBRECT_UV = [&window](const Vec2& P) {
                 return Vec2{
@@ -1623,16 +1637,17 @@ void GLScene::drawWindows(
 
             // Wall loops: the traced silhouette when available, else the
             // plain box outline (first frames before a mask was read back).
+            //
+            // Every segment is emitted TWICE-SIDED -- no facing test: a
+            // translucent window must show its FAR walls through the front
+            // face (they blend in BSP order, far first), and for opaque
+            // windows the hidden walls are simply depth-rejected by the
+            // front face drawn after them.
             const auto EMIT_WALLS = [&](const std::vector<Vec2>& pts,
                                         const std::vector<Vec2>& uvs) {
                 const size_t N = pts.size();
                 if (N < 3)
                     return;
-
-                Vec3 centroid{};
-                for (const auto& P : pts)
-                    centroid += WORLD(P.x - 0.5f, 0.5f - P.y, 0.f);
-                centroid = centroid * (1.0f / static_cast<float>(N));
 
                 for (size_t i = 0; i < N; ++i) {
                     const Vec2& A  = pts[i];
@@ -1642,19 +1657,6 @@ void GLScene::drawWindows(
 
                     const Vec3 AF = WORLD(A.x - 0.5f, 0.5f - A.y, 0.f);
                     const Vec3 BF = WORLD(B.x - 0.5f, 0.5f - B.y, 0.f);
-                    const Vec3 MID = (AF + BF) * 0.5f;
-
-                    // Outward side of this wall: away from the loop's
-                    // centroid, inside the quad plane.
-                    Vec3 OUT = normalize(cross(NORMAL, BF - AF));
-                    if (dot(OUT, centroid - MID) > 0.0f)
-                        OUT = OUT * -1.0f;
-
-                    // Back-facing wall: the slab itself hides it from this
-                    // eye (culling is off for the whole pass, so skip it
-                    // instead of paying the overdraw).
-                    if (dot(OUT, EYE - MID) <= 0.0f)
-                        continue;
 
                     const Vec2 SUA = SUBRECT_UV(UA);
                     const Vec2 SUB = SUBRECT_UV(UB);
@@ -1670,7 +1672,7 @@ void GLScene::drawWindows(
                     wall.verts.push_back(
                         SWVert{AF - NORMAL * DEPTH, SUA.x, SUA.y});
 
-                    polys.push_back(std::move(wall));
+                    slab.inner.push_back(std::move(wall));
                 }
             };
 
@@ -1687,31 +1689,46 @@ void GLScene::drawWindows(
             }
         }
 
-        polys.push_back(std::move(poly));
+        const float DX = slab.front.verts[0].p.x - eye.x;
+        const float DY = slab.front.verts[0].p.y - eye.y;
+        const float DZ = slab.front.verts[0].p.z - eye.z;
+        slab.dist = DX * DX + DY * DY + DZ * DZ;
+
+        slabs.push_back(std::move(slab));
+    }
+
+    // Painter-order assembly, windows far-to-near (coplanar overlapping
+    // faces blend far first). Within a window the surfaces are ordered
+    // far-to-near FOR THE EYE'S SIDE OF THE SLAB -- walls then face from
+    // the front; face then walls from behind. This order survives the BSP
+    // unchanged for all non-crossing polys (the builder files every
+    // behind-or-on-plane poly into the node's coplanar list in insertion
+    // order), so whichever surface is farthest blends FIRST and a
+    // translucent slab shows its far walls through the near face from BOTH
+    // sides -- no ordering luck. Genuinely crossing polys are still split
+    // by the node planes as before.
+    std::sort(
+        slabs.begin(),
+        slabs.end(),
+        [](const SWinSlab& a, const SWinSlab& b) { return a.dist > b.dist; });
+
+    std::vector<SWPoly> polys;
+    polys.reserve(slabs.size() * 8);
+
+    for (auto& S : slabs) {
+        // Walls first, then the content face the eye is actually on: the
+        // other content face is not emitted at all, so the two never stack
+        // through a translucent window -- from the front you see the front
+        // face (plus the far walls through it), from behind the back face
+        // (plus the far walls through it).
+        for (auto& P : S.inner)
+            polys.push_back(std::move(P));
+
+        polys.push_back(std::move(S.fromBehind ? S.back : S.front));
     }
 
     if (polys.empty())
         return;
-
-    // Far-to-near insertion order: coplanar overlapping windows (which the
-    // BSP keeps in insertion order) then blend far first, like the sort the
-    // old painter path used.
-    const Vec3 eye = m_camera.position;
-
-    std::sort(
-        polys.begin(),
-        polys.end(),
-        [&eye](const SWPoly& a, const SWPoly& b) {
-            const float ax = a.verts[0].p.x - eye.x;
-            const float ay = a.verts[0].p.y - eye.y;
-            const float az = a.verts[0].p.z - eye.z;
-            const float bx = b.verts[0].p.x - eye.x;
-            const float by = b.verts[0].p.y - eye.y;
-            const float bz = b.verts[0].p.z - eye.z;
-            return ax * ax + ay * ay + az * az >
-                   bx * bx + by * by + bz * bz;
-        }
-    );
 
     // Exact ordering: split crossing quads along each other's planes and
     // traverse back-to-front from the eye.

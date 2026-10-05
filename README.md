@@ -237,11 +237,15 @@ Vectors can be written either way: `{ x = 1, y = 2, z = 3 }` or just `{ 1, 2, 3 
 # Screenshots
 <table>
   <tr>
-    <td align="center" width="25%"><a href="previews/macos.png"><img src="images/Screenshot5.png" alt="NORY для macOS"></a></td>
-    <td align="center" width="25%"><a href="previews/windows.jpg"><img src="images/Screenshot4.png" alt="NORY для Windows"></a></td>
+    <td align="center" width="25%"><img src="images/Screenshot5.png" alt="screenshot"></a></td>
+    <td align="center" width="25%"><img src="images/Screenshot4.png" alt="screenshot"></a></td>
   </tr>
   <tr>
-    <td align="center" width="25%"><a href="previews/linux.jpg"><img src="images/Screenshot2.png" alt="NORY для Linux"></a></td>
-    <td align="center" width="25%"><a href="previews/android.jpg"><img src="images/Screenshot3.png" alt="NORY для Android"></a></td>
+    <td align="center" width="25%"><img src="images/Screenshot2.png" alt="screenshot"></a></td>
+    <td align="center" width="25%"><img src="images/Screenshot3.png" alt="Nscreenshot"></a></td>
+  </tr>
+<tr>
+    <td align="center" width="25%"><img src="images/Screenshot6.png" alt="screenshot"></a></td>
+    <td align="center" width="25%"><img src="images/Screenshot7.png" alt="screenshot"></a></td>
   </tr>
 </table>

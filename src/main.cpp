@@ -127,6 +127,12 @@ struct SWinOutline {
 };
 static std::unordered_map<std::uintptr_t, SWinOutline> g_winOutlines;
 
+// Set when a resize gesture ends: the next capture pass makes one FORCED
+// snapshot of that window, so the wall silhouette runs its full-resolution
+// "box settled" refresh -- an idle window would otherwise never snapshot
+// again and keep the last mid-drag (reduced-resolution) outline.
+static std::uintptr_t g_skirtFinalRefreshId = 0;
+
 // The window that currently owns keyboard focus, as the aim logic last set it.
 static std::uintptr_t g_lastFocusId = 0;
 
@@ -1141,6 +1147,8 @@ static void refreshCaptures(
     const auto FOCUSED = Compat::focusedWindow();
     const std::uintptr_t FOCUSED_ID = FOCUSED ? Compat::windowId(FOCUSED) : 0;
 
+    bool consumedSkirt = false;
+
     for (const auto& info : infos) {
         // Focus-change feedback (the active/inactive opacity fade and the
         // border color tween) is compositor-side -- no client commit happens,
@@ -1190,11 +1198,24 @@ static void refreshCaptures(
             (g_resize.active && g_resize.id == info.id) ||
             info.id == FOCUSED_ID;
 
+        bool consumedSkirt = false;
+
+        // The frame after a resize gesture ended: one forced snapshot, whose
+        // only purpose is the settled full-resolution silhouette refresh.
+        bool finalSkirt = false;
+        if (info.id == g_skirtFinalRefreshId) {
+            finalSkirt = true;
+            consumedSkirt = true;
+        }
+
         if (info.isLayer)
-            g_capture.makeSnapshotLayer(info.layer, mon, FORCE);
+            g_capture.makeSnapshotLayer(info.layer, mon, FORCE || finalSkirt);
         else
-            g_capture.makeSnapshot(info.window, mon, FORCE);
+            g_capture.makeSnapshot(info.window, mon, FORCE || finalSkirt);
     }
+
+    if (consumedSkirt)
+        g_skirtFinalRefreshId = 0;
 
     ++g_captureFrames;
 }
@@ -1348,14 +1369,11 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         entity.surfaceWidth   = SNAPSHOT->surfaceSize.x;
         entity.surfaceHeight  = SNAPSHOT->surfaceSize.y;
 
-        // Depth-slab silhouette for WINDOWS: an analytic rounded rectangle
-        // of the decorated box -- the corner radius the compositor reports
-        // plus the border inset (the content sits that far inside the box,
-        // and the border's outer edge rounds at radius + border). The
-        // snapshot's alpha channel cannot be read back reliably (GPU
-        // sampling sees opaque content, glReadPixels returns garbage), so
-        // the slab silhouette is derived from the window geometry instead.
-        // Layers keep their mask-traced outlines (their readback works).
+        // Depth-slab FALLBACK silhouette for WINDOWS: an analytic rounded
+        // rectangle of the decorated box -- the corner radius the compositor
+        // reports plus the border inset. Used only when the texture-traced
+        // outline is unavailable (the GPU copy failed or found no shape);
+        // the primary source lives in the capture layer.
         if (!info.isLayer && info.window) {
             const float R = std::max(
                 0.0f, info.window->rounding() +
@@ -1505,16 +1523,19 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
 
         render.alpha = IS_FS_WINDOW ? 1.0f : g_fsFade;
 
-        // Depth slab (windows.depth): walls hug the window's rounded-rect
-        // silhouette for windows (analytic -- the snapshot alpha is not
-        // readable), the traced alpha mask for layers. Shared pointers, no
-        // per-frame copies.
+        // Depth slab (windows.depth): silhouette source priority -- the
+        // outline traced from the snapshot texture's real alpha (exact
+        // corner shape; the GPU-side copy is the only reliable read), then
+        // the analytic rounded rect (mask refresh failures, first frames),
+        // then GLScene's plain box.
         render.depth = g_cfgWindowDepth;
 
-        if (auto IT = g_winOutlines.find(entity.id); IT != g_winOutlines.end())
-            render.outlines = IT->second.loops;
-        else
+        if (SNAPSHOT->outlines && !SNAPSHOT->outlines->empty())
             render.outlines = SNAPSHOT->outlines;
+        else if (auto IT = g_winOutlines.find(entity.id);
+                 IT != g_winOutlines.end() && IT->second.loops &&
+                 !IT->second.loops->empty())
+            render.outlines = IT->second.loops;
 
         // The snapshot framebuffer covers the whole monitor, so the window is
         // a subrect of it. Hyprland renders its framebuffers with logical Y
@@ -2257,6 +2278,13 @@ static void resetPointerGesture() {
     g_pointerDown = false;
     g_pointerGesture = EPointerGesture::None;
     g_pointerButton = 0;
+
+    // A finished resize gesture: schedule one forced snapshot of the resized
+    // window for the next capture pass -- its purpose is the silhouette's
+    // settled full-resolution refresh (see CWindowCapture::refreshSkirtMask).
+    if (g_resize.active)
+        g_skirtFinalRefreshId = g_resize.id;
+
     g_resize = {};
     // A finished roll gesture restores the object's gravity.
     endModelRoll();
@@ -3403,8 +3431,9 @@ static void dumpStatus() {
     out << "renderWindows=" << g_renderWindows.size() << "\n";
 
     // Window-depth pipeline trace: the configured thickness and the
-    // silhouette each window draws its walls from (windows: analytic
-    // rounded rect; layers: traced from the picking mask).
+    // silhouette each window draws its walls from (windows: traced from the
+    // snapshot texture via the GPU copy, fallback analytic; layers: traced
+    // from the picking mask). skirt=0/err=N says the copy failed and why.
     for (const auto& RW : g_renderWindows) {
         out << "  rwin=" << RW.id << " depth=" << RW.depth
             << " outlines=" << (RW.outlines ? (long)RW.outlines->size() : -1);
@@ -3415,6 +3444,11 @@ static void dumpStatus() {
             if (!L.pts.empty())
                 out << " p0=" << L.pts[0].x << "," << L.pts[0].y;
         }
+
+        if (const auto* SN = g_capture.get(RW.id))
+            out << " skirt=" << (SN->skirtValid ? 1 : 0)
+                << " err=" << SN->skirtError
+                << " mask=" << SN->skirtW << "x" << SN->skirtH;
 
         out << "\n";
     }

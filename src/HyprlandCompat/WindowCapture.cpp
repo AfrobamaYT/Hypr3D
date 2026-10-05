@@ -434,6 +434,13 @@ bool CWindowCapture::makeSnapshotLayer(const PHLLS& layer, const PHLMONITOR& mon
             snapshot.alphaW     = MW;
             snapshot.alphaH     = MH;
             snapshot.alphaValid = true;
+
+            // The same mask doubles as the depth-slab silhouette source:
+            // bars and panels get contour-hugging walls for free.
+            snapshot.outlines =
+                std::make_shared<const std::vector<H3D::SOutlineLoop>>(
+                    H3D::traceOutlines(snapshot.alphaMask.data(), MW, MH, 64,
+                                       1.5f, 4, 128));
         }
     }
 

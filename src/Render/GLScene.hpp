@@ -3,6 +3,7 @@
 #include "Render/MapModel.hpp"
 #include "Render/PlayerModel.hpp"
 #include "World/Camera.hpp"
+#include "World/Outline.hpp"
 #include "World/Picking.hpp"
 
 #include <cstdint>
@@ -44,6 +45,15 @@ class GLScene {
         float u0 = 0.f, v0 = 0.f, u1 = 1.f, v1 = 1.f;
 
         float alpha = 1.0f;
+
+        // Depth slab: thickness in world units, extruded BACKWARDS along the
+        // window's normal (0 = the plain flat quad). When `outlines` carries
+        // the captured alpha's silhouette, the slab's walls hug that shape --
+        // rounded corners stay rounded -- and each wall samples its own
+        // silhouette texel, so the window texture's edge colors paint the
+        // sides. Without an outline the slab is a plain box.
+        float depth = 0.0f;
+        std::shared_ptr<const std::vector<SOutlineLoop>> outlines;
     };
 
     GLScene();

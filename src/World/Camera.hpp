@@ -5,6 +5,11 @@
 
 namespace H3D {
 
+struct Vec2 {
+    float x = 0.f;
+    float y = 0.f;
+};
+
 struct Vec3 {
     float x = 0.f;
     float y = 0.f;

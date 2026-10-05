@@ -4,7 +4,10 @@
 #include <hyprland/src/desktop/DesktopTypes.hpp>
 #include <hyprland/src/render/Framebuffer.hpp>
 
+#include "World/Outline.hpp"
+
 #include <cstdint>
+#include <memory>
 #include <unordered_map>
 
 namespace H3D::Compat {
@@ -57,6 +60,14 @@ class CWindowCapture {
         int  alphaH     = 0;
         bool alphaValid = false;
         unsigned int maskAge = 0;
+
+        // Depth-slab silhouette for LAYER surfaces: closed outlines of the
+        // captured alpha in normalized box coords (row 0 = top), traced
+        // from the picking alphaMask when it refreshes. Window snapshots'
+        // alpha cannot be read back reliably, so windows derive their
+        // silhouette analytically in main.cpp instead. Shared, so the
+        // per-frame WindowRender list just bumps the pointer.
+        std::shared_ptr<const std::vector<H3D::SOutlineLoop>> outlines;
 
         // Identity of the client's last-committed buffer at snapshot time:
         // the cheap "did the content change" signal between frames.

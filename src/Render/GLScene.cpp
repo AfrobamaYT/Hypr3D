@@ -1531,8 +1531,12 @@ void GLScene::drawWindows(
 ) {
     // World-space polygons for the visible windows (the unit quad's corners
     // run through each window's model matrix; uvRect is folded into the
-    // corner UVs).
+    // corner UVs). A depth slab adds the back face and one wall quad per
+    // silhouette segment to the same list, so the BSP orders everything
+    // (including walls crossing a neighbouring window's plane) and the
+    // blend order stays per-pixel correct.
     std::vector<SWPoly> polys;
+    const Vec3 EYE = m_camera.position;
 
     for (const auto& window : windows) {
         if (!window.texture)
@@ -1551,6 +1555,16 @@ void GLScene::drawWindows(
             Mat4::rotationZ(window.roll) *
             Mat4::scale({window.width, window.height, 1.0f});
 
+        // Local quad point -> world, through the model matrix columns (the
+        // scale in m[12..] means this is NOT a plain matrix*vec).
+        const auto WORLD = [&model](float lx, float ly, float lz) {
+            return Vec3{
+                model.m[0] * lx + model.m[4] * ly + model.m[8] * lz + model.m[12],
+                model.m[1] * lx + model.m[5] * ly + model.m[9] * lz + model.m[13],
+                model.m[2] * lx + model.m[6] * ly + model.m[10] * lz + model.m[14],
+            };
+        };
+
         const float CU[4] = {0.f, 1.f, 1.f, 0.f};
         const float CV[4] = {0.f, 0.f, 1.f, 1.f};
         const float LX[4] = {-0.5f, 0.5f, 0.5f, -0.5f};
@@ -1561,20 +1575,116 @@ void GLScene::drawWindows(
         poly.alpha = window.alpha;
 
         for (int c = 0; c < 4; ++c) {
-            const Vec3 LOCAL{LX[c], LY[c], 0.f};
             SWVert V{
-                Vec3{
-                    model.m[0] * LOCAL.x + model.m[4] * LOCAL.y +
-                        model.m[8] * LOCAL.z + model.m[12],
-                    model.m[1] * LOCAL.x + model.m[5] * LOCAL.y +
-                        model.m[9] * LOCAL.z + model.m[13],
-                    model.m[2] * LOCAL.x + model.m[6] * LOCAL.y +
-                        model.m[10] * LOCAL.z + model.m[14],
-                },
+                WORLD(LX[c], LY[c], 0.f),
                 window.u0 + (window.u1 - window.u0) * CU[c],
                 window.v0 + (window.v1 - window.v0) * CV[c],
             };
             poly.verts.push_back(V);
+        }
+
+        // --- depth slab -----------------------------------------------------
+        // Extruded backwards along the window's normal: the front face keeps
+        // its exact plane, so picking, input mapping and collision geometry
+        // are untouched. Walls hug the captured alpha silhouette (when one
+        // was traced), so rounded corners keep their shape, and every wall
+        // samples its silhouette texel -- the window texture's edge colors
+        // paint the whole side.
+        if (window.depth > 0.0f) {
+            const Vec3 NORMAL =
+                normalize(Vec3{model.m[8], model.m[9], model.m[10]});
+            const float DEPTH = window.depth;
+
+            // Back face: the slab's rear side, sampling the same subrect.
+            SWPoly back;
+            back.tex   = window.texture;
+            back.alpha = window.alpha;
+
+            for (int c = 0; c < 4; ++c) {
+                SWVert V{
+                    WORLD(LX[c], LY[c], 0.f) - NORMAL * DEPTH,
+                    window.u0 + (window.u1 - window.u0) * CU[c],
+                    window.v0 + (window.v1 - window.v0) * CV[c],
+                };
+                back.verts.push_back(V);
+            }
+
+            polys.push_back(std::move(back));
+
+            const auto SUBRECT_UV = [&window](const Vec2& P) {
+                return Vec2{
+                    window.u0 + (window.u1 - window.u0) * P.x,
+                    // Outline y is top-down (row 0 = the box's top), and v1
+                    // is the subrect's top edge: v runs from v1 (y=0) to
+                    // v0 (y=1).
+                    window.v1 + (window.v0 - window.v1) * P.y,
+                };
+            };
+
+            // Wall loops: the traced silhouette when available, else the
+            // plain box outline (first frames before a mask was read back).
+            const auto EMIT_WALLS = [&](const std::vector<Vec2>& pts,
+                                        const std::vector<Vec2>& uvs) {
+                const size_t N = pts.size();
+                if (N < 3)
+                    return;
+
+                Vec3 centroid{};
+                for (const auto& P : pts)
+                    centroid += WORLD(P.x - 0.5f, 0.5f - P.y, 0.f);
+                centroid = centroid * (1.0f / static_cast<float>(N));
+
+                for (size_t i = 0; i < N; ++i) {
+                    const Vec2& A  = pts[i];
+                    const Vec2& B  = pts[(i + 1) % N];
+                    const Vec2& UA = uvs[i];
+                    const Vec2& UB = uvs[(i + 1) % N];
+
+                    const Vec3 AF = WORLD(A.x - 0.5f, 0.5f - A.y, 0.f);
+                    const Vec3 BF = WORLD(B.x - 0.5f, 0.5f - B.y, 0.f);
+                    const Vec3 MID = (AF + BF) * 0.5f;
+
+                    // Outward side of this wall: away from the loop's
+                    // centroid, inside the quad plane.
+                    Vec3 OUT = normalize(cross(NORMAL, BF - AF));
+                    if (dot(OUT, centroid - MID) > 0.0f)
+                        OUT = OUT * -1.0f;
+
+                    // Back-facing wall: the slab itself hides it from this
+                    // eye (culling is off for the whole pass, so skip it
+                    // instead of paying the overdraw).
+                    if (dot(OUT, EYE - MID) <= 0.0f)
+                        continue;
+
+                    const Vec2 SUA = SUBRECT_UV(UA);
+                    const Vec2 SUB = SUBRECT_UV(UB);
+
+                    SWPoly wall;
+                    wall.tex   = window.texture;
+                    wall.alpha = window.alpha;
+
+                    wall.verts.push_back(SWVert{AF, SUA.x, SUA.y});
+                    wall.verts.push_back(SWVert{BF, SUB.x, SUB.y});
+                    wall.verts.push_back(
+                        SWVert{BF - NORMAL * DEPTH, SUB.x, SUB.y});
+                    wall.verts.push_back(
+                        SWVert{AF - NORMAL * DEPTH, SUA.x, SUA.y});
+
+                    polys.push_back(std::move(wall));
+                }
+            };
+
+            if (window.outlines && !window.outlines->empty()) {
+                for (const auto& LOOP : *window.outlines)
+                    EMIT_WALLS(LOOP.pts, LOOP.uvs);
+            } else {
+                // No silhouette traced (yet) -- the mask readback may fail
+                // legitimately. The slab must never lose its sides: fall
+                // back to the plain box outline.
+                static const std::vector<Vec2> RECT = {
+                    {0.f, 0.f}, {1.f, 0.f}, {1.f, 1.f}, {0.f, 1.f}};
+                EMIT_WALLS(RECT, RECT);
+            }
         }
 
         polys.push_back(std::move(poly));
@@ -1650,20 +1760,35 @@ void GLScene::drawWindows(
 
     glActiveTexture(GL_TEXTURE0);
 
-    for (const auto& P : ordered) {
-        std::vector<float> verts;
-        verts.reserve(P.verts.size() * 5);
+    // Consecutive polys with the same texture and alpha merge into ONE
+    // upload + draw: a depth slab adds ~100 wall quads per window, and a
+    // draw call per wall quad would sink the frame. Only CONSECUTIVE polys
+    // group, so the BSP's back-to-front blend order is untouched -- batches
+    // interleave exactly where windows overlap.
+    std::vector<float> verts;
 
-        for (size_t i = 1; i + 1 < P.verts.size(); ++i) {
-            const auto& A = P.verts[0];
-            const auto& B = P.verts[i];
-            const auto& C = P.verts[i + 1];
+    for (size_t i = 0; i < ordered.size();) {
+        size_t j = i;
+        while (j < ordered.size() && ordered[j].tex == ordered[i].tex &&
+               ordered[j].alpha == ordered[i].alpha)
+            ++j;
 
-            verts.insert(verts.end(), {
-                A.p.x, A.p.y, A.p.z, A.u, A.v,
-                B.p.x, B.p.y, B.p.z, B.u, B.v,
-                C.p.x, C.p.y, C.p.z, C.u, C.v,
-            });
+        verts.clear();
+
+        for (size_t k = i; k < j; ++k) {
+            const auto& P = ordered[k];
+
+            for (size_t v = 1; v + 1 < P.verts.size(); ++v) {
+                const auto& A = P.verts[0];
+                const auto& B = P.verts[v];
+                const auto& C = P.verts[v + 1];
+
+                verts.insert(verts.end(), {
+                    A.p.x, A.p.y, A.p.z, A.u, A.v,
+                    B.p.x, B.p.y, B.p.z, B.u, B.v,
+                    C.p.x, C.p.y, C.p.z, C.u, C.v,
+                });
+            }
         }
 
         glBufferData(GL_ARRAY_BUFFER,
@@ -1676,12 +1801,14 @@ void GLScene::drawWindows(
                               reinterpret_cast<void*>(3 * sizeof(float)));
 
         glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, P.tex);
+        glBindTexture(GL_TEXTURE_2D, ordered[i].tex);
         glUniform1i(m_sceneTextured, 1);
-        glUniform4f(m_sceneColorUniform, 1.f, 1.f, 1.f, P.alpha);
+        glUniform4f(m_sceneColorUniform, 1.f, 1.f, 1.f, ordered[i].alpha);
 
         glDrawArrays(GL_TRIANGLES, 0,
                      static_cast<GLint>(verts.size() / 5));
+
+        i = j;
     }
 
     glBindVertexArray(0);

@@ -118,6 +118,15 @@ static bool g_ghosted = false;
 // What to draw this frame, rebuilt once per frame from the world.
 static std::vector<GLScene::WindowRender> g_renderWindows;
 
+// Per-window depth-slab silhouette (analytic rounded rectangle), rebuilt
+// when the captured box or the reported corner radius changes. Cleared with
+// the frame -- entries for closed windows die with it.
+struct SWinOutline {
+    int w = 0, h = 0, r = -1;
+    std::shared_ptr<const std::vector<SOutlineLoop>> loops;
+};
+static std::unordered_map<std::uintptr_t, SWinOutline> g_winOutlines;
+
 // The window that currently owns keyboard focus, as the aim logic last set it.
 static std::uintptr_t g_lastFocusId = 0;
 
@@ -300,6 +309,7 @@ static bool        g_cfgGrid = true;             // base grid platform on/off
 // --- windows ----------------------------------------------------------------
 static float       g_cfgWindowScale   = 0.5f;    // room multiplier on window size
 static float       g_cfgSpawnDistance = 5.0f;    // units in front of the camera
+static float       g_cfgWindowDepth   = 0.0f;    // slab thickness, 0 = flat quads
 
 // --- player -----------------------------------------------------------------
 static float       g_cfgLookInertia   = 0.03f;   // seconds, 0 = off
@@ -1278,6 +1288,8 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
     // frame -- see serviceCapture().
     const auto INFOS = Compat::enumerateEligibleWindows(mon);
 
+    g_winOutlines.clear();
+
     const float MONW = mon->m_size.x;
     const float MONH = mon->m_size.y;
 
@@ -1335,6 +1347,37 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         entity.surfaceOffsetY = SNAPSHOT->surfaceOffset.y;
         entity.surfaceWidth   = SNAPSHOT->surfaceSize.x;
         entity.surfaceHeight  = SNAPSHOT->surfaceSize.y;
+
+        // Depth-slab silhouette for WINDOWS: an analytic rounded rectangle
+        // of the decorated box -- the corner radius the compositor reports
+        // plus the border inset (the content sits that far inside the box,
+        // and the border's outer edge rounds at radius + border). The
+        // snapshot's alpha channel cannot be read back reliably (GPU
+        // sampling sees opaque content, glReadPixels returns garbage), so
+        // the slab silhouette is derived from the window geometry instead.
+        // Layers keep their mask-traced outlines (their readback works).
+        if (!info.isLayer && info.window) {
+            const float R = std::max(
+                0.0f, info.window->rounding() +
+                          static_cast<float>(SNAPSHOT->surfaceOffset.x));
+
+            auto& C = g_winOutlines[info.id];
+
+            if (!C.loops || C.w != static_cast<int>(BOX.w) ||
+                C.h != static_cast<int>(BOX.h) || C.r != static_cast<int>(R)) {
+                C.w = static_cast<int>(BOX.w);
+                C.h = static_cast<int>(BOX.h);
+                C.r = static_cast<int>(R);
+
+                SOutlineLoop LOOP =
+                    roundedRectLoop(BOX.w, BOX.h, R, 3.0f, 10);
+
+                C.loops = std::make_shared<const std::vector<SOutlineLoop>>(
+                    LOOP.pts.size() >= 3
+                        ? std::vector<SOutlineLoop>{std::move(LOOP)}
+                        : std::vector<SOutlineLoop>{});
+            }
+        }
 
         // Uniform window scale from config, applied to every entity every
         // frame so a runtime change resizes the whole room. The scale is
@@ -1461,6 +1504,17 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
             (LAST_FS_WIN && entity.id == Compat::windowId(LAST_FS_WIN));
 
         render.alpha = IS_FS_WINDOW ? 1.0f : g_fsFade;
+
+        // Depth slab (windows.depth): walls hug the window's rounded-rect
+        // silhouette for windows (analytic -- the snapshot alpha is not
+        // readable), the traced alpha mask for layers. Shared pointers, no
+        // per-frame copies.
+        render.depth = g_cfgWindowDepth;
+
+        if (auto IT = g_winOutlines.find(entity.id); IT != g_winOutlines.end())
+            render.outlines = IT->second.loops;
+        else
+            render.outlines = SNAPSHOT->outlines;
 
         // The snapshot framebuffer covers the whole monitor, so the window is
         // a subrect of it. Hyprland renders its framebuffers with logical Y
@@ -3347,6 +3401,24 @@ static void dumpStatus() {
         out << "scenePixel=unavailable\n";
 
     out << "renderWindows=" << g_renderWindows.size() << "\n";
+
+    // Window-depth pipeline trace: the configured thickness and the
+    // silhouette each window draws its walls from (windows: analytic
+    // rounded rect; layers: traced from the picking mask).
+    for (const auto& RW : g_renderWindows) {
+        out << "  rwin=" << RW.id << " depth=" << RW.depth
+            << " outlines=" << (RW.outlines ? (long)RW.outlines->size() : -1);
+
+        if (RW.outlines && !RW.outlines->empty()) {
+            const auto& L = (*RW.outlines)[0];
+            out << " pts=" << L.pts.size();
+            if (!L.pts.empty())
+                out << " p0=" << L.pts[0].x << "," << L.pts[0].y;
+        }
+
+        out << "\n";
+    }
+
     out << "renderGate=" << (g_lastRenderGate.empty() ? "none" : g_lastRenderGate)
         << "\n";
     out << "renderer=" << (g_pHyprRenderer ? "ok" : "NULL")
@@ -4170,6 +4242,10 @@ static int luaConfig(lua_State* L) {
     //     windows = {
     //         window_scale = 0.5,           -- room multiplier on window size
     //         spawn_distance = 5.0,         -- units in front of the camera
+    //         depth = 0.0,                  -- window slab thickness, world
+    //                                       -- units (0 = flat quads; walls
+    //                                       -- follow rounded corners and
+    //                                       -- show the texture's edge)
     //     },
     //     player = {
     //         look_sensitivity = 0.0025,    -- radians per pointer count
@@ -4195,7 +4271,7 @@ static int luaConfig(lua_State* L) {
     // })
     //
     // Missing keys keep their current value; wrong-typed keys raise a lua
-    // error. Numbers are clamped on set.
+    // error.
     if (!lua_istable(L, 1))
         return luaL_error(L, "hypr3d.config expects a single table");
 
@@ -4339,6 +4415,14 @@ static int luaConfig(lua_State* L) {
         if (!SET_NUM(idx, "spawn_distance", g_cfgSpawnDistance,
                      "windows.spawn_distance"))
             return luaL_error(L, "hypr3d.config: windows.spawn_distance must be a number");
+        if (!SET_NUM(idx, "depth", g_cfgWindowDepth,
+                     "windows.depth"))
+            return luaL_error(L, "hypr3d.config: windows.depth must be a number");
+
+        // Thickness is a distance: 0 (the default) draws the flat quads,
+        // anything below is clamped up to it.
+        g_cfgWindowDepth = std::max(0.0f, g_cfgWindowDepth);
+
         lua_pop(L, 1);
     }
 

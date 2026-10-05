@@ -1,10 +1,6 @@
 cmake_minimum_required(VERSION 3.27)
 
-<<<<<<< HEAD
 project(hypr3d LANGUAGES CXX)
-=======
-project(hypr3d LANGUAGES CXX)
->>>>>>> feature/player-model
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

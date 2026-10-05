@@ -315,7 +315,7 @@ static bool        g_cfgGrid = true;             // base grid platform on/off
 // --- windows ----------------------------------------------------------------
 static float       g_cfgWindowScale   = 0.5f;    // room multiplier on window size
 static float       g_cfgSpawnDistance = 5.0f;    // units in front of the camera
-static float       g_cfgWindowDepth   = 0.0f;    // slab thickness, 0 = flat quads
+static float       g_cfgWindowDepth   = 0.05f;   // slab thickness, 0 = flat quads
 
 // --- player -----------------------------------------------------------------
 static float       g_cfgLookInertia   = 0.03f;   // seconds, 0 = off
@@ -4276,7 +4276,7 @@ static int luaConfig(lua_State* L) {
     //     windows = {
     //         window_scale = 0.5,           -- room multiplier on window size
     //         spawn_distance = 5.0,         -- units in front of the camera
-    //         depth = 0.0,                  -- window slab thickness, world
+    //         depth = 0.05,                 -- window slab thickness, world
     //                                       -- units (0 = flat quads; walls
     //                                       -- follow rounded corners and
     //                                       -- show the texture's edge)

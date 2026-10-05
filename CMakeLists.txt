@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.27)
 
+<<<<<<< HEAD
 project(hypr3d LANGUAGES CXX)
+=======
+project(hypr3d LANGUAGES CXX)
+>>>>>>> feature/player-model
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -90,8 +94,10 @@ add_library(hypr3d SHARED
     src/main.cpp
     src/Render/GLScene.cpp
     src/Render/MapModel.cpp
+    src/Render/PlayerModel.cpp
     src/World/MapCollision.cpp
     src/World/Camera.cpp
+    src/World/Outline.cpp
     src/World/Picking.cpp
     src/World/World3D.cpp
     src/Input/InputController.cpp

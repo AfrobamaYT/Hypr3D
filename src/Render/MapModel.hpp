@@ -40,9 +40,9 @@ class CMapModel {
     void poll();
     void destroy();
 
-    // A load is still being read and decoded.
+    // A load is still being read and decoded, or its textures uploaded.
     bool pending() const {
-        return m_worker.joinable();
+        return m_worker.joinable() || m_uploading;
     }
 
     // The last load could not read the file; it is not retried until the
@@ -161,7 +161,8 @@ class CMapModel {
     struct SDecoded;
     static std::unique_ptr<SDecoded> decode(const std::string& path,
                                             std::stop_token stop);
-    void upload(SDecoded& decoded);
+    void finishUpload();
+    void dropUpload();
     void releaseMesh();
     void stopWorker();
 
@@ -208,6 +209,10 @@ class CMapModel {
     std::string               m_meshPath; // the file the GL mesh came from
     bool                      m_failed = false;
     std::unique_ptr<SDecoded> m_decoded;  // the worker's result
+    // A decoded file whose textures go up one per frame, then its buffers.
+    std::unique_ptr<SDecoded> m_uploading;
+    std::vector<unsigned>     m_uploadTextures; // by image index, 0 = none
+    size_t                    m_uploadNext = 0;
     std::atomic<bool>         m_decodedReady{false};
     // Last, so it is destroyed -- joined -- before what its thread writes.
     std::jthread              m_worker;

@@ -513,7 +513,9 @@ void CMapModel::stopWorker() {
 bool CMapModel::load(const std::string& path, const Vec3& position,
                      const Vec3& rotationDeg, const Vec3& scale) {
     // A load still decoding is dropped; its thread stops at the next node.
+    // One still uploading its textures is dropped as well.
     stopWorker();
+    dropUpload();
 
     // Another file: the old mesh goes now, as before. The same file again
     // (written anew, e.g. from Blender): the old mesh stays until the new
@@ -539,22 +541,55 @@ bool CMapModel::load(const std::string& path, const Vec3& position,
 }
 
 void CMapModel::poll() {
-    if (!m_worker.joinable() || !m_decodedReady.load(std::memory_order_acquire))
-        return;
+    if (!m_uploading) {
+        if (!m_worker.joinable() || !m_decodedReady.load(std::memory_order_acquire))
+            return;
 
-    m_worker.join();
-    m_decodedReady.store(false, std::memory_order_relaxed);
+        m_worker.join();
+        m_decodedReady.store(false, std::memory_order_relaxed);
 
-    const auto DECODED = std::move(m_decoded);
-    if (!DECODED) {
-        m_failed = true;
+        if (!m_decoded) {
+            m_failed = true;
+            return;
+        }
+
+        m_uploading = std::move(m_decoded);
+        m_uploadTextures.assign(m_uploading->images.size(), 0);
+        m_uploadNext = 0;
+    }
+
+    // One texture per frame: six 2048x2048 textures with their mipmaps held
+    // Hyprland ~100 ms in a single frame (VM, virgl).
+    while (m_uploadNext < m_uploading->images.size()) {
+        auto& IMG = m_uploading->images[m_uploadNext++];
+        if (IMG.rgba.empty())
+            continue;
+
+        unsigned int tex = 0;
+        glGenTextures(1, &tex);
+
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, IMG.w, IMG.h, 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, IMG.rgba.data());
+        glGenerateMipmap(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, 0);
+
+        m_uploadTextures[m_uploadNext - 1] = tex;
+        IMG.rgba = {}; // uploaded: the pixels can go
         return;
     }
 
-    upload(*DECODED);
+    finishUpload();
 }
 
-void CMapModel::upload(SDecoded& decoded) {
+void CMapModel::finishUpload() {
+    const auto DECODED = std::move(m_uploading);
+
     releaseMesh();
 
     if (!m_program) {
@@ -592,37 +627,18 @@ void CMapModel::upload(SDecoded& decoded) {
     }
 
     // One texture per decoded image, shared by every primitive using it.
-    std::vector<unsigned int> textures(decoded.images.size(), 0);
+    // destroy() frees them; map reloads would otherwise leak every texture,
+    // base and emissive alike.
+    const std::vector<unsigned int> TEXTURES = std::move(m_uploadTextures);
+    m_uploadTextures.clear();
+    for (const auto T : TEXTURES)
+        if (T != 0)
+            m_ownedTextures.push_back(T);
 
-    for (size_t i = 0; i < decoded.images.size(); ++i) {
-        const auto& IMG = decoded.images[i];
-        if (IMG.rgba.empty())
-            continue;
-
-        unsigned int tex = 0;
-        glGenTextures(1, &tex);
-
-        glBindTexture(GL_TEXTURE_2D, tex);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, IMG.w, IMG.h, 0, GL_RGBA,
-                     GL_UNSIGNED_BYTE, IMG.rgba.data());
-        glGenerateMipmap(GL_TEXTURE_2D);
-        glBindTexture(GL_TEXTURE_2D, 0);
-
-        textures[i] = tex;
-        // destroy() frees them; map reloads would otherwise leak every
-        // texture, base and emissive alike.
-        m_ownedTextures.push_back(tex);
-    }
-
-    for (auto& P : decoded.prims) {
+    for (auto& P : DECODED->prims) {
         SPrimitive out = P.params;
-        out.texture     = P.baseImage >= 0 ? textures[P.baseImage] : 0;
-        out.emissiveTex = P.emissiveImage >= 0 ? textures[P.emissiveImage] : 0;
+        out.texture     = P.baseImage >= 0 ? TEXTURES[P.baseImage] : 0;
+        out.emissiveTex = P.emissiveImage >= 0 ? TEXTURES[P.emissiveImage] : 0;
 
         glGenVertexArrays(1, &out.vao);
         glGenBuffers(1, &out.vbo);
@@ -657,12 +673,21 @@ void CMapModel::upload(SDecoded& decoded) {
         m_primitives.push_back(out);
     }
 
-    m_localTriangles = std::move(decoded.localTriangles);
+    m_localTriangles = std::move(DECODED->localTriangles);
     m_meshPath       = m_path;
     m_loaded         = true;
     resolvePivot();
     recomputeTriangles();
     ++m_meshVersion;
+}
+
+void CMapModel::dropUpload() {
+    for (const auto T : m_uploadTextures)
+        if (T != 0)
+            glDeleteTextures(1, &T);
+    m_uploadTextures.clear();
+    m_uploading.reset();
+    m_uploadNext = 0;
 }
 
 float CMapModel::rayCast(const Vec3& origin, const Vec3& dir) const {
@@ -699,6 +724,7 @@ void CMapModel::releaseMesh() {
 
 void CMapModel::destroy() {
     stopWorker();
+    dropUpload();
     m_failed = false;
 
     releaseMesh();

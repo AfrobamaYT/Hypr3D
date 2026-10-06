@@ -1530,10 +1530,10 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
     const bool WALL  = g_cfgSpan && PLANE && spannedMonitors().size() > 1;
 
     // On the wall, windows that overlap on the desk would lie in one plane and
-    // cut into each other: each steps toward the eye by its place in the
-    // stack -- panels over floating windows over tiled ones over bottom-layer
-    // panels, a later one over an earlier (Hyprland lists windows bottom to
-    // top) -- one slab thickness and a gap per step.
+    // cut into each other: each steps toward the eye once per window it covers
+    // -- panels over floating windows over tiled ones over bottom-layer panels,
+    // a later one over an earlier (Hyprland lists windows bottom to top) -- one
+    // slab thickness and a gap per step. Tiles side by side stay on the wall.
     std::unordered_map<std::uintptr_t, int> wallStack;
     if (WALL) {
         std::vector<const Compat::SWindowInfo*> ORDER;
@@ -1549,8 +1549,22 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         std::stable_sort(ORDER.begin(), ORDER.end(),
                          [&](const auto* a, const auto* b) { return CLASS(a) < CLASS(b); });
 
-        for (size_t i = 0; i < ORDER.size(); ++i)
-            wallStack[ORDER[i]->id] = static_cast<int>(i);
+        const auto RECT = [](const Compat::SWindowInfo* i) {
+            CBox r = i->monitorLocalBox;
+            if (i->monitor) {
+                r.x += i->monitor->m_position.x;
+                r.y += i->monitor->m_position.y;
+            }
+            return r;
+        };
+
+        for (size_t i = 0; i < ORDER.size(); ++i) {
+            int step = 0;
+            for (size_t j = 0; j < i; ++j)
+                if (RECT(ORDER[i]).overlaps(RECT(ORDER[j])))
+                    step = std::max(step, wallStack[ORDER[j]->id] + 1);
+            wallStack[ORDER[i]->id] = step;
+        }
     }
 
     std::unordered_map<std::uintptr_t, float> freshAngle;
@@ -1699,10 +1713,17 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
                 const float NEARER =
                     RANK != wallStack.end() ? STEP * static_cast<float>(RANK->second) : 0.0f;
 
-                entity.center = CAM.position +
-                    FWD * (static_cast<float>(PLANE->distance * K) - NEARER) +
+                // Toward the eye along its own sight line, not the view axis:
+                // stepped along the axis, a panel far off it projected further
+                // out -- a side screen's bar slid past that screen's edge.
+                const Vec3 ONWALL =
+                    FWD * static_cast<float>(PLANE->distance * K) +
                     RIGHT * static_cast<float>((GX - PLANE->cx) * K) +
                     UP * static_cast<float>((PLANE->cy - GY) * K);
+                const float LEN = std::sqrt(dot(ONWALL, ONWALL));
+
+                entity.center = CAM.position +
+                    ONWALL * (LEN > NEARER ? (LEN - NEARER) / LEN : 1.0f);
             }
             else {
                 // Its slot on the arc (see freshAngle): turned about the
@@ -3811,6 +3832,14 @@ static void dumpStatus() {
             out << M->m_name << "[" << V.left << "," << V.right << "," << V.bottom << "," << V.top << "] ";
         }
         out << "\n";
+        // What each spanned monitor brings into the room, and how far it got:
+        // captured, then an entity of the world.
+        for (const auto& I : eligibleWindowsSpanned())
+            out << "  item " << (I.isLayer ? "layer" : "window") << " mon="
+                << (I.monitor ? I.monitor->m_name : std::string{"?"}) << " box="
+                << I.monitorLocalBox.x << "," << I.monitorLocalBox.y << "," << I.monitorLocalBox.w << "x"
+                << I.monitorLocalBox.h << " captured=" << (g_capture.has(I.id) ? 1 : 0)
+                << " entity=" << (g_world.find(I.id) ? 1 : 0) << "\n";
     }
     out << "lastError=" << (g_lastError.empty() ? "none" : g_lastError)
         << "\n";

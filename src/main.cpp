@@ -63,6 +63,7 @@ extern "C" {
 #include "HyprlandCompat/PointerHook.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -71,6 +72,7 @@ extern "C" {
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -471,6 +473,29 @@ struct SObjJolt {
 };
 static std::vector<SObjJolt> g_joltBodies;
 
+// A static object's mesh shape, cooked off the main thread: Jolt building
+// the MeshShape of a 95 000-triangle model held Hyprland ~180 ms (-O2,
+// perf). Jolt is made for this -- MeshShape creation was tuned for many
+// threads building meshes at once.
+struct SShapeJob {
+    uint32_t             meshGen = 0; // what the shape is built from
+    Vec3                 scale{}, pivot{};
+    JPH::Ref<JPH::Shape> shape;       // empty when Jolt refused the mesh
+    std::atomic<bool>    done{false};
+    std::jthread         thread;      // last: joined before the rest goes
+};
+static std::vector<std::unique_ptr<SShapeJob>> g_shapeJobs; // by object
+
+// A static object's first shape is still cooking: there is nothing to stand
+// on yet where it will be.
+static bool joltShapesPending() {
+    for (size_t i = 0; i < g_shapeJobs.size() && i < g_joltBodies.size(); ++i)
+        if (g_shapeJobs[i] && !g_joltBodies[i].valid &&
+            !g_shapeJobs[i]->done.load(std::memory_order_acquire))
+            return true;
+    return false;
+}
+
 // Gravity factor saved while a wheel-roll gesture suspends the object's
 // simulation (captured ONCE at grab -- re-reading it per frame would store
 // the suspended zero and never restore it).
@@ -504,6 +529,9 @@ static bool joltInit() {
 }
 
 static void joltShutdown() {
+    // A shape still cooking finishes first; Jolt cannot stop mid-build.
+    g_shapeJobs.clear();
+
     if (g_joltSystem) {
         delete g_joltSystem;
         g_joltSystem = nullptr;
@@ -653,6 +681,7 @@ static Vec3 quatToEuler(const JPH::Quat& q) {
 
 static void joltSyncBodies() {
     g_joltBodies.resize(g_sceneObjects.size());
+    g_shapeJobs.resize(g_sceneObjects.size());
 
     for (size_t i = 0; i < g_sceneObjects.size(); ++i) {
         auto& JB = g_joltBodies[i];
@@ -664,6 +693,7 @@ static void joltSyncBodies() {
         const uint32_t MESH_VER = MODEL ? MODEL->meshVersion() : 0;
 
         if (!WANT) {
+            g_shapeJobs[i].reset();
             if (JB.valid) {
                 g_bodyIf->RemoveBody(JB.body);
                 g_bodyIf->DestroyBody(JB.body);
@@ -684,12 +714,6 @@ static void joltSyncBodies() {
             JB.builtPivot.y != PIV.y || JB.builtPivot.z != PIV.z;
 
         if (!JB.valid || JB.meshGen != MESH_VER || MAPPING_CHANGED) {
-            if (JB.valid) {
-                g_bodyIf->RemoveBody(JB.body);
-                g_bodyIf->DestroyBody(JB.body);
-                JB = {};
-            }
-
             // Body-space triangles: the mesh scaled, with the PIVOT at the
             // body origin. The body transform (config position/rotation)
             // then maps body space onto the world exactly like the render
@@ -698,30 +722,13 @@ static void joltSyncBodies() {
             // (World-baked vertices here would apply the body transform a
             // SECOND time: an object placed at {2,0,1} got its collision at
             // {4,0,2}.)
-            const auto BODY_PT = [&](const Vec3& p) {
+            const auto BODY_PT = [SCL, PIV](const Vec3& p) {
                 return Vec3{SCL.x * p.x - SCL.x * PIV.x,
                             SCL.y * p.y - SCL.y * PIV.y,
                             SCL.z * p.z - SCL.z * PIV.z};
             };
 
             const auto& LOCAL = MODEL->localTriangles();
-            JPH::TriangleList TL;
-            // Two-sided: each triangle twice (both windings) -- Jolt's
-            // narrow phase ignores back faces, and single-sided authored
-            // geometry (ceilings!) would let bodies tunnel through.
-            TL.reserve(LOCAL.size() * 2);
-            for (const auto& T : LOCAL) {
-                const Vec3 A = BODY_PT(T.a), B = BODY_PT(T.b),
-                           C = BODY_PT(T.c);
-                TL.push_back(JPH::Triangle(
-                    JPH::Float3(A.x, A.y, A.z),
-                    JPH::Float3(B.x, B.y, B.z),
-                    JPH::Float3(C.x, C.y, C.z)));
-                TL.push_back(JPH::Triangle(
-                    JPH::Float3(A.x, A.y, A.z),
-                    JPH::Float3(C.x, C.y, C.z),
-                    JPH::Float3(B.x, B.y, B.z)));
-            }
 
             const bool DYN = OBJ.dynamic && OBJ.physics;
             const JPH::EMotionType MOTION =
@@ -733,14 +740,71 @@ static void joltSyncBodies() {
 
             JPH::Ref<JPH::Shape> SHAPE;
             if (MOTION == JPH::EMotionType::Static) {
-                // Static meshes keep their exact triangle soup.
-                JPH::MeshShapeSettings SETTINGS(TL);
-                SETTINGS.SetEmbedded();
-                auto RES = SETTINGS.Create();
-                if (RES.HasError())
+                // Static meshes keep their exact triangle soup, cooked on a
+                // worker. The old body stays until the new shape is there.
+                auto& JOB = g_shapeJobs[i];
+                const bool CURRENT = JOB && JOB->meshGen == MESH_VER &&
+                    JOB->scale.x == SCL.x && JOB->scale.y == SCL.y &&
+                    JOB->scale.z == SCL.z && JOB->pivot.x == PIV.x &&
+                    JOB->pivot.y == PIV.y && JOB->pivot.z == PIV.z;
+
+                if (!CURRENT) {
+                    JOB.reset(); // an outdated one is waited for
+                    JOB          = std::make_unique<SShapeJob>();
+                    JOB->meshGen = MESH_VER;
+                    JOB->scale   = SCL;
+                    JOB->pivot   = PIV;
+                    JOB->thread  = std::jthread([J = JOB.get(), LOCAL, BODY_PT] {
+                        // An exception leaving this thread would terminate
+                        // Hyprland.
+                        try {
+                            JPH::TriangleList TL;
+                            // Two-sided: each triangle twice (both windings)
+                            // -- Jolt's narrow phase ignores back faces, and
+                            // single-sided authored geometry (ceilings!)
+                            // would let bodies tunnel through.
+                            TL.reserve(LOCAL.size() * 2);
+                            for (const auto& T : LOCAL) {
+                                const Vec3 A = BODY_PT(T.a), B = BODY_PT(T.b),
+                                           C = BODY_PT(T.c);
+                                TL.push_back(JPH::Triangle(
+                                    JPH::Float3(A.x, A.y, A.z),
+                                    JPH::Float3(B.x, B.y, B.z),
+                                    JPH::Float3(C.x, C.y, C.z)));
+                                TL.push_back(JPH::Triangle(
+                                    JPH::Float3(A.x, A.y, A.z),
+                                    JPH::Float3(C.x, C.y, C.z),
+                                    JPH::Float3(B.x, B.y, B.z)));
+                            }
+
+                            JPH::MeshShapeSettings SETTINGS(TL);
+                            SETTINGS.SetEmbedded();
+                            auto RES = SETTINGS.Create();
+                            if (!RES.HasError())
+                                J->shape = RES.Get();
+                        } catch (...) {
+                            J->shape = nullptr;
+                        }
+                        J->done.store(true, std::memory_order_release);
+                    });
                     continue;
-                SHAPE = RES.Get();
+                }
+
+                // Still cooking, or Jolt refused this mesh (kept, so it is
+                // not tried again until the mesh changes).
+                if (!JOB->done.load(std::memory_order_acquire) || !JOB->shape)
+                    continue;
+
+                JOB->thread.join();
+                SHAPE = JOB->shape;
+                JOB.reset();
             } else {
+                if (JB.valid) {
+                    g_bodyIf->RemoveBody(JB.body);
+                    g_bodyIf->DestroyBody(JB.body);
+                    JB = {};
+                }
+
                 // Dynamic/kinematic bodies use a convex hull (Jolt requires
                 // it; the hull also tumbles believably).
                 JPH::Array<JPH::Vec3> POINTS;
@@ -757,6 +821,12 @@ static void joltSyncBodies() {
                 if (RES.HasError())
                     continue;
                 SHAPE = RES.Get();
+            }
+
+            if (JB.valid) {
+                g_bodyIf->RemoveBody(JB.body);
+                g_bodyIf->DestroyBody(JB.body);
+                JB = {};
             }
 
             JPH::BodyCreationSettings BCS(
@@ -2824,11 +2894,11 @@ static void update3D(float dt) {
     const auto JOLT_T0 = std::chrono::steady_clock::now();
     joltSyncBodies();
 
-    // While a scene object is still being decoded its collision is missing:
-    // the player and every prop would fall through a map that is not there
-    // yet. Time stands still until it is -- as it did while the load froze
-    // the whole compositor.
-    if (g_joltSystem && !g_scene.scenePending()) {
+    // While a scene object is still being decoded, or its first shape
+    // cooked, its collision is missing: the player and every prop would fall
+    // through a map that is not there yet. Time stands still until it is --
+    // as it did while the load froze the whole compositor.
+    if (g_joltSystem && !g_scene.scenePending() && !joltShapesPending()) {
         // All jobs execute on the main thread (0 workers), but through the
         // FULL thread-pool job system: it handles the dependency graph of
         // PhysicsSystem::Update, unlike JobSystemSingleThreaded, which

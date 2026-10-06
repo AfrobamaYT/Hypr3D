@@ -1254,10 +1254,15 @@ uint64_t GLScene::sceneFingerprint() const {
 // same rule as the panorama.
 void GLScene::refreshScene() {
     for (auto& S : m_slots) {
+        // A file read and decoded on the model's worker gets its GL objects
+        // here, with the context current.
+        if (S.model)
+            S.model->poll();
+
         const std::string& CFG_PATH = S.spec.path;
 
         if (CFG_PATH.empty()) {
-            if (S.model && S.model->loaded()) {
+            if (S.model && (S.model->loaded() || S.model->pending())) {
                 S.model->destroy();
                 S.loadedPath.clear();
                 S.mtimeValid = false;
@@ -1276,9 +1281,13 @@ void GLScene::refreshScene() {
         std::error_code ec;
         const auto MTIME = std::filesystem::last_write_time(path, ec);
 
-        const bool UNCHANGED = S.model && S.model->loaded() &&
-            S.loadedPath == path && S.mtimeValid && !ec &&
-            MTIME == S.mtime;
+        // The same file as last time, also when it is still missing. Loading,
+        // loaded or failed, it is not started again until it changes: a load
+        // per frame would start a worker per frame.
+        const bool SAME_FILE = S.loadedPath == path &&
+            S.mtimeValid == !ec && (ec || MTIME == S.mtime);
+        const bool UNCHANGED = S.model && SAME_FILE &&
+            (S.model->loaded() || S.model->pending() || S.model->failed());
 
         if (UNCHANGED)
             continue;

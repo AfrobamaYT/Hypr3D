@@ -184,6 +184,15 @@ class GLScene {
         return index < m_slots.size() ? m_slots[index].model.get() : nullptr;
     }
 
+    // A scene object is still being read and decoded, so its collision is
+    // not there yet.
+    bool scenePending() const {
+        for (const auto& S : m_slots)
+            if (S.model && S.model->pending())
+                return true;
+        return false;
+    }
+
     // Move/rotate a (grabbed) object: updates the slot spec and the model
     // transform in one place so mtime reloads keep the new placement.
     void setSceneObjectTransform(size_t index, const Vec3& position,

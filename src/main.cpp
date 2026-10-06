@@ -2824,7 +2824,11 @@ static void update3D(float dt) {
     const auto JOLT_T0 = std::chrono::steady_clock::now();
     joltSyncBodies();
 
-    if (g_joltSystem) {
+    // While a scene object is still being decoded its collision is missing:
+    // the player and every prop would fall through a map that is not there
+    // yet. Time stands still until it is -- as it did while the load froze
+    // the whole compositor.
+    if (g_joltSystem && !g_scene.scenePending()) {
         // All jobs execute on the main thread (0 workers), but through the
         // FULL thread-pool job system: it handles the dependency graph of
         // PhysicsSystem::Update, unlike JobSystemSingleThreaded, which

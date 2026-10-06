@@ -63,7 +63,7 @@ hyprctl eval 'hl.plugin.hypr3d.reset()'
 
 ### The companion
 
-A second avatar stands in the room, a blue capsule, driven from outside --
+A second avatar can stand in the room, a blue capsule, driven from outside --
 by an AI through a bridge process, or by hand:
 
 ```bash
@@ -93,8 +93,9 @@ What happens goes out on Hyprland's event socket (`.socket2.sock`) as
 - `{"event":"companion","state":"first_step"|"arrived"|"blocked"|"aborted","target":"foot",...}`,
   with a `reason` for `blocked` and `aborted`.
 
-Its body lives as long as the plugin: leaving the room keeps it where it
-stood, `reset()` puts it back beside the spawn.
+It appears on the first call, beside the spawn, and its body lives as long as
+the plugin: leaving the room keeps it where it stood, `reset()` puts it back
+beside the spawn.
 
 ## Controls
 

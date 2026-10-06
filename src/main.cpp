@@ -709,6 +709,9 @@ struct SCompanion {
     float            lastSpeed = 0.f; // commanded on the previous frame
 };
 static SCompanion g_companion;
+// It appears on the first call (a bridge asks for the state when it
+// starts), not in every room: without an AI it would only stand there.
+static bool g_companionCalled = false;
 
 static constexpr float kCompanionSpeed = 3.0f;  // m/s; the player flies at 4
 static constexpr float kCompanionTurn  = 8.0f;  // rad/s
@@ -1023,6 +1026,10 @@ static bool companionStart(bool walk, const std::string& name, std::string& why)
 
 // Once per frame after the physics step: steer for the next one.
 static void updateCompanion(float dt) {
+    if (!g_companionCalled) {
+        g_scene.setCompanion(Vec3{}, 0.f, false);
+        return;
+    }
     ensureCompanionBody();
     if (g_companion.body.IsInvalid())
         return;
@@ -5935,6 +5942,8 @@ static int luaReset(lua_State*) {
 static bool companionLua(lua_State* L) {
     const char* VERB = lua_type(L, 1) == LUA_TSTRING ? lua_tostring(L, 1) : "";
     const std::string verb = VERB;
+    if (verb == "state" || verb == "stop" || verb == "go_to" || verb == "look_at")
+        g_companionCalled = true;
 
     if (verb == "state") {
         postRoomState();

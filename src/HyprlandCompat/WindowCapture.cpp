@@ -787,6 +787,15 @@ bool CWindowCapture::makeSnapshotLayer(const PHLLS& layer, const PHLMONITOR& mon
     if (!BOXOPT || BOXOPT->w <= 0 || BOXOPT->h <= 0)
         return false;
 
+    // surfaceLogicalBox() is in layout coordinates -- arrangeLayerArray starts
+    // from the monitor's position -- while the snapshot FB, its UV subrect and
+    // the alpha mask are monitor-local. On a monitor not at the layout's origin
+    // the layer's pixels fell outside the texture and the room showed a panel
+    // of its edge colour (a full-screen dialog at x = 2560, release VM).
+    CBox LOCAL = *BOXOPT;
+    LOCAL.x -= monitor->m_position.x;
+    LOCAL.y -= monitor->m_position.y;
+
     const auto ID = reinterpret_cast<std::uintptr_t>(layer.get());
 
     const auto SURFACE =
@@ -795,7 +804,7 @@ bool CWindowCapture::makeSnapshotLayer(const PHLLS& layer, const PHLMONITOR& mon
     if (!force) {
         if (auto IT = m_snapshots.find(ID); IT != m_snapshots.end() &&
             IT->second.lastBuffer == bufferIdentity(SURFACE) &&
-            boxEquals(IT->second.fullBox, *BOXOPT))
+            boxEquals(IT->second.fullBox, LOCAL))
             return true;
     }
 
@@ -817,10 +826,10 @@ bool CWindowCapture::makeSnapshotLayer(const PHLLS& layer, const PHLMONITOR& mon
         return false;
     }
 
-    snapshot.fullBox       = *BOXOPT;
-    snapshot.sampledBox    = *BOXOPT;
+    snapshot.fullBox       = LOCAL;
+    snapshot.sampledBox    = LOCAL;
     snapshot.surfaceOffset = Vector2D{0, 0};
-    snapshot.surfaceSize   = Vector2D{BOXOPT->w, BOXOPT->h};
+    snapshot.surfaceSize   = Vector2D{LOCAL.w, LOCAL.h};
     snapshot.texSpan       = monitor->m_size;
 
     // Alpha mask for picking, refreshed every 32nd snapshot (or when the box
@@ -832,8 +841,8 @@ bool CWindowCapture::makeSnapshotLayer(const PHLLS& layer, const PHLMONITOR& mon
     const double SX = monitor->m_pixelSize.x / monitor->m_size.x;
     const double SY = monitor->m_pixelSize.y / monitor->m_size.y;
 
-    const int PW = static_cast<int>(std::lround(BOXOPT->w * SX));
-    const int PH = static_cast<int>(std::lround(BOXOPT->h * SY));
+    const int PW = static_cast<int>(std::lround(LOCAL.w * SX));
+    const int PH = static_cast<int>(std::lround(LOCAL.h * SY));
 
     const bool SIZE_CHANGED =
         snapshot.alphaValid &&
@@ -844,9 +853,9 @@ bool CWindowCapture::makeSnapshotLayer(const PHLLS& layer, const PHLMONITOR& mon
 
         // The layer sits at its box position inside the monitor-sized
         // snapshot; read exactly that region, clamped to the framebuffer.
-        const int PX = std::clamp(static_cast<int>(std::lround(BOXOPT->x * SX)), 0,
+        const int PX = std::clamp(static_cast<int>(std::lround(LOCAL.x * SX)), 0,
             std::max(0, snapshot.width - 1));
-        const int PY = std::clamp(static_cast<int>(std::lround(BOXOPT->y * SY)), 0,
+        const int PY = std::clamp(static_cast<int>(std::lround(LOCAL.y * SY)), 0,
             std::max(0, snapshot.height - 1));
         const int RW = std::min(PW, snapshot.width - PX);
         const int RH = std::min(PH, snapshot.height - PY);

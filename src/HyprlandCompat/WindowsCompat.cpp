@@ -62,8 +62,8 @@ std::vector<SWindowInfo> enumerateEligibleWindows(const PHLMONITOR& monitor) {
     // Layer-shell surfaces (panels, bars, quickshell PanelWindow) live
     // outside the window list; show them in the room as regular entities.
     // The background layer is skipped -- that is where wallpapers live, and a
-    // full-screen wallpaper would swallow the whole room. Their boxes are
-    // monitor-local and decoration-free.
+    // full-screen wallpaper would swallow the whole room. Their boxes come in
+    // layout coordinates and are made monitor-local below; decoration-free.
     constexpr uint32_t LAYER_BACKGROUND = 0;
 
     for (const auto& LAYERLIST : monitor->m_layerSurfaceLayers) {
@@ -84,7 +84,11 @@ std::vector<SWindowInfo> enumerateEligibleWindows(const PHLMONITOR& monitor) {
             info.isLayer = true;
             info.monitor = monitor;
 
+            // Layout coordinates (arrangeLayerArray starts from the monitor's
+            // position) made monitor-local like a window's box.
             info.monitorLocalBox = *BOXOPT;
+            info.monitorLocalBox.x -= monitor->m_position.x;
+            info.monitorLocalBox.y -= monitor->m_position.y;
             info.surfaceOffset   = Vector2D{0, 0};
             info.surfaceSize     = Vector2D{BOXOPT->w, BOXOPT->h};
 

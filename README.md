@@ -51,6 +51,16 @@ Or bind in lua config:
 hl.bind("SUPER + F12", hl.plugin.hypr3d.toggle)
 ```
 
+Leaving the room keeps it as it was: where you stood and looked, the view (F5)
+and where every window stood -- for as long as Hyprland runs. To start over at
+the spawn point with the windows in front of you:
+
+```bash
+hyprctl eval 'hl.plugin.hypr3d.reset()'
+```
+
+(or the dispatcher `hypr3d:reset`)
+
 ## Controls
 
 | Input                         | Action                                         |

@@ -87,6 +87,28 @@ static GLScene         g_scene;
 static InputController g_input;
 static World3D::CWorld g_world;
 static AimFocus        g_aim;
+
+// The room as it was left: where the player stood and looked, the view (F5),
+// and where every window and layer stood. Entering used to start at the spawn
+// point with every window back on the wall each time (the Larch owner,
+// 2026-10-06). Kept for the compositor's lifetime; hl.plugin.hypr3d.reset()
+// forgets it.
+struct SRememberedPose {
+    // A weak reference proves it is the same surface: a closed window's locks
+    // to nothing, so a new one at a reused address does not inherit its place.
+    PHLWINDOWREF window;
+    PHLLSREF     layer;
+    Vec3         center{};
+    float        yaw = 0.0f, pitch = 0.0f, roll = 0.0f;
+};
+struct SRoomMemory {
+    bool  valid = false;
+    Vec3  eye{};
+    float yaw = 0.0f, pitch = 0.0f;
+    int   viewMode = 0;
+    std::unordered_map<std::uintptr_t, SRememberedPose> poses;
+};
+static SRoomMemory g_room;
 static Compat::CWindowCapture g_capture;
 
 static bool g_active = false;
@@ -1567,11 +1589,22 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         }
     }
 
+    // A surface the room remembers is not new: it goes back where it stood
+    // (see g_room), and takes no slot on the arc.
+    const auto REMEMBERED = [](const Compat::SWindowInfo& info) -> const SRememberedPose* {
+        const auto IT = g_room.poses.find(info.id);
+        if (IT == g_room.poses.end())
+            return nullptr;
+        const bool SAME = info.isLayer ? IT->second.layer.lock() == info.layer
+                                       : IT->second.window.lock() == info.window;
+        return SAME ? &IT->second : nullptr;
+    };
+
     std::unordered_map<std::uintptr_t, float> freshAngle;
     if (!WALL) {
         std::vector<const Compat::SWindowInfo*> FRESH;
         for (const auto& info : INFOS)
-            if (!info.isLayer && !g_world.find(info.id))
+            if (!info.isLayer && !g_world.find(info.id) && !REMEMBERED(info))
                 FRESH.push_back(&info);
 
         if (FRESH.size() > 1) {
@@ -1687,6 +1720,12 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
             entity.yaw = EXISTING->yaw;
             entity.pitch = EXISTING->pitch;
             entity.roll = EXISTING->roll;
+        }
+        else if (const auto* MEM = REMEMBERED(info)) {
+            entity.center = MEM->center;
+            entity.yaw    = MEM->yaw;
+            entity.pitch  = MEM->pitch;
+            entity.roll   = MEM->roll;
         }
         else {
             const auto& CAM = g_scene.camera();
@@ -2724,7 +2763,40 @@ static void onRenderPre(PHLMONITOR mon) {
 
 // --- lifecycle --------------------------------------------------------------
 
+// Takes the live room into g_room. Surfaces not in the room right now (on
+// another workspace, or not captured yet) keep what was remembered of them;
+// closed ones are dropped.
+static void rememberRoom() {
+    const auto& CAM = g_scene.camera();
+    g_room.valid    = true;
+    g_room.eye      = CAM.position;
+    g_room.yaw      = CAM.yaw;
+    g_room.pitch    = CAM.pitch;
+    g_room.viewMode = g_viewMode;
+
+    std::erase_if(g_room.poses, [](const auto& KV) {
+        return !KV.second.window.lock() && !KV.second.layer.lock();
+    });
+
+    for (const auto& E : g_world.entities()) {
+        SRememberedPose P;
+        if (const auto W = Compat::findWindowById(E.id))
+            P.window = W;
+        else if (const auto L = Compat::findLayerById(E.id))
+            P.layer = L;
+        else
+            continue;
+        P.center = E.center;
+        P.yaw    = E.yaw;
+        P.pitch  = E.pitch;
+        P.roll   = E.roll;
+        g_room.poses[E.id] = P;
+    }
+}
+
 static void deactivate3D() {
+    rememberRoom();
+
     finishClientButton(0);
     resetPointerGesture();
 
@@ -2792,7 +2864,28 @@ static void requestDeactivate3D() {
     });
 }
 
+// Player spawn point (config player_spawn): the coordinates are the player's
+// FEET, so spawning at 0,0,0 stands on the grid platform at world zero instead
+// of falling through it. Eyes ride kEyeHeight above.
+static void placeAtSpawn() {
+    auto& CAM = g_scene.camera();
+    CAM.position = Vec3{
+        g_playerSpawn.x,
+        g_playerSpawn.y + Camera::kEyeHeight,
+        g_playerSpawn.z,
+    };
+
+    // Camera forward is {sin yaw, ., -cos yaw}: looking at the origin
+    // from (x, z) means yaw = atan2(-x, z).
+    CAM.yaw = std::atan2(-g_playerSpawn.x, g_playerSpawn.z);
+}
+
 static void enter3D() {
+    // Entered again before the room closed (toggled while it faded out, or
+    // opened while open): what is live now is what to come back to.
+    if (g_active)
+        rememberRoom();
+
     // Without this the render stage bails out immediately and the toggle does
     // nothing at all.
     g_active = true;
@@ -2821,28 +2914,22 @@ static void enter3D() {
     g_world.clear();
     g_renderWindows.clear();
 
-    // Player spawn point (config player_spawn): the coordinates are the
-    // player's FEET, so spawning at 0,0,0 stands on the grid platform at
-    // world zero instead of falling through it. Eyes ride kEyeHeight above.
-    {
-        auto& CAM = g_scene.camera();
-        CAM.position = Vec3{
-            g_playerSpawn.x,
-            g_playerSpawn.y + Camera::kEyeHeight,
-            g_playerSpawn.z,
-        };
-
-        // Camera forward is {sin yaw, ., -cos yaw}: looking at the origin
-        // from (x, z) means yaw = atan2(-x, z).
-        CAM.yaw = std::atan2(-g_playerSpawn.x, g_playerSpawn.z);
-    }
+    // Back where the player stood and looked when the room closed; the spawn
+    // point the first time and after hl.plugin.hypr3d.reset().
+    if (g_room.valid) {
+        auto& CAM    = g_scene.camera();
+        CAM.position = g_room.eye;
+        CAM.yaw      = g_room.yaw;
+        CAM.pitch    = g_room.pitch;
+    } else
+        placeAtSpawn();
 
     g_capture.releaseAll();
 
     resetMovementKeys();
 
     g_grounded = false;
-    g_viewMode = 0;
+    g_viewMode = g_room.valid ? g_room.viewMode : 0;
     g_scene.camera().mirrorView = false;
     g_scene.setPlayerVisible(false);
     g_scene.setPlayerDebugCapsule(Vec3{}, false);
@@ -3833,13 +3920,25 @@ static void dumpStatus() {
         }
         out << "\n";
         // What each spanned monitor brings into the room, and how far it got:
-        // captured, then an entity of the world.
-        for (const auto& I : eligibleWindowsSpanned())
+        // captured, then an entity of the world -- and where that stands.
+        for (const auto& I : eligibleWindowsSpanned()) {
             out << "  item " << (I.isLayer ? "layer" : "window") << " mon="
                 << (I.monitor ? I.monitor->m_name : std::string{"?"}) << " box="
                 << I.monitorLocalBox.x << "," << I.monitorLocalBox.y << "," << I.monitorLocalBox.w << "x"
-                << I.monitorLocalBox.h << " captured=" << (g_capture.has(I.id) ? 1 : 0)
-                << " entity=" << (g_world.find(I.id) ? 1 : 0) << "\n";
+                << I.monitorLocalBox.h << " captured=" << (g_capture.has(I.id) ? 1 : 0) << " entity=";
+            if (const auto* E = g_world.find(I.id))
+                out << "(" << E->center.x << "," << E->center.y << "," << E->center.z << ")\n";
+            else
+                out << "0\n";
+        }
+    }
+    {
+        // Where the player stands and looks, and what the room remembers
+        // (see g_room).
+        const auto& CAM = g_scene.camera();
+        out << "camera: pos=(" << CAM.position.x << "," << CAM.position.y << "," << CAM.position.z
+            << ") yaw=" << CAM.yaw << " pitch=" << CAM.pitch << " view=" << g_viewMode
+            << " remembered=" << (g_room.valid ? 1 : 0) << "/" << g_room.poses.size() << "\n";
     }
     out << "lastError=" << (g_lastError.empty() ? "none" : g_lastError)
         << "\n";
@@ -5280,6 +5379,37 @@ static int luaConfig(lua_State* L) {
     return 0;
 }
 
+// Back to the spawn point with every window on the wall, as the first time:
+// the room forgets how it was left.
+static void resetRoom() {
+    g_room = {};
+    if (!g_active)
+        return;
+
+    g_scene.reset();
+    placeAtSpawn();
+
+    // In first person the camera is read back from the player's body every
+    // frame, so a camera moved alone snaps back: the body goes too, at rest.
+    if (!g_playerBody.IsInvalid() && g_bodyIf) {
+        const auto& CAM = g_scene.camera();
+        g_bodyIf->SetPositionAndRotation(
+            g_playerBody,
+            JPH::RVec3(CAM.position.x, CAM.position.y - PLAYER_EYE_OFF, CAM.position.z),
+            JPH::Quat::sIdentity(), JPH::EActivation::Activate);
+        g_bodyIf->SetLinearVelocity(g_playerBody, JPH::Vec3::sZero());
+    }
+
+    g_world.clear();
+    g_viewMode = 0;
+    damageCurrentMonitor();
+}
+
+static int luaReset(lua_State*) {
+    resetRoom();
+    return 0;
+}
+
 static int luaToggle(lua_State*) {
     toggle3D();
     return 0;
@@ -5307,6 +5437,11 @@ static SDispatchResult dispatchOpen(std::string) {
 
 static SDispatchResult dispatchClose(std::string) {
     close3D();
+    return {};
+}
+
+static SDispatchResult dispatchReset(std::string) {
+    resetRoom();
     return {};
 }
 
@@ -5356,6 +5491,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     if (!HyprlandAPI::addDispatcherV2(PHANDLE, "hypr3d:close", dispatchClose))
         throw std::runtime_error("[hypr3d] failed to register close dispatcher");
 
+    if (!HyprlandAPI::addDispatcherV2(PHANDLE, "hypr3d:reset", dispatchReset))
+        throw std::runtime_error("[hypr3d] failed to register reset dispatcher");
+
     if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "toggle", luaToggle))
         throw std::runtime_error("[hypr3d] failed to register Lua toggle");
 
@@ -5364,6 +5502,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "close", luaClose))
         throw std::runtime_error("[hypr3d] failed to register Lua close");
+
+    if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "reset", luaReset))
+        throw std::runtime_error("[hypr3d] failed to register Lua reset");
 
     if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "config", luaConfig))
         throw std::runtime_error("[hypr3d] failed to register Lua config");

@@ -5164,6 +5164,15 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
+    // Hyprland keeps the last frame's pass elements until the next
+    // beginRender() clears them -- ours included. After dlclose() that clear()
+    // ran the destructor of a CHypr3DPassElement whose code was gone: unloading
+    // while the 3D view was on crashed Hyprland (SIGSEGV in
+    // IHyprRenderer::beginRender, measured on 0.56.2). `hyprctl plugin unload`
+    // calls this from the event loop, between frames, so the element is done.
+    if (g_pHyprRenderer)
+        g_pHyprRenderer->m_renderPass.removeAllOfType("Hypr3D");
+
     if (g_deactivateLater && g_pEventLoopManager)
         g_pEventLoopManager->removeDoLater(g_deactivateLater);
     g_deactivateLater = 0;

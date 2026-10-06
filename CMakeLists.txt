@@ -6,6 +6,14 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# No STB_GNU_UNIQUE symbols: one of them makes glibc refuse to unload the
+# library (it is marked NODELETE), so `hyprctl plugin unload` left it mapped
+# and the next `plugin load` ran PLUGIN_INIT again on the old, already shut
+# down state -- turning the view on then crashed Hyprland (SIGSEGV, measured
+# on Hyprland 0.56.2; 162 such symbols came from Hyprland's headers). For
+# every target, Jolt included.
+add_compile_options(-fno-gnu-unique)
+
 set(HYPRLAND_HEADERS "" CACHE PATH
     "Hyprland headers root containing include/hyprland"
 )

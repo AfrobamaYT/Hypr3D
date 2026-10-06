@@ -1342,9 +1342,13 @@ void GLScene::refreshScene() {
     }
 }
 
-// The player's collision capsule outline (F3): three circles + four
-// verticals, rebuilt every drawn frame (a couple hundred floats).
-void GLScene::drawPlayerDebugCapsule(const Mat4& vp) {
+// A capsule outline at a body center: three circles + four verticals,
+// rebuilt every drawn frame (a couple hundred floats). With a yaw, a line
+// from the head shows where it looks. The player's collision capsule (F3)
+// draws over everything; the companion is hidden behind what stands in
+// front of it.
+void GLScene::drawCapsule(const Mat4& vp, const Vec3& center, const float* yaw,
+                          const Vec3& color, bool depthTest) {
     if (!m_pDbgProgram) {
         static const char* VS = R"GLSL(
 #version 320 es
@@ -1355,8 +1359,9 @@ void main() { gl_Position = uMVP * vec4(aPos, 1.0); }
         static const char* FS = R"GLSL(
 #version 320 es
 precision mediump float;
+uniform vec3 uColor;
 out vec4 fragColor;
-void main() { fragColor = vec4(0.2, 1.0, 0.3, 1.0); }
+void main() { fragColor = vec4(uColor, 1.0); }
 )GLSL";
         const GLuint VSx = glCreateShader(GL_VERTEX_SHADER);
         glShaderSource(VSx, 1, &VS, nullptr);
@@ -1372,10 +1377,11 @@ void main() { fragColor = vec4(0.2, 1.0, 0.3, 1.0); }
         glDeleteShader(FSx);
         m_pDbgProgram = P;
         m_pDbgMVP     = glGetUniformLocation(P, "uMVP");
+        m_pDbgColor   = glGetUniformLocation(P, "uColor");
     }
 
     const float R = 0.3f;             // Camera::kBodyHalfWidth
-    const float CY = m_pDbgCenter.y;  // the Jolt body center (feet + 0.9)
+    const float CY = center.y;        // the Jolt body center (feet + 0.9)
     const float HH = 0.6f;            // the cylinder half height (0.9 - r)
     const int SEG = 24;
 
@@ -1385,12 +1391,12 @@ void main() { fragColor = vec4(0.2, 1.0, 0.3, 1.0); }
         for (int s = 0; s < SEG; ++s) {
             const float A0 = float(s) / SEG * 6.2831853f;
             const float A1 = float(s + 1) / SEG * 6.2831853f;
-            V.push_back(m_pDbgCenter.x + std::cos(A0) * R);
+            V.push_back(center.x + std::cos(A0) * R);
             V.push_back(CY + y);
-            V.push_back(m_pDbgCenter.z + std::sin(A0) * R);
-            V.push_back(m_pDbgCenter.x + std::cos(A1) * R);
+            V.push_back(center.z + std::sin(A0) * R);
+            V.push_back(center.x + std::cos(A1) * R);
             V.push_back(CY + y);
-            V.push_back(m_pDbgCenter.z + std::sin(A1) * R);
+            V.push_back(center.z + std::sin(A1) * R);
         }
     };
     CIRCLE(-HH);
@@ -1398,10 +1404,16 @@ void main() { fragColor = vec4(0.2, 1.0, 0.3, 1.0); }
     CIRCLE(HH);
     for (int s = 0; s < 4; ++s) {
         const float A = float(s) / 4 * 6.2831853f + 0.3926991f;
-        const float X = m_pDbgCenter.x + std::cos(A) * R;
-        const float Z = m_pDbgCenter.z + std::sin(A) * R;
+        const float X = center.x + std::cos(A) * R;
+        const float Z = center.z + std::sin(A) * R;
         V.push_back(X); V.push_back(CY - HH); V.push_back(Z);
         V.push_back(X); V.push_back(CY + HH); V.push_back(Z);
+    }
+    if (yaw) { // forward is {sin yaw, 0, -cos yaw}, as the camera's
+        V.push_back(center.x); V.push_back(CY + HH); V.push_back(center.z);
+        V.push_back(center.x + std::sin(*yaw) * 0.6f);
+        V.push_back(CY + HH);
+        V.push_back(center.z - std::cos(*yaw) * 0.6f);
     }
     m_pDbgVerts = static_cast<int>(V.size() / 3);
 
@@ -1418,13 +1430,17 @@ void main() { fragColor = vec4(0.2, 1.0, 0.3, 1.0); }
 
     glUseProgram(m_pDbgProgram);
     glUniformMatrix4fv(m_pDbgMVP, 1, GL_FALSE, vp.m.data());
+    glUniform3f(m_pDbgColor, color.x, color.y, color.z);
     glBindVertexArray(m_pDbgVAO);
     glBindBuffer(GL_ARRAY_BUFFER, m_pDbgVBO);
     glBufferData(GL_ARRAY_BUFFER,
                  static_cast<GLsizeiptr>(V.size() * sizeof(float)),
                  V.data(), GL_STREAM_DRAW);
-    glDisable(GL_DEPTH_TEST);
-    glDepthMask(GL_FALSE);
+    // Depth-tested lines also write depth: the floor is drawn after them
+    // and would otherwise paint over everything below the horizon.
+    if (!depthTest)
+        glDisable(GL_DEPTH_TEST);
+    glDepthMask(depthTest ? GL_TRUE : GL_FALSE);
     glDrawArrays(GL_LINES, 0, m_pDbgVerts);
     glEnable(GL_DEPTH_TEST);
     glDepthMask(GL_TRUE);
@@ -2279,7 +2295,10 @@ bool GLScene::render(
     if (primary)
         refreshPlayer();
     if (m_pDbgOn)
-        drawPlayerDebugCapsule(vp);
+        drawCapsule(vp, m_pDbgCenter, nullptr, Vec3{0.2f, 1.0f, 0.3f}, false);
+    // Arch blue, the default accent of Larch's palette.
+    if (m_compOn)
+        drawCapsule(vp, m_compCenter, &m_compYaw, Vec3{0.09f, 0.576f, 0.82f}, true);
     if (m_playerVisible && m_player.loaded()) {
         m_player.setPose(m_playerFeet, m_playerYaw, m_playerCfg.scale,
                          m_playerCfg.posOffset + m_playerCfg.centerOffset,

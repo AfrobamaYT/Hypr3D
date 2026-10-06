@@ -61,6 +61,41 @@ hyprctl eval 'hl.plugin.hypr3d.reset()'
 
 (or the dispatcher `hypr3d:reset`)
 
+### The companion
+
+A second avatar stands in the room, a blue capsule, driven from outside --
+by an AI through a bridge process, or by hand:
+
+```bash
+hyprctl eval 'hl.plugin.hypr3d.companion("go_to", "foot")'
+```
+
+| Call | What it does |
+| --- | --- |
+| `companion("go_to", target)` | walks a straight line and stops in front of the target, facing it |
+| `companion("look_at", target)` | turns to face the target |
+| `companion("stop")` | stops at once |
+| `companion("state")` | posts the room event now |
+
+A target is `player` (it stops within 1.5 m of you), `spawn`, or a window in
+the room by its app class in lower case: `foot`, and `foot 2` for a second
+one. A window keeps its number while it lives. When the room is closed or the
+target unknown, the call fails and `hyprctl eval` prints why, for example
+`error: companion: Unknown target 'firefox'. Targets now: player, spawn, foot`.
+It never walks into you or off the floor.
+
+What happens goes out on Hyprland's event socket (`.socket2.sock`) as
+`hypr3d>>{json}`, each stamped with `CLOCK_MONOTONIC` nanoseconds in `t`:
+
+- `{"event":"room","open":true,"targets":[{"name":"player"},{"name":"spawn"},{"name":"foot","title":"~"}],...}`
+  when the room opens, closes (a fullscreen window closes it too) or a window
+  comes or goes;
+- `{"event":"companion","state":"first_step"|"arrived"|"blocked"|"aborted","target":"foot",...}`,
+  with a `reason` for `blocked` and `aborted`.
+
+Its body lives as long as the plugin: leaving the room keeps it where it
+stood, `reset()` puts it back beside the spawn.
+
 ## Controls
 
 | Input                         | Action                                         |

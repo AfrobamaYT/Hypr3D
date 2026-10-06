@@ -27,6 +27,7 @@
 #include <hyprland/src/render/gl/GLFramebuffer.hpp>
 #include <hyprland/src/output/Monitor.hpp>
 #include <hyprland/src/desktop/view/Window.hpp>
+#include <hyprland/src/managers/EventManager.hpp>
 #include <hyprland/src/managers/SeatManager.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
 #include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
@@ -67,6 +68,8 @@ extern "C" {
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -586,25 +589,20 @@ static bool        g_playerJumpQueued = false;
 static constexpr float PLAYER_EYE_OFF =
     Camera::kEyeHeight - Camera::kBodyHeight * 0.5f;
 
-static void ensurePlayerBody() {
-    if (!g_joltSystem || !g_playerBody.IsInvalid())
-        return;
-
+// A 0.6x1.8 capsule driven by velocity: the player's body and the
+// companion's.
+static JPH::BodyID capsuleBody(const JPH::RVec3& center) {
     JPH::CapsuleShapeSettings CAPSULE(
         Camera::kBodyHeight * 0.5f - Camera::kBodyHalfWidth, // cylinder half
         Camera::kBodyHalfWidth);                             // -> 0.6x1.8
     CAPSULE.SetEmbedded();
     auto RES = CAPSULE.Create();
     if (RES.HasError())
-        return;
+        return {};
 
-    // Spawned under the camera (the camera was placed by the spawn reset).
-    const auto& CAM = g_scene.camera();
     JPH::BodyCreationSettings BCS(
-        RES.Get(),
-        JPH::RVec3(CAM.position.x, CAM.position.y - PLAYER_EYE_OFF,
-                   CAM.position.z),
-        JPH::Quat::sIdentity(), JPH::EMotionType::Dynamic, LAYER_MOVING);
+        RES.Get(), center, JPH::Quat::sIdentity(), JPH::EMotionType::Dynamic,
+        LAYER_MOVING);
     BCS.mAllowedDOFs   = JPH::EAllowedDOFs::TranslationX |
                          JPH::EAllowedDOFs::TranslationY |
                          JPH::EAllowedDOFs::TranslationZ;
@@ -623,9 +621,19 @@ static void ensurePlayerBody() {
 
     auto* B = g_bodyIf->CreateBody(BCS);
     if (!B)
-        return;
+        return {};
     g_bodyIf->AddBody(B->GetID(), JPH::EActivation::Activate);
-    g_playerBody = B->GetID();
+    return B->GetID();
+}
+
+static void ensurePlayerBody() {
+    if (!g_joltSystem || !g_playerBody.IsInvalid())
+        return;
+
+    // Spawned under the camera (the camera was placed by the spawn reset).
+    const auto& CAM = g_scene.camera();
+    g_playerBody = capsuleBody(JPH::RVec3(
+        CAM.position.x, CAM.position.y - PLAYER_EYE_OFF, CAM.position.z));
 }
 
 // The grid platform as real physics: a slab matching the visible grid
@@ -674,6 +682,498 @@ static bool playerGrounded() {
     return g_joltSystem->GetNarrowPhaseQuery().CastRay(
         RAY, HIT, JPH::BroadPhaseLayerFilter(), JPH::ObjectLayerFilter(),
         SKIP_SELF);
+}
+
+// --- the companion: a second avatar, driven from outside --------------------
+// hl.plugin.hypr3d.companion(verb, target) is its whole interface. A separate
+// bridge process speaks for it to an AI over the Neuro SDK protocol, so no
+// network code lives in the compositor. Its rights are its own body and its
+// own gaze: it walks a straight line to a target and turns to face one; it
+// types into nothing and never walks into the player. The body is a second
+// capsule like the player's and lives as long as the plugin, so leaving the
+// room keeps it where it stood. What it does goes out on socket2 as
+// hypr3d>>{json}, stamped with CLOCK_MONOTONIC.
+enum class ECompanionMode : uint8_t { Idle, Walk, Turn };
+enum class ECompanionTarget : uint8_t { Player, Spawn, Window };
+
+struct SCompanion {
+    JPH::BodyID      body{};
+    float            yaw  = 0.f; // where it faces, the camera's convention
+    ECompanionMode   mode = ECompanionMode::Idle;
+    ECompanionTarget kind = ECompanionTarget::Spawn;
+    std::string      target;     // the name it was sent to
+    std::uintptr_t   windowId = 0;
+    Vec3             start{};    // where the walk began
+    bool             stepped   = false;
+    float            stuck     = 0.f; // seconds walking without getting anywhere
+    float            lastSpeed = 0.f; // commanded on the previous frame
+};
+static SCompanion g_companion;
+
+static constexpr float kCompanionSpeed = 3.0f;  // m/s; the player flies at 4
+static constexpr float kCompanionTurn  = 8.0f;  // rad/s
+static constexpr float kNearPlayer     = 1.5f;  // go_to "player" ends here
+static constexpr float kNearPoint      = 0.3f;  // every other target
+static constexpr float kWindowStandOff = 1.5f;  // in front of a window
+static constexpr float kPersonalSpace  = 0.9f;  // body centers, never closer
+static constexpr float kStuckSeconds   = 1.5f;
+static constexpr float kFloorHalf      = 20.0f; // the slab in syncFloorBody
+
+// Windows are named by their app class in lower case, numbered from the
+// second of a class on ("foot", "foot 2"). A number stays with its window
+// while it lives; the next window of the class gets the lowest free one.
+struct SCompanionName {
+    PHLWINDOWREF window;
+    std::string  base;
+    int          number = 1;
+
+    std::string name() const {
+        return number == 1 ? base : base + " " + std::to_string(number);
+    }
+};
+static std::unordered_map<std::uintptr_t, SCompanionName> g_companionNames;
+
+static long long monotonicNs() {
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<long long>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
+}
+
+static std::string jsonString(const std::string& s) {
+    std::string out = "\"";
+    for (const unsigned char C : s) {
+        if (C == '"' || C == '\\') {
+            out += '\\';
+            out += static_cast<char>(C);
+        } else if (C < 0x20) {
+            char buf[8];
+            std::snprintf(buf, sizeof(buf), "\\u%04x", C);
+            out += buf;
+        } else
+            out += static_cast<char>(C);
+    }
+    return out + "\"";
+}
+
+static void postRoomEvent(const std::string& json) {
+    if (g_pEventManager)
+        g_pEventManager->postEvent(SHyprIPCEvent{"hypr3d", json});
+}
+
+// Open = on screen and taking commands: not while it fades out, not while a
+// fullscreen window has it paused.
+static bool roomOpen() {
+    return g_active && g_transitionTarget > 0.5f &&
+        g_fsPhase != EFullscreenPhase::In2D;
+}
+
+// The windows in the room with their names, sorted by name. Layers (bars,
+// notifications) are no targets.
+static std::vector<std::pair<std::uintptr_t, std::string>> companionWindows() {
+    std::erase_if(g_companionNames,
+                  [](const auto& KV) { return !KV.second.window.lock(); });
+
+    std::vector<std::uintptr_t> ids;
+    for (const auto& E : g_world.entities()) {
+        const auto W = Compat::findWindowById(E.id);
+        if (!W)
+            continue;
+
+        if (!g_companionNames.contains(E.id)) {
+            // Only [a-z0-9._-]: a name is always safe to pass back in.
+            std::string base;
+            for (unsigned char C : W->m_class.empty() ? W->m_initialClass : W->m_class) {
+                if (C >= 'A' && C <= 'Z')
+                    C = C - 'A' + 'a';
+                const bool KEEP = (C >= 'a' && C <= 'z') || (C >= '0' && C <= '9') ||
+                    C == '.' || C == '-' || C == '_';
+                base += KEEP ? static_cast<char>(C) : '-';
+            }
+            if (base.empty())
+                base = "window";
+            if (base.size() > 40)
+                base.resize(40);
+
+            // "player" and "spawn" are taken by the other targets.
+            int number = base == "player" || base == "spawn" ? 2 : 1;
+            for (bool taken = true; taken;) {
+                taken = false;
+                for (const auto& [ID, N] : g_companionNames)
+                    if (N.base == base && N.number == number) {
+                        taken = true;
+                        ++number;
+                        break;
+                    }
+            }
+            g_companionNames.emplace(E.id, SCompanionName{W, base, number});
+        }
+        ids.push_back(E.id);
+    }
+
+    std::ranges::sort(ids, [](std::uintptr_t a, std::uintptr_t b) {
+        const auto& A = g_companionNames.at(a);
+        const auto& B = g_companionNames.at(b);
+        return A.base != B.base ? A.base < B.base : A.number < B.number;
+    });
+
+    std::vector<std::pair<std::uintptr_t, std::string>> out;
+    for (const auto ID : ids)
+        out.emplace_back(ID, g_companionNames.at(ID).name());
+    return out;
+}
+
+static std::string companionTargetList() {
+    std::string out = "player, spawn";
+    for (const auto& [ID, NAME] : companionWindows())
+        out += ", " + NAME;
+    return out;
+}
+
+static bool companionResolve(const std::string& name, ECompanionTarget& kind,
+                             std::uintptr_t& id) {
+    if (name == "player" || name == "spawn") {
+        kind = name == "player" ? ECompanionTarget::Player : ECompanionTarget::Spawn;
+        return true;
+    }
+    for (const auto& [ID, NAME] : companionWindows())
+        if (NAME == name) {
+            kind = ECompanionTarget::Window;
+            id   = ID;
+            return true;
+        }
+    return false;
+}
+
+// Where a walk to the target ends this frame, what to face there and how
+// close counts as there. False with the reason when the target is gone.
+static bool companionGoal(ECompanionTarget kind, std::uintptr_t id,
+                          const std::string& name, const Vec3& at, Vec3& point,
+                          std::optional<Vec3>& face, float& near,
+                          std::string& why) {
+    face.reset();
+    near = kNearPoint;
+
+    switch (kind) {
+        case ECompanionTarget::Player: {
+            if (g_playerBody.IsInvalid()) {
+                why = "The player has no body";
+                return false;
+            }
+            const auto P = g_bodyIf->GetPosition(g_playerBody);
+            point = Vec3{P.GetX(), 0.f, P.GetZ()};
+            face  = point;
+            near  = kNearPlayer;
+            return true;
+        }
+        case ECompanionTarget::Spawn: point = Vec3{g_playerSpawn.x, 0.f, g_playerSpawn.z}; break;
+        case ECompanionTarget::Window: {
+            const auto* E = g_world.find(id);
+            if (!E) {
+                why = "'" + name + "' " +
+                    (Compat::findWindowById(id) ? "left the room" : "was closed");
+                return false;
+            }
+
+            // On the floor along the window's normal, the side its content
+            // faces; a window lying flat is approached from where the
+            // companion stands.
+            const Vec3 N = g_world.normalOf(id);
+            float hx = N.x, hz = N.z, len = std::sqrt(hx * hx + hz * hz);
+            if (len < 0.2f) {
+                hx  = at.x - E->center.x;
+                hz  = at.z - E->center.z;
+                len = std::sqrt(hx * hx + hz * hz);
+                if (len < 1e-3f)
+                    hx = 0.f, hz = 1.f, len = 1.f;
+            }
+            point = Vec3{E->center.x + hx / len * kWindowStandOff, 0.f,
+                         E->center.z + hz / len * kWindowStandOff};
+            face  = Vec3{E->center.x, 0.f, E->center.z};
+            break;
+        }
+    }
+    return true;
+}
+
+// A walk ends on the floor. The player is the exception: it may fly past
+// the edge, and the companion then stops there (updateCompanion).
+static bool companionReachable(ECompanionTarget kind, const std::string& name,
+                               const Vec3& point, std::string& why) {
+    const float EDGE = kFloorHalf - Camera::kBodyHalfWidth;
+    if (kind == ECompanionTarget::Player ||
+        (std::fabs(point.x) <= EDGE && std::fabs(point.z) <= EDGE))
+        return true;
+    why = kind == ECompanionTarget::Window ?
+        "The point in front of '" + name + "' is off the floor" :
+        "'" + name + "' is off the floor";
+    return false;
+}
+
+static void companionEvent(const char* state, const std::string& reason = {}) {
+    std::string json = std::string("{\"event\":\"companion\",\"state\":\"") + state +
+        "\",\"target\":" + jsonString(g_companion.target);
+    if (!reason.empty())
+        json += ",\"reason\":" + jsonString(reason);
+    postRoomEvent(json + ",\"t\":" + std::to_string(monotonicNs()) + "}");
+}
+
+// Stands still. A walk cut short says why, unless `state` is null (stop).
+static void companionHalt(const char* state, const std::string& reason) {
+    if (g_companion.mode == ECompanionMode::Walk && state)
+        companionEvent(state, reason);
+
+    g_companion.mode      = ECompanionMode::Idle;
+    g_companion.stuck     = 0.f;
+    g_companion.lastSpeed = 0.f;
+    if (!g_companion.body.IsInvalid() && g_bodyIf) {
+        const auto V = g_bodyIf->GetLinearVelocity(g_companion.body);
+        g_bodyIf->SetLinearVelocity(g_companion.body, JPH::Vec3(0.f, V.GetY(), 0.f));
+    }
+}
+
+// Turns toward `to` at the turn rate; true once it faces it.
+static bool companionTurn(const Vec3& from, const Vec3& to, float dt) {
+    const float DX = to.x - from.x, DZ = to.z - from.z;
+    if (DX * DX + DZ * DZ < 1e-6f)
+        return true;
+
+    const float WANT = std::atan2(DX, -DZ);
+    const float DIFF = std::remainder(WANT - g_companion.yaw, 2.f * std::numbers::pi_v<float>);
+    const float STEP = kCompanionTurn * dt;
+    if (std::fabs(DIFF) <= STEP) {
+        g_companion.yaw = WANT;
+        return true;
+    }
+    g_companion.yaw += DIFF > 0.f ? STEP : -STEP;
+    return false;
+}
+
+// Its place when it is new and after a reset: a step ahead of the player's
+// spawn and to the right, turned toward it. Feet, like the player's spawn.
+static void placeCompanion() {
+    const float YAW = std::atan2(-g_playerSpawn.x, g_playerSpawn.z); // as placeAtSpawn
+    const Vec3 FEET{
+        g_playerSpawn.x + std::sin(YAW) * 1.5f + std::cos(YAW) * 1.2f,
+        g_playerSpawn.y,
+        g_playerSpawn.z - std::cos(YAW) * 1.5f + std::sin(YAW) * 1.2f,
+    };
+    g_companion.yaw =
+        std::atan2(g_playerSpawn.x - FEET.x, -(g_playerSpawn.z - FEET.z));
+
+    if (g_companion.body.IsInvalid() || !g_bodyIf)
+        return;
+    g_bodyIf->SetPositionAndRotation(
+        g_companion.body,
+        JPH::RVec3(FEET.x, FEET.y + Camera::kBodyHeight * 0.5f, FEET.z),
+        JPH::Quat::sIdentity(), JPH::EActivation::Activate);
+    g_bodyIf->SetLinearVelocity(g_companion.body, JPH::Vec3::sZero());
+}
+
+static void ensureCompanionBody() {
+    if (!g_joltSystem || !g_companion.body.IsInvalid())
+        return;
+
+    g_companion.body = capsuleBody(JPH::RVec3::sZero());
+    placeCompanion();
+}
+
+static bool companionStart(bool walk, const std::string& name, std::string& why) {
+    if (!roomOpen()) {
+        why = "The room is closed";
+        return false;
+    }
+    ensureCompanionBody();
+    if (g_companion.body.IsInvalid()) {
+        why = "The companion has no body: the physics did not start";
+        return false;
+    }
+    if (walk && g_floorBody.IsInvalid()) {
+        why = "There is no floor to walk on (world.grid is off)";
+        return false;
+    }
+
+    ECompanionTarget kind = ECompanionTarget::Spawn;
+    std::uintptr_t   id   = 0;
+    if (!companionResolve(name, kind, id)) {
+        why = "Unknown target '" + name + "'. Targets now: " + companionTargetList();
+        return false;
+    }
+
+    const auto P = g_bodyIf->GetPosition(g_companion.body);
+    const Vec3 AT{P.GetX(), P.GetY(), P.GetZ()};
+    Vec3 point{};
+    std::optional<Vec3> face;
+    float near = 0.f;
+    if (!companionGoal(kind, id, name, AT, point, face, near, why) ||
+        (walk && !companionReachable(kind, name, point, why)))
+        return false;
+
+    // A walk under way is replaced without a word: the new command says
+    // what became of it.
+    g_companion.mode      = walk ? ECompanionMode::Walk : ECompanionMode::Turn;
+    g_companion.kind      = kind;
+    g_companion.windowId  = id;
+    g_companion.target    = name;
+    g_companion.start     = AT;
+    g_companion.stepped   = false;
+    g_companion.stuck     = 0.f;
+    g_companion.lastSpeed = 0.f;
+    return true;
+}
+
+// Once per frame after the physics step: steer for the next one.
+static void updateCompanion(float dt) {
+    ensureCompanionBody();
+    if (g_companion.body.IsInvalid())
+        return;
+
+    // It stands on the slab; without one it stays where it is instead of
+    // falling forever.
+    const bool FLOOR = !g_floorBody.IsInvalid();
+    if (!FLOOR && g_companion.mode == ECompanionMode::Walk)
+        companionHalt("aborted", "There is no floor any more (world.grid is off)");
+    g_bodyIf->SetGravityFactor(g_companion.body, FLOOR ? 1.f : 0.f);
+
+    const auto P = g_bodyIf->GetPosition(g_companion.body);
+    const Vec3 AT{P.GetX(), P.GetY(), P.GetZ()};
+    const auto V = g_bodyIf->GetLinearVelocity(g_companion.body);
+    float vx = 0.f, vz = 0.f;
+
+    if (g_companion.mode != ECompanionMode::Idle) {
+        Vec3 point{};
+        std::optional<Vec3> face;
+        float near = kNearPoint;
+        std::string why;
+
+        if (!companionGoal(g_companion.kind, g_companion.windowId, g_companion.target,
+                           AT, point, face, near, why) ||
+            (g_companion.mode == ECompanionMode::Walk &&
+             !companionReachable(g_companion.kind, g_companion.target, point, why)))
+            companionHalt("aborted", why);
+
+        if (g_companion.mode == ECompanionMode::Turn) {
+            if (companionTurn(AT, face.value_or(point), dt))
+                g_companion.mode = ECompanionMode::Idle;
+        } else if (g_companion.mode == ECompanionMode::Walk) {
+            const float SX = AT.x - g_companion.start.x, SZ = AT.z - g_companion.start.z;
+            if (!g_companion.stepped && SX * SX + SZ * SZ > 1e-4f) {
+                g_companion.stepped = true;
+                companionEvent("first_step");
+            }
+
+            const float TX = point.x - AT.x, TZ = point.z - AT.z;
+            const float DIST = std::sqrt(TX * TX + TZ * TZ);
+
+            if (DIST <= near) {
+                // There: it stands, then turns to the target.
+                g_companion.lastSpeed = 0.f;
+                if (!face || companionTurn(AT, *face, dt)) {
+                    companionEvent("arrived");
+                    g_companion.mode = ECompanionMode::Idle;
+                }
+            } else {
+                const float DX = TX / DIST, DZ = TZ / DIST;
+                float speed = std::clamp(2.5f * (DIST - near) + 0.5f, 0.5f, kCompanionSpeed);
+                std::string blocker;
+
+                // Never into the player, never off the edge: it stops short.
+                if (g_companion.kind != ECompanionTarget::Player &&
+                    !g_playerBody.IsInvalid()) {
+                    const auto PP = g_bodyIf->GetPosition(g_playerBody);
+                    const float QX = PP.GetX() - AT.x, QZ = PP.GetZ() - AT.z;
+                    if (QX * QX + QZ * QZ < kPersonalSpace * kPersonalSpace &&
+                        QX * DX + QZ * DZ > 0.f &&
+                        std::fabs(PP.GetY() - AT.y) < Camera::kBodyHeight) {
+                        speed   = 0.f;
+                        blocker = "The player is in the way";
+                    }
+                }
+                const float EDGE = kFloorHalf - Camera::kBodyHalfWidth;
+                if (std::fabs(AT.x + DX * 0.35f) > EDGE ||
+                    std::fabs(AT.z + DZ * 0.35f) > EDGE) {
+                    speed   = 0.f;
+                    blocker = "The floor ends here";
+                }
+
+                // Progress on the velocity the solver left: what a wall or a
+                // prop takes away is missing there.
+                const float MADE = V.GetX() * DX + V.GetZ() * DZ;
+                if (speed == 0.f || MADE < 0.25f * g_companion.lastSpeed)
+                    g_companion.stuck += dt;
+                else
+                    g_companion.stuck = 0.f;
+                g_companion.lastSpeed = speed;
+
+                if (g_companion.stuck > kStuckSeconds)
+                    companionHalt("blocked",
+                                  blocker.empty() ? "Something is in the way" : blocker);
+                else {
+                    vx = DX * speed;
+                    vz = DZ * speed;
+                    companionTurn(AT, point, dt);
+                }
+            }
+        }
+    }
+
+    g_bodyIf->SetLinearVelocity(
+        g_companion.body,
+        JPH::Vec3(vx, FLOOR ? std::max(V.GetY(), -40.f) : 0.f, vz));
+    g_scene.setCompanion(AT, g_companion.yaw, true);
+}
+
+// The room event: open or closed, and when open what can be walked to.
+static void postRoomState() {
+    const bool OPEN = roomOpen();
+    std::string json = std::string("{\"event\":\"room\",\"open\":") + (OPEN ? "true" : "false");
+    if (OPEN) {
+        json += ",\"targets\":[{\"name\":\"player\"},{\"name\":\"spawn\"}";
+        for (const auto& [ID, NAME] : companionWindows()) {
+            json += ",{\"name\":" + jsonString(NAME);
+            if (const auto W = Compat::findWindowById(ID))
+                json += ",\"title\":" + jsonString(W->m_title);
+            json += "}";
+        }
+        json += "]";
+    }
+    postRoomEvent(json + ",\"t\":" + std::to_string(monotonicNs()) + "}");
+}
+
+// Posts the room event when it opened, closed or a window came or went --
+// once the change has held for 100 ms, so the frames in which the room fills
+// up after opening send one event, not one per window. Titles change all the
+// time and do not count.
+static std::string                           g_roomPosted = "closed";
+static std::string                           g_roomPending;
+static std::chrono::steady_clock::time_point g_roomPendingSince{};
+
+static void syncRoomState(bool now) {
+    const bool OPEN = roomOpen();
+    if (!OPEN && g_companion.mode != ECompanionMode::Idle)
+        companionHalt("aborted", "The room was closed");
+
+    std::string sig = OPEN ? "open" : "closed";
+    if (OPEN)
+        for (const auto& [ID, NAME] : companionWindows())
+            sig += "\n" + NAME;
+
+    if (sig == g_roomPosted) {
+        g_roomPending.clear();
+        return;
+    }
+    const auto NOW = std::chrono::steady_clock::now();
+    if (!now) {
+        if (sig != g_roomPending) {
+            g_roomPending      = sig;
+            g_roomPendingSince = NOW;
+            return;
+        }
+        if (NOW - g_roomPendingSince < std::chrono::milliseconds(100))
+            return;
+    }
+    g_roomPosted = sig;
+    g_roomPending.clear();
+    postRoomState();
 }
 
 // Euler (degrees, our RY*RX*RZ convention) -> Jolt quaternion.
@@ -2801,6 +3301,7 @@ static void deactivate3D() {
     resetPointerGesture();
 
     g_active = false;
+    syncRoomState(true);
     stopFramePump();
 
     // Fullscreen passthrough state: back to plain 3D-off. Restore the real
@@ -3328,6 +3829,7 @@ static void update3D(float dt) {
     // ---- player physics body: input -> velocity, Jolt owns the pose ----
     ensurePlayerBody();
     syncFloorBody();
+    updateCompanion(dt);
 
     if (!g_playerBody.IsInvalid()) {
         auto& CAM = g_scene.camera();
@@ -3939,6 +4441,17 @@ static void dumpStatus() {
         out << "camera: pos=(" << CAM.position.x << "," << CAM.position.y << "," << CAM.position.z
             << ") yaw=" << CAM.yaw << " pitch=" << CAM.pitch << " view=" << g_viewMode
             << " remembered=" << (g_room.valid ? 1 : 0) << "/" << g_room.poses.size() << "\n";
+
+        if (!g_companion.body.IsInvalid() && g_bodyIf) {
+            static constexpr const char* MODES[] = {"idle", "walk", "turn"};
+            const auto P = g_bodyIf->GetPosition(g_companion.body);
+            out << "companion: pos=(" << P.GetX() << "," << P.GetY() << "," << P.GetZ()
+                << ") yaw=" << g_companion.yaw
+                << " mode=" << MODES[static_cast<int>(g_companion.mode)]
+                << " target=" << (g_companion.target.empty() ? "-" : g_companion.target)
+                << " stuck=" << g_companion.stuck << " room=" << g_roomPosted.substr(0, g_roomPosted.find('\n'))
+                << "\n";
+        }
     }
     out << "lastError=" << (g_lastError.empty() ? "none" : g_lastError)
         << "\n";
@@ -4054,6 +4567,7 @@ static void onRenderStage(eRenderStage stage) {
     }
 
     dumpStatus();
+    syncRoomState(false);
 
     const float dt = updateTransition();
 
@@ -5383,6 +5897,8 @@ static int luaConfig(lua_State* L) {
 // the room forgets how it was left.
 static void resetRoom() {
     g_room = {};
+    companionHalt("aborted", "The room was reset");
+    placeCompanion();
     if (!g_active)
         return;
 
@@ -5407,6 +5923,57 @@ static void resetRoom() {
 
 static int luaReset(lua_State*) {
     resetRoom();
+    return 0;
+}
+
+// hl.plugin.hypr3d.companion(verb[, target]): go_to and look_at check the
+// target and set off, or fail with the reason -- hyprctl eval prints it and
+// exits non-zero. stop halts; state posts the room event now, for a bridge
+// that has just connected. The checks run in a function of their own that
+// returns before lua_error: Lua's error is a longjmp, and it must not skip
+// the destructors of live C++ objects.
+static bool companionLua(lua_State* L) {
+    const char* VERB = lua_type(L, 1) == LUA_TSTRING ? lua_tostring(L, 1) : "";
+    const std::string verb = VERB;
+
+    if (verb == "state") {
+        postRoomState();
+        return true;
+    }
+    if (verb == "stop") {
+        companionHalt(nullptr, {});
+        return true;
+    }
+    if (verb != "go_to" && verb != "look_at") {
+        lua_pushstring(L, "companion: the verb is go_to, look_at, stop or state");
+        return false;
+    }
+    if (lua_type(L, 2) != LUA_TSTRING) {
+        lua_pushstring(L, "companion: go_to and look_at need a target name");
+        return false;
+    }
+
+    // Names are lower case; what the model typed may not be.
+    std::string target = lua_tostring(L, 2);
+    for (auto& c : target)
+        if (c >= 'A' && c <= 'Z')
+            c = c - 'A' + 'a';
+    const auto FIRST = target.find_first_not_of(' ');
+    target = FIRST == std::string::npos ?
+        "" : target.substr(FIRST, target.find_last_not_of(' ') - FIRST + 1);
+    if (target.size() > 64)
+        target.resize(64);
+
+    std::string why;
+    if (companionStart(verb == "go_to", target, why))
+        return true;
+    lua_pushstring(L, ("companion: " + why).c_str());
+    return false;
+}
+
+static int luaCompanion(lua_State* L) {
+    if (!companionLua(L))
+        return lua_error(L);
     return 0;
 }
 
@@ -5502,6 +6069,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "close", luaClose))
         throw std::runtime_error("[hypr3d] failed to register Lua close");
+
+    if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "companion", luaCompanion))
+        throw std::runtime_error("[hypr3d] failed to register Lua companion");
 
     if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "reset", luaReset))
         throw std::runtime_error("[hypr3d] failed to register Lua reset");
@@ -5625,6 +6195,10 @@ APICALL EXPORT void PLUGIN_EXIT() {
     if (g_deactivateLater && g_pEventLoopManager)
         g_pEventLoopManager->removeDoLater(g_deactivateLater);
     g_deactivateLater = 0;
+
+    // A bridge must not take a room that is gone for open.
+    g_transitionTarget = 0.0f;
+    syncRoomState(true);
 
     joltShutdown();
 

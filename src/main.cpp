@@ -69,7 +69,10 @@ extern "C" {
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
+#include <numbers>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -104,6 +107,7 @@ static std::string g_lastRenderGate;  // why the 3D pass was skipped last frame
 static double g_msUpdate3D = 0.0;     // per-section profiling (exponential avg)
 static double g_msJolt     = 0.0;
 static double g_msRender   = 0.0;
+static double g_msRenderSpan = 0.0;    // one neighbour's pass, the same average
 static std::string g_lastError;        // last caught handler exception
 
 static void dumpErrorNow(const std::string& what) {
@@ -315,6 +319,7 @@ static bool g_hookInstalled = false;
 static std::string g_cfgPanorama;                // panorama image path
 static std::string g_cfgMonitor;                 // monitor name (e.g. "DP-1"), empty = focused
 static bool        g_cfgGrid = true;             // base grid platform on/off
+static bool        g_cfgSpan = true;             // the room across every monitor
 
 // --- windows ----------------------------------------------------------------
 static float       g_cfgWindowScale   = 0.5f;    // room multiplier on window size
@@ -999,6 +1004,8 @@ static uint32_t inputTimeMs() {
     return static_cast<uint32_t>(std::max<int64_t>(0, elapsed));
 }
 
+static std::vector<PHLMONITOR> spannedMonitors();
+
 static void damageCurrentMonitor() {
     if (!g_monitor)
         return;
@@ -1009,6 +1016,23 @@ static void damageCurrentMonitor() {
     g_pHyprRenderer->damageMonitor(
         g_monitor
     );
+
+    // The neighbours the room spans show the same moving room.
+    if (g_active)
+        for (const auto& mon : spannedMonitors())
+            if (mon != g_monitor)
+                g_pHyprRenderer->damageMonitor(mon);
+}
+
+// Every monitor redrawn: leaving the room, a neighbour with no window to
+// re-lay out would otherwise keep showing its last 3D frame.
+static void damageAllMonitors() {
+    if (!g_pHyprRenderer || !State::monitorState())
+        return;
+
+    for (const auto& mon : State::monitorState()->monitors())
+        if (mon)
+            g_pHyprRenderer->damageMonitor(mon);
 }
 
 static PHLMONITOR g_currentRenderMon = nullptr;
@@ -1027,6 +1051,96 @@ static PHLMONITOR targetMonitor() {
         return FOCUSED;
 
     return g_monitor;
+}
+
+// The monitors the room spans: with world.span (the default) every enabled
+// monitor that mirrors none, the one the view is built for first; without it
+// that one alone.
+static std::vector<PHLMONITOR> spannedMonitors() {
+    std::vector<PHLMONITOR> out;
+    const auto MAIN = targetMonitor();
+
+    if (!MAIN)
+        return out;
+
+    out.push_back(MAIN);
+
+    if (!g_cfgSpan || !State::monitorState())
+        return out;
+
+    for (const auto& mon : State::monitorState()->monitors()) {
+        if (!mon || mon == MAIN || !mon->m_enabled || mon->m_isUnsafeFallback ||
+            mon->m_mirrorOf.lock() || mon->m_size.x <= 0 || mon->m_size.y <= 0)
+            continue;
+
+        out.push_back(mon);
+    }
+
+    return out;
+}
+
+static bool isSpanned(const PHLMONITOR& mon) {
+    const auto ALL = spannedMonitors();
+    return std::find(ALL.begin(), ALL.end(), mon) != ALL.end();
+}
+
+// The view plane the monitors are windows in. The eye sits in front of the
+// centre of the monitor the view is built for, at the distance (in logical
+// px) at which that monitor spans the field of view; every monitor lies in the
+// one plane where the layout puts it. So the room continues across the
+// screens the way the desktop does -- the layout's arrangement, flat: tilted
+// side screens and bezels are not modelled. (Kooima, "Generalized
+// Perspective Projection", for a flat wall of screens.)
+struct SViewPlane {
+    double distance = 0.0;      // eye to plane, logical px
+    double cx = 0.0, cy = 0.0;  // the eye's foot on the plane, layout px
+};
+
+static std::optional<SViewPlane> viewPlane() {
+    const auto MAIN = targetMonitor();
+
+    if (!MAIN || MAIN->m_size.x <= 0 || MAIN->m_size.y <= 0)
+        return std::nullopt;
+
+    const double TANFOV = std::tan(kFovDeg * std::numbers::pi / 360.0);
+
+    return SViewPlane{
+        MAIN->m_size.y * 0.5 / TANFOV,
+        MAIN->m_position.x + MAIN->m_size.x * 0.5,
+        MAIN->m_position.y + MAIN->m_size.y * 0.5,
+    };
+}
+
+// The rectangle of the view plane a monitor shows, in tangents of the view
+// axis. For the main monitor it is its own symmetric field of view.
+static GLScene::ViewWindow viewWindowFor(const PHLMONITOR& mon) {
+    const auto PLANE = viewPlane();
+
+    if (!PLANE || !mon)
+        return {};
+
+    const double D = PLANE->distance;
+
+    return GLScene::ViewWindow{
+        static_cast<float>((mon->m_position.x - PLANE->cx) / D),
+        static_cast<float>((mon->m_position.x + mon->m_size.x - PLANE->cx) / D),
+        static_cast<float>((PLANE->cy - mon->m_position.y - mon->m_size.y) / D),
+        static_cast<float>((PLANE->cy - mon->m_position.y) / D),
+    };
+}
+
+// The windows and panels of every monitor the room spans, each with its
+// monitor.
+static std::vector<Compat::SWindowInfo> eligibleWindowsSpanned() {
+    std::vector<Compat::SWindowInfo> out;
+
+    for (const auto& mon : spannedMonitors()) {
+        auto part = Compat::enumerateEligibleWindows(mon);
+        out.insert(out.end(), std::make_move_iterator(part.begin()),
+                   std::make_move_iterator(part.end()));
+    }
+
+    return out;
 }
 
 // Where the crosshair sits in logical coordinates: the centre of the monitor
@@ -1075,12 +1189,10 @@ static void clearAimFocus() {
 // triggers a relayout of the ones still attached, which would corrupt boxes
 // captured afterwards. Ghosting is what stops tiling from managing windows
 // while they are living in 3D space.
-static void ghostWindows(const PHLMONITOR& mon) {
-    if (!mon)
-        return;
-
-    const auto INFOS = Compat::enumerateEligibleWindows(mon);
-
+// INFOS: the windows of every monitor the room spans (eligibleWindowsSpanned):
+// one first pass saves them all, or the second monitor's windows would be
+// taken for windows new to the room and shrunk to a spawn panel.
+static void ghostWindows(const std::vector<Compat::SWindowInfo>& INFOS) {
     if (!g_ghosted) {
         // First pass: save EVERY window before ghosting any of them, since
         // ghosting one window triggers a relayout of the ones still attached,
@@ -1126,7 +1238,8 @@ static void ghostWindows(const PHLMONITOR& mon) {
         // user actually worked with. setWindowBox takes GLOBAL layout
         // coordinates: centre on this monitor, not on the layout origin
         // (which belongs to whichever monitor sits at 0,0, or none at all).
-        if (info.window) {
+        if (info.window && info.monitor) {
+            const auto& mon = info.monitor;
             const double CX =
                 mon->m_position.x + mon->m_size.x * 0.5 - kSpawnWidth * 0.5;
             const double CY =
@@ -1294,9 +1407,9 @@ static void refreshCaptures(
         }
 
         if (info.isLayer)
-            g_capture.makeSnapshotLayer(info.layer, mon, FORCE || finalSkirt);
+            g_capture.makeSnapshotLayer(info.layer, info.monitor ? info.monitor : mon, FORCE || finalSkirt);
         else
-            g_capture.makeSnapshot(info.window, mon, FORCE || finalSkirt);
+            g_capture.makeSnapshot(info.window, info.monitor ? info.monitor : mon, FORCE || finalSkirt);
     }
 
     if (consumedSkirt)
@@ -1323,8 +1436,8 @@ static void serviceCapture() {
 
     g_capturing = true;
 
-    ghostWindows(MON);
-    refreshCaptures(Compat::enumerateEligibleWindows(MON), MON);
+    ghostWindows(eligibleWindowsSpanned());
+    refreshCaptures(eligibleWindowsSpanned(), MON);
 
     g_capturing = false;
 }
@@ -1392,7 +1505,7 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
     // monitor blur FBs; the compositor's outer endRender() then aborted in
     // CMonitor::useFP16(). Capture and ghosting therefore happen outside the
     // frame -- see serviceCapture().
-    const auto INFOS = Compat::enumerateEligibleWindows(mon);
+    const auto INFOS = eligibleWindowsSpanned();
 
     g_winOutlines.clear();
 
@@ -1411,8 +1524,37 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
     // other and the room showed a single panel. One alone still spawns
     // straight ahead. Each slot's angle is the arc length of the windows
     // before it over the radius, with a gap between neighbours.
+    // Spanning several monitors, new windows go on the wall (below), not on
+    // the arc.
+    const auto PLANE = viewPlane();
+    const bool WALL  = g_cfgSpan && PLANE && spannedMonitors().size() > 1;
+
+    // On the wall, windows that overlap on the desk would lie in one plane and
+    // cut into each other: each steps toward the eye by its place in the
+    // stack -- panels over floating windows over tiled ones over bottom-layer
+    // panels, a later one over an earlier (Hyprland lists windows bottom to
+    // top) -- one slab thickness and a gap per step.
+    std::unordered_map<std::uintptr_t, int> wallStack;
+    if (WALL) {
+        std::vector<const Compat::SWindowInfo*> ORDER;
+        ORDER.reserve(INFOS.size());
+        for (const auto& info : INFOS)
+            ORDER.push_back(&info);
+
+        const auto CLASS = [](const Compat::SWindowInfo* i) {
+            if (i->isLayer)
+                return i->layer && i->layer->m_layer <= 1 ? 0 : 3;
+            return i->floating ? 2 : 1;
+        };
+        std::stable_sort(ORDER.begin(), ORDER.end(),
+                         [&](const auto* a, const auto* b) { return CLASS(a) < CLASS(b); });
+
+        for (size_t i = 0; i < ORDER.size(); ++i)
+            wallStack[ORDER[i]->id] = static_cast<int>(i);
+    }
+
     std::unordered_map<std::uintptr_t, float> freshAngle;
-    {
+    if (!WALL) {
         std::vector<const Compat::SWindowInfo*> FRESH;
         for (const auto& info : INFOS)
             if (!info.isLayer && !g_world.find(info.id))
@@ -1536,14 +1678,42 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
             const auto& CAM = g_scene.camera();
             Vec3 FWD = CAM.forward();
 
-            // Its slot on the arc (see freshAngle): turned about the
-            // camera's up, to the right for a positive angle.
-            if (const auto SLOT = freshAngle.find(info.id); SLOT != freshAngle.end()) {
+            if (WALL && info.monitor) {
+                // Spanning several monitors the desktop becomes a wall: each
+                // window where it stood, on the view plane at the distance at
+                // which one of its pixels covers one pixel of the screen. On
+                // every monitor the room then opens on exactly the desktop it
+                // replaces. (On a sphere around the eye a side screen's
+                // windows overlapped: 66 degrees off the axis, a flat screen
+                // spans a quarter of the angle it would face-on.)
+                const double K  = World3D::toWorld(1.0f) * WIN_SCALE; // world units per logical px
+                const double GX = info.monitor->m_position.x + info.monitorLocalBox.x +
+                    info.monitorLocalBox.w * 0.5;
+                const double GY = info.monitor->m_position.y + info.monitorLocalBox.y +
+                    info.monitorLocalBox.h * 0.5;
                 const Vec3 RIGHT = CAM.right();
-                FWD = normalize(FWD * std::cos(SLOT->second) + RIGHT * std::sin(SLOT->second));
-            }
+                const Vec3 UP    = cross(RIGHT, FWD);
 
-            entity.center = CAM.position + FWD * g_cfgSpawnDistance;
+                const float STEP = std::max(g_cfgWindowDepth, 0.0f) + 0.02f;
+                const auto  RANK = wallStack.find(info.id);
+                const float NEARER =
+                    RANK != wallStack.end() ? STEP * static_cast<float>(RANK->second) : 0.0f;
+
+                entity.center = CAM.position +
+                    FWD * (static_cast<float>(PLANE->distance * K) - NEARER) +
+                    RIGHT * static_cast<float>((GX - PLANE->cx) * K) +
+                    UP * static_cast<float>((PLANE->cy - GY) * K);
+            }
+            else {
+                // Its slot on the arc (see freshAngle): turned about the
+                // camera's up, to the right for a positive angle.
+                if (const auto SLOT = freshAngle.find(info.id); SLOT != freshAngle.end()) {
+                    const Vec3 RIGHT = CAM.right();
+                    FWD = normalize(FWD * std::cos(SLOT->second) + RIGHT * std::sin(SLOT->second));
+                }
+
+                entity.center = CAM.position + FWD * g_cfgSpawnDistance;
+            }
 
             // Face the camera: with this model's convention (the normal's Y
             // component is -sin(pitch)) the target is the camera's own yaw
@@ -2513,7 +2683,9 @@ static void onRenderPre(PHLMONITOR mon) {
 
     const auto TARGET = targetMonitor();
     if (TARGET && mon != TARGET) {
-        g_currentRenderMon = nullptr;
+        // A neighbour the room spans draws it as well (onRenderStage); the
+        // target's frame captures and lays out for all of them.
+        g_currentRenderMon = g_active && isSpanned(mon) ? mon : nullptr;
         return;
     }
 
@@ -2571,6 +2743,7 @@ static void deactivate3D() {
     Compat::setPointerCapture(false);
 
     unghostWindows();
+    damageAllMonitors();
     g_renderedOnce = false;
 }
 
@@ -3350,8 +3523,11 @@ static void update3D(float dt) {
 
 class CHypr3DPassElement final : public IPassElement {
   public:
-    CHypr3DPassElement(float alpha, float dt) :
-        m_alpha(alpha), m_dt(dt) {}
+    // `view` set: a neighbour the room spans -- the same room through its own
+    // window of the view plane, drawn without advancing anything.
+    CHypr3DPassElement(float alpha, float dt,
+                       std::optional<GLScene::ViewWindow> view = std::nullopt) :
+        m_alpha(alpha), m_dt(dt), m_view(view) {}
 
     std::vector<UP<IPassElement>> draw() override {
         const auto GATE = [&](const std::string& why) {
@@ -3408,11 +3584,16 @@ class CHypr3DPassElement final : public IPassElement {
             height,
             m_alpha,
             m_dt,
-            g_renderWindows
+            g_renderWindows,
+            m_view ? &*m_view : nullptr,
+            !m_view
         );
-        g_msRender = g_msRender * 0.9 +
-            std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - R_T0).count() * 0.1;
+        const double MS = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - R_T0).count();
+        if (m_view)
+            g_msRenderSpan = g_msRenderSpan * 0.9 + MS * 0.1;
+        else
+            g_msRender = g_msRender * 0.9 + MS * 0.1;
 
         if (!result) {
             if (!g_reportedRenderError) {
@@ -3485,6 +3666,7 @@ class CHypr3DPassElement final : public IPassElement {
 
     float m_alpha;
     float m_dt;
+    std::optional<GLScene::ViewWindow> m_view;
 };
 
 // Throttled snapshot of the live state, written where I can read it directly
@@ -3621,7 +3803,15 @@ static void dumpStatus() {
         << " rtype=" << (g_pHyprRenderer ? (int)g_pHyprRenderer->type() : -1)
         << " (RT_GL=" << (int)Render::IHyprRenderer::RT_GL << ")\n";
     out << "msUpdate3D=" << g_msUpdate3D << " msJolt=" << g_msJolt
-        << " msRender=" << g_msRender << "\n";
+        << " msRender=" << g_msRender << " msRenderSpan=" << g_msRenderSpan << "\n";
+    {
+        out << "span=" << (g_cfgSpan ? 1 : 0) << " monitors=";
+        for (const auto& M : spannedMonitors()) {
+            const auto V = viewWindowFor(M);
+            out << M->m_name << "[" << V.left << "," << V.right << "," << V.bottom << "," << V.top << "] ";
+        }
+        out << "\n";
+    }
     out << "lastError=" << (g_lastError.empty() ? "none" : g_lastError)
         << "\n";
     out << "sceneObjects=" << g_sceneObjects.size() << " joltBodies="
@@ -3719,8 +3909,21 @@ static void onRenderStage(eRenderStage stage) {
     if (stage != RENDER_LAST_MOMENT)
         return;
 
-    if (!g_currentRenderMon || g_currentRenderMon != g_monitor)
+    if (!g_currentRenderMon)
         return;
+
+    if (g_currentRenderMon != g_monitor) {
+        // A neighbour the room spans: the room as the target's frame left
+        // it -- no clock, no physics, no transition step of its own -- through
+        // this monitor's window of the view plane.
+        if (g_fsPhase == EFullscreenPhase::In2D || g_transition <= 0.0f ||
+            !g_pHyprRenderer || g_pHyprRenderer->type() != Render::IHyprRenderer::RT_GL)
+            return;
+
+        g_pHyprRenderer->addPassElement(makeUnique<CHypr3DPassElement>(
+            g_diagAlpha, 0.0f, viewWindowFor(g_currentRenderMon)));
+        return;
+    }
 
     dumpStatus();
 
@@ -4603,6 +4806,8 @@ static int luaConfig(lua_State* L) {
             return luaL_error(L, "hypr3d.config: world.monitor must be a string");
         if (!SET_BOOL(idx, "grid", g_cfgGrid, "world.grid"))
             return luaL_error(L, "hypr3d.config: world.grid must be a boolean");
+        if (!SET_BOOL(idx, "span", g_cfgSpan, "world.span"))
+            return luaL_error(L, "hypr3d.config: world.span must be a boolean");
         lua_pop(L, 1);
     }
 
@@ -5293,6 +5498,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
     // until their first repaint).
     if (g_pHyprRenderer && g_monitor)
         g_pHyprRenderer->damageMonitor(g_monitor);
+    damageAllMonitors();
 
     Compat::setPointerCapture(false);
     Compat::removePointerHook();

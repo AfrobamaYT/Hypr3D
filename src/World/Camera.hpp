@@ -26,6 +26,9 @@ struct Mat4 {
 
     static Mat4 identity();
     static Mat4 perspective(float fovYRad, float aspect, float zNear, float zFar);
+    // Off-axis perspective (glFrustum): the near-plane rectangle need not be
+    // centred on the view axis.
+    static Mat4 frustum(float left, float right, float bottom, float top, float zNear, float zFar);
     static Mat4 lookAt(const Vec3& eye, const Vec3& center, const Vec3& up);
     static Mat4 rotationY(float r);
     static Mat4 rotationX(float r);

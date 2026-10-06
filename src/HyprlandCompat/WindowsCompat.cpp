@@ -46,6 +46,7 @@ std::vector<SWindowInfo> enumerateEligibleWindows(const PHLMONITOR& monitor) {
         info.id       = reinterpret_cast<std::uintptr_t>(window.get());
         info.window   = window;
         info.floating = window->m_isFloating;
+        info.monitor  = monitor;
 
         if (!decoratedSurfaceBox(
                 window,
@@ -81,6 +82,7 @@ std::vector<SWindowInfo> enumerateEligibleWindows(const PHLMONITOR& monitor) {
             info.id      = reinterpret_cast<std::uintptr_t>(LS.get());
             info.layer   = LS;
             info.isLayer = true;
+            info.monitor = monitor;
 
             info.monitorLocalBox = *BOXOPT;
             info.surfaceOffset   = Vector2D{0, 0};

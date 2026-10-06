@@ -581,6 +581,7 @@ uniform vec3 uRight;
 uniform vec3 uUp;
 uniform float uTanHalfX;
 uniform float uTanHalfY;
+uniform vec2 uTanCenter; // the rectangle's centre: off-axis on a side monitor
 uniform float uLod;
 uniform sampler2D uPanorama;
 
@@ -591,7 +592,8 @@ void main() {
     // sample the equirectangular panorama. fract() keeps u strictly inside
     // [0, 1) so the wrap point never rides the texture's outer edge.
     vec3 dir = normalize(
-        uFwd + uRight * (vNdc.x * uTanHalfX) + uUp * (vNdc.y * uTanHalfY));
+        uFwd + uRight * (uTanCenter.x + vNdc.x * uTanHalfX) +
+        uUp * (uTanCenter.y + vNdc.y * uTanHalfY));
 
     float lon = atan(dir.x, -dir.z);
     float lat = asin(clamp(dir.y, -1.0, 1.0));
@@ -711,6 +713,12 @@ void main() {
             "uTanHalfY"
         );
 
+    m_panoramaTanCenter =
+        glGetUniformLocation(
+            m_panoramaProgram,
+            "uTanCenter"
+        );
+
     m_panoramaLod =
         glGetUniformLocation(
             m_panoramaProgram,
@@ -736,6 +744,7 @@ void main() {
         m_panoramaUp >= 0 &&
         m_panoramaTanX >= 0 &&
         m_panoramaTanY >= 0 &&
+        m_panoramaTanCenter >= 0 &&
         m_panoramaLod >= 0 &&
         m_panoramaSampler >= 0;
 }
@@ -929,6 +938,38 @@ bool GLScene::ensureSceneFramebuffer(
         m_sceneHeight == height
     )
         return true;
+
+    // Another monitor's size: swap in the target kept for it, or keep the
+    // current one aside and make a new one, instead of reallocating.
+    if (m_sceneFBO) {
+        const SceneTarget CURRENT{m_sceneWidth, m_sceneHeight, m_sceneFBO, m_sceneColor, m_sceneDepth};
+        const auto KEPT = std::find_if(m_otherSceneTargets.begin(), m_otherSceneTargets.end(),
+            [&](const SceneTarget& t) { return t.width == width && t.height == height; });
+
+        if (KEPT != m_otherSceneTargets.end()) {
+            m_sceneWidth  = KEPT->width;
+            m_sceneHeight = KEPT->height;
+            m_sceneFBO    = KEPT->fbo;
+            m_sceneColor  = KEPT->color;
+            m_sceneDepth  = KEPT->depth;
+            *KEPT         = CURRENT;
+            return true;
+        }
+
+        // Bounded: monitors come and go; the oldest size is released.
+        if (m_otherSceneTargets.size() >= 4) {
+            auto& OLD = m_otherSceneTargets.front();
+            glDeleteRenderbuffers(1, &OLD.depth);
+            glDeleteTextures(1, &OLD.color);
+            glDeleteFramebuffers(1, &OLD.fbo);
+            m_otherSceneTargets.erase(m_otherSceneTargets.begin());
+        }
+
+        m_otherSceneTargets.push_back(CURRENT);
+        m_sceneFBO   = 0;
+        m_sceneColor = 0;
+        m_sceneDepth = 0;
+    }
 
     if (!m_sceneFBO) {
         glGenFramebuffers(1, &m_sceneFBO);
@@ -1440,7 +1481,7 @@ void GLScene::refreshPlayer() {
     }
 }
 
-void GLScene::drawPanorama(float aspect) {
+void GLScene::drawPanorama(const ViewWindow& view) {
     if (!m_panoramaTex || !m_panoramaProgram)
         return;
 
@@ -1449,11 +1490,13 @@ void GLScene::drawPanorama(float aspect) {
     Vec3 FWD   = m_camera.forward();
     Vec3 RIGHT = m_camera.right();
     Vec3 UP    = cross(RIGHT, FWD);
-    // Zoomed fov (C key): the panorama must narrow with the scene, so its
-    // half-tangent divides by the magnification exactly like the render
-    // projection's fov does.
-    const float TANY =
-        std::tan(kFovDeg * PI / 360.0f) / std::max(m_zoom, 0.01f);
+    // The rectangle this monitor sees (render() has applied the zoom): half
+    // extents and centre in tangents, so a side monitor samples the part of
+    // the sky beside the main one.
+    const float TANX = (view.right - view.left) * 0.5f;
+    const float TANY = (view.top - view.bottom) * 0.5f;
+    const float CENX = (view.right + view.left) * 0.5f;
+    const float CENY = (view.top + view.bottom) * 0.5f;
 
     // Roll (walk bob): rotate the pixel->ray basis around the view axis by
     // the SAME angle the view matrix tilts its up vector, or the panorama
@@ -1479,7 +1522,7 @@ void GLScene::drawPanorama(float aspect) {
     if (m_panoramaW > 0 && m_sceneWidth > 0) {
         const float texelsPerPixel =
             static_cast<float>(m_panoramaW) / (2.0f * PI) *
-            (2.0f * TANY * aspect) / static_cast<float>(m_sceneWidth);
+            (2.0f * TANX) / static_cast<float>(m_sceneWidth);
 
         lod = std::clamp(std::log2(std::max(texelsPerPixel, 0.03125f)), 0.0f, 12.0f);
     }
@@ -1487,8 +1530,9 @@ void GLScene::drawPanorama(float aspect) {
     glUniform3f(m_panoramaFwd, FWD.x, FWD.y, FWD.z);
     glUniform3f(m_panoramaRight, RRIGHT.x, RRIGHT.y, RRIGHT.z);
     glUniform3f(m_panoramaUp, RUP.x, RUP.y, RUP.z);
-    glUniform1f(m_panoramaTanX, TANY * aspect);
+    glUniform1f(m_panoramaTanX, TANX);
     glUniform1f(m_panoramaTanY, TANY);
+    glUniform2f(m_panoramaTanCenter, CENX, CENY);
     glUniform1f(m_panoramaLod, lod);
 
     glActiveTexture(GL_TEXTURE0);
@@ -2095,7 +2139,9 @@ bool GLScene::render(
     int height,
     float alpha,
     float dt,
-    const std::vector<WindowRender>& windows
+    const std::vector<WindowRender>& windows,
+    const ViewWindow* view,
+    bool primary
 ) {
     if (width <= 0 || height <= 0)
         return false;
@@ -2106,7 +2152,10 @@ bool GLScene::render(
     if (!ensureSceneFramebuffer(width, height))
         return false;
 
-    m_time += std::clamp(dt, 0.0f, 0.1f);
+    // Once per frame, on the monitor the view is built for: the others draw
+    // the same instant, they do not advance it.
+    if (primary)
+        m_time += std::clamp(dt, 0.0f, 0.1f);
 
     GLint oldDrawFBO = 0;
     GLint oldReadFBO = 0;
@@ -2183,24 +2232,37 @@ bool GLScene::render(
     const float aspect =
         static_cast<float>(width) / static_cast<float>(height);
 
-    const float ZFOV =
-        2.0f * std::atan(std::tan(kFovDeg * PI / 360.0f) /
-                         std::max(m_zoom, 0.01f));
+    // The rectangle of the view plane this framebuffer shows, narrowed by the
+    // zoom (C key) about the view axis like the fov: with no `view` the
+    // symmetric fov, which is exactly the perspective() this replaced.
+    const float TANFOV = std::tan(kFovDeg * PI / 360.0f);
+    ViewWindow VIEW = view ? *view : ViewWindow{-TANFOV * aspect, TANFOV * aspect, -TANFOV, TANFOV};
+    const float ZOOM = std::max(m_zoom, 0.01f);
+    VIEW.left /= ZOOM;
+    VIEW.right /= ZOOM;
+    VIEW.bottom /= ZOOM;
+    VIEW.top /= ZOOM;
 
-    const Mat4 projection =
-        Mat4::perspective(ZFOV, aspect, 0.05f, 200.0f);
+    constexpr float ZNEAR = 0.05f, ZFAR = 200.0f;
+    const Mat4 projection = Mat4::frustum(VIEW.left * ZNEAR, VIEW.right * ZNEAR,
+                                          VIEW.bottom * ZNEAR, VIEW.top * ZNEAR, ZNEAR, ZFAR);
 
-    m_width  = width;
-    m_height = height;
+    // What picking and the HUD measure against: the primary monitor.
+    if (primary) {
+        m_width  = width;
+        m_height = height;
+    }
 
     const Mat4 vp = projection * m_camera.view();
 
     // Background panorama first, then the map (it replaces the flat floor
     // when loaded; depth rejects whatever is behind its geometry), then the
     // ground so windows behind it are depth-rejected.
-    refreshPanorama();
-    refreshScene();
-    drawPanorama(aspect);
+    if (primary) {
+        refreshPanorama();
+        refreshScene();
+    }
+    drawPanorama(VIEW);
 
     for (auto& S : m_slots) {
         if (!S.model || !S.model->loaded())
@@ -2214,7 +2276,8 @@ bool GLScene::render(
 
     // The player's character (hidden in first person): animated inside
     // render -- the clock and the vertex upload need the EGL context.
-    refreshPlayer();
+    if (primary)
+        refreshPlayer();
     if (m_pDbgOn)
         drawPlayerDebugCapsule(vp);
     if (m_playerVisible && m_player.loaded()) {
@@ -2223,7 +2286,8 @@ bool GLScene::render(
                          m_playerCfg.rotDeg);
         m_player.setFlat(m_playerCfg.flat);
         m_player.setEmissiveScale(m_playerCfg.emissiveScale);
-        m_player.update(dt);
+        if (primary)
+            m_player.update(dt);
         m_player.draw(vp, m_camera.position);
     }
 
@@ -2247,13 +2311,14 @@ bool GLScene::render(
     glDepthMask(GL_TRUE);
 
     // F3 HUD: always on top of the scene, never part of the 3D pass state.
-    drawDebugOverlay(width, height);
+    if (primary)
+        drawDebugOverlay(width, height);
 
     // Read back one pixel of the offscreen scene while it is still bound. A
     // floor point in the lower half of the screen, where ground and sky are
     // both opaque by construction: alpha below 255 here means the composite
     // cannot become fully opaque no matter what the fade is set to.
-    if (m_probeRequested) {
+    if (primary && m_probeRequested) {
         glReadPixels(
             width / 2,
             height / 4,
@@ -2286,7 +2351,8 @@ bool GLScene::render(
     );
 
     drawFullscreen(std::clamp(alpha, 0.0f, 1.0f));
-    drawCrosshair(width, height);
+    if (primary)
+        drawCrosshair(width, height);
 
     // --- restore compositor state ---
     glUseProgram(static_cast<GLuint>(oldProgram));
@@ -2498,6 +2564,15 @@ void GLScene::destroyGLObjects() {
         glDeleteFramebuffers(1, &m_sceneFBO);
         m_sceneFBO = 0;
     }
+
+    for (auto& T : m_otherSceneTargets) {
+        glDeleteRenderbuffers(1, &T.depth);
+        glDeleteTextures(1, &T.color);
+        glDeleteFramebuffers(1, &T.fbo);
+    }
+    m_otherSceneTargets.clear();
+    m_sceneWidth  = 0;
+    m_sceneHeight = 0;
 
     if (m_sceneProgram) {
         glDeleteProgram(m_sceneProgram);

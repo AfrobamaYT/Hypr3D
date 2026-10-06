@@ -155,6 +155,7 @@ Everything is optional -- only set what you want to change.
 | panorama | string | ""      | 360° background image (equirectangular) |
 | grid     | bool   | true    | the starting 40x40 platform             |
 | monitor  | string | ""      | render the 3D view on this monitor (e.g. "DP-1") instead of the focused one |
+| span     | bool   | true    | with several monitors, one room across all of them: each monitor shows the part of the room where it sits in the layout (an off-axis view, like a triple-screen simulator), and the windows of every monitor enter as a wall where they stood; the eye sits in front of `monitor` (or the focused one). `false`: the room on that one monitor only |
 
 ### Windows
 

@@ -56,14 +56,30 @@ class GLScene {
         std::shared_ptr<const std::vector<SOutlineLoop>> outlines;
     };
 
+    // Where one monitor looks through the view plane, in tangents of the view
+    // axis (the plane at distance 1): left, right, bottom, top. The monitor
+    // the view is built for gets the symmetric field of view; a neighbour
+    // gets the rectangle beside it, so several monitors show one continuous
+    // room -- the way CAVEs and triple-screen simulators split a view (Kooima,
+    // "Generalized Perspective Projection").
+    struct ViewWindow {
+        float left = 0.f, right = 0.f, bottom = 0.f, top = 0.f;
+    };
+
     GLScene();
 
     // Draws into `targetFBO` and composites the result over whatever is
     // already there with `alpha`, so the 2D desktop underneath fades out
     // instead of being captured and re-projected -- the workspace itself is
     // never rendered as an object in the scene.
+    //
+    // `view` null: the symmetric field of view of this framebuffer. `primary`:
+    // the monitor the view is built for -- it advances the clock and the
+    // player's animation, loads what the scene needs and draws the HUD and the
+    // crosshair; any other monitor only draws the same room through `view`.
     bool render(unsigned int targetFBO, int width, int height, float alpha,
-                float dt, const std::vector<WindowRender>& windows);
+                float dt, const std::vector<WindowRender>& windows,
+                const ViewWindow* view = nullptr, bool primary = true);
 
     // Raw pointer counts -> camera look. Prefer driving this through
     // InputController so sensitivity policy stays in one testable place.
@@ -238,7 +254,7 @@ class GLScene {
 
     void drawFloor(const Mat4& vp);
     void drawGrid(const Mat4& vp);
-    void drawPanorama(float aspect);
+    void drawPanorama(const ViewWindow& view);
     void refreshPanorama();
 
     void drawWindows(const Mat4& vp, const std::vector<WindowRender>& windows);
@@ -254,6 +270,15 @@ class GLScene {
     unsigned int m_sceneFBO = 0;
     unsigned int m_sceneColor = 0;
     unsigned int m_sceneDepth = 0;
+
+    // Offscreen scenes of the other sizes in use: monitors of different
+    // sizes share the room, and reallocating one target for each of them
+    // every frame would be the cost of the whole pass.
+    struct SceneTarget {
+        int          width = 0, height = 0;
+        unsigned int fbo = 0, color = 0, depth = 0;
+    };
+    std::vector<SceneTarget> m_otherSceneTargets;
 
     unsigned int m_sceneProgram = 0;
     unsigned int m_blitProgram = 0;
@@ -298,6 +323,7 @@ class GLScene {
     int m_panoramaUp = -1;
     int m_panoramaTanX = -1;
     int m_panoramaTanY = -1;
+    int m_panoramaTanCenter = -1;
     int m_panoramaLod = -1;
     int m_panoramaSampler = -1;
 

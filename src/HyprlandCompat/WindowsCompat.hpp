@@ -22,6 +22,7 @@ struct SWindowInfo {
     Vector2D       surfaceOffset;   // top-left of the client surface inside monitorLocalBox (border margin)
     Vector2D       surfaceSize;     // client surface size in logical px
     bool           floating = false;
+    PHLMONITOR     monitor;   // the monitor monitorLocalBox is local to
 };
 
 // Enumerate mapped, non-hidden windows that live on a visible workspace of

@@ -52,6 +52,18 @@ Mat4 Mat4::perspective(float fovYRad, float aspect, float zNear, float zFar) {
     return r;
 }
 
+Mat4 Mat4::frustum(float l, float r, float b, float t, float n, float f) {
+    Mat4 m{};
+    m.m[0]  = 2.f * n / (r - l);
+    m.m[5]  = 2.f * n / (t - b);
+    m.m[8]  = (r + l) / (r - l);
+    m.m[9]  = (t + b) / (t - b);
+    m.m[10] = (f + n) / (n - f);
+    m.m[11] = -1.f;
+    m.m[14] = (2.f * f * n) / (n - f);
+    return m;
+}
+
 Mat4 Mat4::lookAt(const Vec3& eye, const Vec3& center, const Vec3& up) {
     const Vec3 f = normalize(center - eye);
     const Vec3 s = normalize(cross(f, up));

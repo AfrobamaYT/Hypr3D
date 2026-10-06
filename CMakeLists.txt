@@ -2,6 +2,15 @@ cmake_minimum_required(VERSION 3.27)
 
 project(hypr3d LANGUAGES CXX)
 
+# hyprpm and the README run cmake without a build type, which compiled the
+# plugin's own code unoptimised (-O0, only Jolt had -O2); the official
+# hyprland-plugins build with CXXFLAGS ?= -O2. Loading Khronos' FlightHelmet
+# held one frame ~260 ms at -O0 and ~60 ms at -O2 (VM, virgl). A packager's
+# own build type (makepkg: None) is kept.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)

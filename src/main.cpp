@@ -1334,6 +1334,42 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
     std::vector<World3D::SEntity> ENTITIES;
     ENTITIES.reserve(INFOS.size());
 
+    // Windows new to the room in this rebuild -- all of them when the view
+    // is turned on -- stand side by side on an arc around the camera at the
+    // spawn distance, in the order the 2D layout had them, left to right
+    // (then top to bottom). All at the one spawn point, they covered each
+    // other and the room showed a single panel. One alone still spawns
+    // straight ahead. Each slot's angle is the arc length of the windows
+    // before it over the radius, with a gap between neighbours.
+    std::unordered_map<std::uintptr_t, float> freshAngle;
+    {
+        std::vector<const Compat::SWindowInfo*> FRESH;
+        for (const auto& info : INFOS)
+            if (!info.isLayer && !g_world.find(info.id))
+                FRESH.push_back(&info);
+
+        if (FRESH.size() > 1) {
+            std::sort(FRESH.begin(), FRESH.end(), [](const auto* a, const auto* b) {
+                if (a->monitorLocalBox.x != b->monitorLocalBox.x)
+                    return a->monitorLocalBox.x < b->monitorLocalBox.x;
+                return a->monitorLocalBox.y < b->monitorLocalBox.y;
+            });
+
+            const float RADIUS = std::max(g_cfgSpawnDistance, 0.5f);
+            const float GAP    = World3D::toWorld(48.0f) * WIN_SCALE;
+            float       total  = GAP * static_cast<float>(FRESH.size() - 1);
+            for (const auto* f : FRESH)
+                total += World3D::toWorld(f->monitorLocalBox.w) * WIN_SCALE;
+
+            float along = -total * 0.5f;
+            for (const auto* f : FRESH) {
+                const float W = World3D::toWorld(f->monitorLocalBox.w) * WIN_SCALE;
+                freshAngle[f->id] = (along + W * 0.5f) / RADIUS;
+                along += W + GAP;
+            }
+        }
+    }
+
     for (const auto& info : INFOS) {
         // Track each window's last stable (non-transition) box -- see
         // g_fsStableBoxes. Skipped while the exit re-assert is running: a
@@ -1428,7 +1464,14 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         }
         else {
             const auto& CAM = g_scene.camera();
-            const Vec3 FWD = CAM.forward();
+            Vec3 FWD = CAM.forward();
+
+            // Its slot on the arc (see freshAngle): turned about the
+            // camera's up, to the right for a positive angle.
+            if (const auto SLOT = freshAngle.find(info.id); SLOT != freshAngle.end()) {
+                const Vec3 RIGHT = CAM.right();
+                FWD = normalize(FWD * std::cos(SLOT->second) + RIGHT * std::sin(SLOT->second));
+            }
 
             entity.center = CAM.position + FWD * g_cfgSpawnDistance;
 

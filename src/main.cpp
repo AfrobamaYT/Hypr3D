@@ -3796,12 +3796,27 @@ static void forwardPointerToAim(uint32_t timeMs) {
     Compat::deliverMotion(TARGET.window, localFromHit(HIT), timeMs);
 }
 
+// A game that locked the pointer (zwp_locked_pointer, as CS2 and Minecraft
+// do once they take the mouse) has the mouse and the keyboard: Hyprland sends
+// it the relative motion itself, the room's camera holds still and the keys
+// reach it -- until it lets go (its own Escape), as the cursor holds still
+// for it in 2D. Turning the room as well moved the window under the crosshair,
+// and the game read the positions the room forwarded as more motion: 100 for
+// 40 under Xwayland, jumps of 1000 px for a game that warps (measured
+// 2026-10-07).
+static bool gameHasMouse() {
+    const auto W = Compat::focusedWindow();
+    return W && g_world.find(Compat::windowId(W)) && Compat::pointerConstraintOf(W) == 2;
+}
+
 // Absolute-position fallback for installations where the PointerManager hook
 // is unavailable. When the hook works, it feeds onPointerMotion directly and
 // this event only keeps the baseline warm.
 static bool onPointerMotion(double dx, double dy) {
     if (!ownsInput())
         return false;
+    if (gameHasMouse())
+        return true; // the game had the motion already; the cursor stays put
 
     g_input.addMotion(dx, dy);
     damageCurrentMonitor();
@@ -5038,7 +5053,9 @@ static void dumpStatus() {
         << " renderedOnce=" << (g_renderedOnce ? 1 : 0) << "\n";
 
     out << "aimed=" << g_lastAimedId << " focus=" << g_lastFocusId
-        << " focusLock=" << g_focusLockId << "\n";
+        << " focusLock=" << g_focusLockId << " aimedConstraint="
+        << Compat::pointerConstraintOf(Compat::findWindowById(g_lastAimedId))
+        << " gameHasMouse=" << (gameHasMouse() ? 1 : 0) << "\n";
 
     out << "hookInstalled=" << (g_hookInstalled ? 1 : 0)
         << " hookActive=" << (Compat::pointerHookActive() ? 1 : 0)
@@ -5919,6 +5936,13 @@ static void onKeyboardKey(
         g_superHeld = PRESSED;
     else if (SYM == XKB_KEY_Alt_L)
         g_altHeld = PRESSED;
+
+    // A game holding the mouse has the keyboard too; keys held for walking
+    // let go, so the player does not walk on behind it.
+    if (gameHasMouse()) {
+        resetMovementKeys();
+        return;
+    }
 
     // Walking mode: Space jumps off whatever the capsule stands on. The
     // held state still reaches setMovementSym, but the walking movement

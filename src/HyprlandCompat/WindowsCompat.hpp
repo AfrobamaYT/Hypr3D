@@ -112,4 +112,8 @@ PHLLS findLayerById(std::uintptr_t id);
 
 void clearPointerFocus();
 
+// The pointer constraint a window's surface holds (zwp_pointer_constraints):
+// 0 none or inactive, 1 confined, 2 locked -- a game that grabbed the mouse.
+int pointerConstraintOf(const PHLWINDOW& window);
+
 } // namespace H3D::Compat

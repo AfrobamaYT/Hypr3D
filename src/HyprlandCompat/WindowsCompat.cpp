@@ -8,6 +8,8 @@
 #include <hyprland/src/layout/target/Target.hpp>
 #include <hyprland/src/managers/SeatManager.hpp>
 #include <hyprland/src/protocols/LayerShell.hpp>
+#include <hyprland/src/protocols/PointerConstraints.hpp>
+#include <hyprland/src/desktop/view/WLSurface.hpp>
 // CLayerShellResource's m_surface (CWLSurfaceResource) needs the full type
 // for .lock()->m_current access in deliver* paths.
 #include <hyprland/src/protocols/types/SurfaceState.hpp>
@@ -272,6 +274,38 @@ void clearPointerFocus() {
     g_pSeatManager->setPointerFocus(nullptr, {});
 }
 
+// The point the room last sent a window, so that it sends motion only when
+// that point moved, as a mouse does. The room aims every frame; each position
+// sent to an Xwayland window becomes an X raw event in screen coordinates,
+// which a game that took the mouse reads as that much motion (GLFW takes raw
+// values as deltas): ~1000 px per frame, the spinbot, and on clicking back
+// into a game the position sent with the click before its lock arrived
+// (measured with XI2 raw events, 2026-10-07).
+static WP<CWLSurfaceResource> g_motionSurface;
+static Vector2D               g_motionLocal;
+
+// Focuses SURFACE at LOCAL; true when the client is to be told the position:
+// on an enter, or when the point moved by wl_fixed's 1/256 or more.
+static bool pointerMoved(const SP<CWLSurfaceResource>& surface, const Vector2D& local) {
+    const bool ENTER = g_pSeatManager->m_state.pointerFocus != surface;
+    g_pSeatManager->setPointerFocus(surface, local);
+    if (!ENTER && g_motionSurface == surface && (local - g_motionLocal).size() < 1.0 / 256.0)
+        return false;
+    g_motionSurface = surface;
+    g_motionLocal   = local;
+    return true;
+}
+
+int pointerConstraintOf(const PHLWINDOW& window) {
+    if (!window || !window->resource())
+        return 0;
+    const auto HL = Desktop::View::CWLSurface::fromResource(window->resource());
+    const auto C  = HL ? HL->constraint() : nullptr;
+    if (!C || !C->isActive())
+        return 0;
+    return C->isLocked() ? 2 : 1;
+}
+
 void deliverMotion(
     const PHLWINDOW& window,
     const Vector2D& localLogical,
@@ -280,11 +314,34 @@ void deliverMotion(
     if (!window || !g_pSeatManager)
         return;
 
+    // A locked pointer gets no motion events (zwp_locked_pointer_v1: "the
+    // wl_pointer objects of the associated seat will not emit any
+    // wl_pointer.motion events"), only Hyprland's relative motion. A game
+    // that had grabbed the mouse read each absolute position as more motion
+    // and spun (measured 2026-10-07).
     const auto SURFACE = window->resource();
     if (!SURFACE)
         return;
 
-    g_pSeatManager->setPointerFocus(SURFACE, localLogical);
+    // Hyprland lets every lock go when a pointer device goes away
+    // (CInputManager::destroyPointer -> unconstrainMouse) and gives it back
+    // only on the next focus change -- which in the room never comes, so the
+    // game spun on from there. The focused window gets its lock back here,
+    // as a focus change would give it; a oneshot lock died with the
+    // deactivation and activate() leaves it so.
+    if (Desktop::focusState()->surface() == SURFACE) {
+        const auto HL = Desktop::View::CWLSurface::fromResource(SURFACE);
+        if (const auto C = HL ? HL->constraint() : nullptr; C && C->isLocked() && !C->isActive())
+            C->activate();
+    }
+    if (pointerConstraintOf(window) == 2) {
+        g_pSeatManager->setPointerFocus(SURFACE, localLogical); // keeps it; a no-op when it has it
+        return;
+    }
+
+    if (!pointerMoved(SURFACE, localLogical))
+        return;
+
     g_pSeatManager->sendPointerMotion(timeMs, localLogical);
     g_pSeatManager->sendPointerFrame();
 }
@@ -307,9 +364,13 @@ void deliverClick(
     // Point the seat at the aimed surface, put the virtual pointer at the hit
     // coordinate, then send the button and a frame. The application therefore
     // sees an ordinary Wayland pointer event even though the physical cursor
-    // is captured by the 3D view.
-    g_pSeatManager->setPointerFocus(SURFACE, localLogical);
-    g_pSeatManager->sendPointerMotion(timeMs, localLogical);
+    // is captured by the 3D view. A locked pointer gets the button alone: a
+    // position with every click was a jump with every shot in a game. So
+    // does a pointer already at the point (pointerMoved).
+    if (pointerConstraintOf(window) == 2)
+        g_pSeatManager->setPointerFocus(SURFACE, localLogical);
+    else if (pointerMoved(SURFACE, localLogical))
+        g_pSeatManager->sendPointerMotion(timeMs, localLogical);
     g_pSeatManager->sendPointerButton(
         timeMs,
         button,

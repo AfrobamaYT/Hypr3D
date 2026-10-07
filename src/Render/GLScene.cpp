@@ -420,12 +420,14 @@ in vec2 vUV;
 uniform sampler2D uTexture;
 uniform int uTextured;
 uniform vec4 uColor;
+// Windows only (drawWindows), 0 for everything else.
+uniform float uLodBias;
 
 out vec4 fragColor;
 
 void main() {
     if (uTextured != 0)
-        fragColor = texture(uTexture, vUV) * uColor;
+        fragColor = texture(uTexture, vUV, uLodBias) * uColor;
     else
         fragColor = uColor;
 }
@@ -670,6 +672,8 @@ void main() {
             m_sceneProgram,
             "uUVRect"
         );
+
+    m_sceneLodBias = glGetUniformLocation(m_sceneProgram, "uLodBias");
 
     m_blitTexture =
         glGetUniformLocation(
@@ -1832,6 +1836,11 @@ void GLScene::drawWindows(
     glUniformMatrix4fv(m_sceneMVP, 1, GL_FALSE, vp.m.data());
     glUniform4f(m_sceneUVRect, 0.f, 0.f, 1.f, 1.f);
     glUniform1i(m_sceneTexture, 0);
+    // Half a mip level sharper than the GPU picks: mipmapped text reads
+    // soft from afar. At 15 m (3.7 window pixels to a screen pixel) -0.5
+    // came 0.9 dB closer to an ideal downscale than 0, -1.0 lost the
+    // mipmaps' gain at 10 m (measured 2026-10-07, larch-rice sandbox).
+    glUniform1f(m_sceneLodBias, -0.5f);
 
     // Tested against the room's depth, writing none: the BSP order above is
     // already exact among the windows, and depth written by one of them made
@@ -1902,6 +1911,7 @@ void GLScene::drawWindows(
         i = j;
     }
 
+    glUniform1f(m_sceneLodBias, 0.0f);
     glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
     glBindTexture(GL_TEXTURE_2D, 0);

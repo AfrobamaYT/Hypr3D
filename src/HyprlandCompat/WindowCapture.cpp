@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 
 namespace H3D::Compat {
@@ -41,6 +42,40 @@ void destroyTexture(unsigned int& tex) {
 
     glDeleteTextures(1, &tex);
     tex = 0;
+}
+
+// GL_EXT_texture_filter_anisotropic, core only from GL 4.6 / not in GLES.
+constexpr GLenum TEXTURE_MAX_ANISOTROPY     = 0x84FE;
+constexpr GLenum MAX_TEXTURE_MAX_ANISOTROPY = 0x84FF;
+
+float maxAnisotropy() {
+    const auto* EXT = reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
+    if (!EXT || !std::strstr(EXT, "GL_EXT_texture_filter_anisotropic"))
+        return 1.0f;
+    GLfloat max = 1.0f;
+    glGetFloatv(MAX_TEXTURE_MAX_ANISOTROPY, &max);
+    return std::min(max, 16.0f);
+}
+
+// A window further away than 1:1 is minified: one screen pixel covers
+// several texels, and plain bilinear sampling reads four of them, so thin
+// text strokes drop out and flicker as the camera moves. Mipmaps are the
+// GPU's own answer (trilinear for distance), anisotropic filtering keeps a
+// window seen at a slant from blurring along its short axis. Built once per
+// captured frame of the window, after it is drawn.
+void buildMipmaps(GLuint tex) {
+    if (!tex)
+        return;
+
+    static const float ANISO = maxAnisotropy();
+    GLint old = 0;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &old);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    if (ANISO > 1.0f)
+        glTexParameterf(GL_TEXTURE_2D, TEXTURE_MAX_ANISOTROPY, ANISO);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(old));
 }
 
 GLuint createBlankTexture(int width, int height) {
@@ -430,6 +465,7 @@ bool CWindowCapture::makeSnapshot(const PHLWINDOW& window, const PHLMONITOR& mon
         snapshot.fb = nullptr;
         return false;
     }
+    buildMipmaps(snapshot.texID);
 
     // Record the geometry the snapshot was rendered at. The live box may be
     // written later in the same frame (the resize path runs after render.pre),
@@ -577,6 +613,7 @@ bool CWindowCapture::makeTiledSnapshot(
 
     if (!anyTile)
         return false;
+    buildMipmaps(bigTex);
 
     // Drop a monitor-sized fb left over from a previous non-tiled snapshot;
     // the composite texture replaces it wholesale.
@@ -825,6 +862,7 @@ bool CWindowCapture::makeSnapshotLayer(const PHLLS& layer, const PHLMONITOR& mon
         snapshot.fb = nullptr;
         return false;
     }
+    buildMipmaps(snapshot.texID);
 
     snapshot.fullBox       = LOCAL;
     snapshot.sampledBox    = LOCAL;

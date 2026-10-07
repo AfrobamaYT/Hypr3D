@@ -360,6 +360,7 @@ class GLScene {
     int m_sceneTextured = -1;
     int m_sceneColorUniform = -1;
     int m_sceneUVRect = -1;
+    int m_sceneLodBias = -1;
 
     int m_blitTexture = -1;
     int m_blitAlpha = -1;

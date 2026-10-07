@@ -130,6 +130,19 @@ hyprctl eval 'hl.plugin.hypr3d.portal("deltarune")'   -- removes it
 Each start goes out on socket2 as `{"event":"portal","name":"deltarune","started":true,...}`.
 A portal lives as long as the plugin; a wrong call fails with the reason.
 
+### The waste bin
+
+```lua
+hl.plugin.hypr3d.config({ trash = { at = { 3, 0, 0.6 }, radius = 0.29, height = 0.72 } })
+```
+
+Carry a window (Super + left click), look at the bin and let go: the
+window tumbles into it, shrinking like a sheet crumpled up, and is asked to
+close, as Super+Q asks. An application that stays open -- an unsaved file
+asks first -- gets its window back after 3 s. `trash` is only the zone, a
+vertical cylinder standing at `at`; what the bin looks like is a scene
+object you put at the same place. `radius = 0` takes the bin away.
+
 ### The menu
 
 ```lua
@@ -152,7 +165,7 @@ program that opens such a window -- Larch's is `larch-room-menu`.
 | Shift                         | Crouch (walking) / move down (flying)          |
 | Ctrl                          | Sprint                                         |
 | C                             | Zoom, wheel adjusts                            |
-| Super + Left click            | Drag window                                    |
+| Super + Left click            | Drag window; let go on the waste bin to close it |
 | Super + Right click           | Resize window                                  |
 | Super + Mouse wheel click     | rotate window                                  |
 | Super + Mouse wheel scrolling | Zoom window                                    |

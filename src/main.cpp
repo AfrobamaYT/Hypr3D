@@ -2425,6 +2425,114 @@ static void endReading(bool putBack) {
     g_scene.setFeatured(0, 0.0f);
 }
 
+// The waste bin (config trash = { at, radius, height }): a window carried
+// with Super+LMB and let go while the crosshair is on the bin falls in -- it
+// tumbles and shrinks into the opening like a sheet crumpled up -- and is
+// asked to close, as Super+Q asks. An application that stays (an unsaved
+// file asks first) gets its window back after kTrashGrace. The bin's look is
+// a scene object at the same place; the plugin knows only the zone.
+static Vec3  g_trashAt{};
+static float g_trashRadius = 0.0f, g_trashHeight = 0.0f; // radius 0: no bin
+struct STrashed {
+    std::uintptr_t id = 0;
+    std::chrono::steady_clock::time_point start;
+    Vec3  fromCenter{};
+    float fromYaw = 0.f, fromPitch = 0.f, fromRoll = 0.f, fromScale = 1.f;
+    bool  asked = false; // the close request went out
+    std::chrono::steady_clock::time_point askedAt;
+};
+static std::vector<STrashed> g_trashed;
+static constexpr float kTrashSeconds = 0.45f;
+static constexpr float kTrashGrace   = 3.0f;
+
+// The crosshair's ray on the bin: its side within its height, or its opening.
+static bool aimAtBin() {
+    if (g_trashRadius <= 0.0f)
+        return false;
+    const auto& CAM = g_scene.camera();
+    const Vec3  O = CAM.position, D = CAM.centerRay();
+    const float TOP = g_trashAt.y + g_trashHeight;
+    const auto  IN_HEIGHT = [&](float t) {
+        const float Y = O.y + t * D.y;
+        return t > 0.0f && t < 12.0f && Y >= g_trashAt.y && Y <= TOP;
+    };
+    const float FX = O.x - g_trashAt.x, FZ = O.z - g_trashAt.z;
+    const float A = D.x * D.x + D.z * D.z;
+    const float B = 2.0f * (FX * D.x + FZ * D.z);
+    const float C = FX * FX + FZ * FZ - g_trashRadius * g_trashRadius;
+    const float DISC = B * B - 4.0f * A * C;
+    if (A > 1e-6f && DISC >= 0.0f) {
+        const float SQ = std::sqrt(DISC);
+        if (IN_HEIGHT((-B - SQ) / (2.0f * A)) || IN_HEIGHT((-B + SQ) / (2.0f * A)))
+            return true;
+    }
+    if (std::fabs(D.y) > 1e-6f) {
+        const float T = (TOP - O.y) / D.y;
+        const float X = O.x + T * D.x - g_trashAt.x, Z = O.z + T * D.z - g_trashAt.z;
+        if (T > 0.0f && T < 12.0f && X * X + Z * Z <= g_trashRadius * g_trashRadius)
+            return true;
+    }
+    return false;
+}
+
+// Let go of a carried window on the bin: it starts falling in.
+static bool dropInBin(std::uintptr_t id) {
+    const auto* E = id ? g_world.find(id) : nullptr;
+    if (!E || !Compat::findWindowById(id) || !aimAtBin())
+        return false;
+    if (std::ranges::any_of(g_trashed, [&](const STrashed& t) { return t.id == id; }))
+        return true;
+    if (g_read.id == id)
+        endReading(false);
+    STrashed T;
+    T.id = id;
+    T.start = std::chrono::steady_clock::now();
+    T.fromCenter = E->center;
+    T.fromYaw = E->yaw, T.fromPitch = E->pitch, T.fromRoll = E->roll;
+    T.fromScale = E->logicalWidth > 0.f ? E->width / World3D::toWorld(E->logicalWidth) : configWindowScale();
+    g_trashed.push_back(T);
+    return true;
+}
+
+// One window of syncWorld's loop on its way into the bin, or waiting there
+// for its application to close it. False: it stayed open -- back it comes.
+static bool applyTrash(STrashed& T, const CBox& BOX, World3D::SEntity& E) {
+    const auto NOW = std::chrono::steady_clock::now();
+    const float RAW = std::clamp(std::chrono::duration<float>(NOW - T.start).count() / kTrashSeconds, 0.0f, 1.0f);
+    const float P = RAW * RAW; // falling: slow, then fast
+    // Over the opening, then down into it: an arc that drops in at the end.
+    const Vec3 OVER = g_trashAt + Vec3{0.f, g_trashHeight + 0.35f, 0.f};
+    const Vec3 IN   = g_trashAt + Vec3{0.f, g_trashHeight * 0.5f, 0.f};
+    const Vec3 MID  = T.fromCenter + (OVER - T.fromCenter) * P;
+    E.center = MID + (IN - MID) * (P * P);
+    E.yaw    = T.fromYaw + 3.0f * P;   // tumbling as it crumples
+    E.pitch  = T.fromPitch + 2.2f * P;
+    E.roll   = T.fromRoll + 4.0f * P;
+    const float SCALE = T.fromScale * (1.0f - 0.985f * P);
+    E.width  = World3D::toWorld(BOX.w) * SCALE;
+    E.height = World3D::toWorld(BOX.h) * SCALE;
+
+    if (RAW >= 1.0f && !T.asked) {
+        T.asked = true;
+        T.askedAt = NOW;
+        // Outside the frame: render.stage is no place to talk to clients.
+        const std::uintptr_t ID = T.id;
+        if (g_pEventLoopManager)
+            g_pEventLoopManager->doLater([ID] {
+                if (const auto W = Compat::findWindowById(ID))
+                    W->sendClose();
+            });
+    }
+    if (T.asked && std::chrono::duration<float>(NOW - T.askedAt).count() > kTrashGrace) {
+        E.center = T.fromCenter;
+        E.yaw = T.fromYaw, E.pitch = T.fromPitch, E.roll = T.fromRoll;
+        E.width  = World3D::toWorld(BOX.w) * T.fromScale;
+        E.height = World3D::toWorld(BOX.h) * T.fromScale;
+        return false;
+    }
+    return true;
+}
+
 static void syncWorld(const PHLMONITOR& mon, float dt) {
     // Deliberately free of side effects on the layout and the renderer. This
     // runs from render.stage, i.e. between the frame's startRenderPass() and
@@ -2723,6 +2831,12 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
 
         if (g_read.id == info.id)
             applyReading(mon, BOX, entity);
+        if (const auto T = std::ranges::find_if(g_trashed, [&](const STrashed& t) { return t.id == info.id; });
+            T != g_trashed.end() && !applyTrash(*T, BOX, entity)) {
+            if (const auto W = Compat::findWindowById(T->id))
+                notify("[hypr3d] " + W->m_title + " stayed open; it is back", CHyprColor{1.0f, 0.6f, 0.2f, 1.0f});
+            g_trashed.erase(T);
+        }
 
         // Fullscreen transition: the animation owns this quad's size, and it
         // MUST be applied here -- the draw list below is built from these
@@ -2764,6 +2878,9 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
 
     if (g_read.id && std::ranges::none_of(ENTITIES, [](const auto& E) { return E.id == g_read.id; }))
         g_read = {}; // it closed
+    std::erase_if(g_trashed, [&](const STrashed& t) {
+        return std::ranges::none_of(ENTITIES, [&](const auto& E) { return E.id == t.id; });
+    }); // closed: in the bin for good
 
     // The menu window, as it opens, comes to the eye at 1:1 -- over a window
     // being read, which goes back first.
@@ -3750,6 +3867,14 @@ static void rememberRoom() {
 
 static void deactivate3D() {
     endReading(true);
+    // Windows still in the bin, their applications not gone yet: back where
+    // they were let go, not remembered tiny.
+    for (const auto& T : g_trashed)
+        if (auto* E = g_world.find(T.id)) {
+            E->center = T.fromCenter;
+            E->yaw = T.fromYaw, E->pitch = T.fromPitch, E->roll = T.fromRoll;
+        }
+    g_trashed.clear();
     rememberRoom();
 
     finishClientButton(0);
@@ -5418,6 +5543,8 @@ static void onMouseButton(
 
     // Release the plugin gesture that owns this physical button.
     if (!PRESSED && g_pointerDown && event.button == g_pointerButton) {
+        if (g_pointerGesture == EPointerGesture::Move3D)
+            dropInBin(g_world.draggedId());
         resetPointerGesture();
         info.cancelled = true;
         damageCurrentMonitor();
@@ -6113,6 +6240,23 @@ static int luaConfig(lua_State* L) {
         lua_pop(L, 1);
     }
 
+    // trash = { at = { x, y, z }, radius = 0.3, height = 0.75 }: the waste
+    // bin's zone, its foot at `at`; radius 0 takes it away.
+    idx = SECTION("trash", "trash");
+    if (idx == -1)
+        return luaL_error(L, "hypr3d.config: trash must be a table");
+    if (idx > 0) {
+        if (!SET_VEC3(idx, "at", g_trashAt, "trash.at"))
+            return luaL_error(L, "hypr3d.config: trash.at must be a vector");
+        if (!SET_NUM(idx, "radius", g_trashRadius, "trash.radius"))
+            return luaL_error(L, "hypr3d.config: trash.radius must be a number");
+        if (!SET_NUM(idx, "height", g_trashHeight, "trash.height"))
+            return luaL_error(L, "hypr3d.config: trash.height must be a number");
+        g_trashRadius = std::clamp(g_trashRadius, 0.0f, 5.0f);
+        g_trashHeight = std::clamp(g_trashHeight, 0.0f, 5.0f);
+        lua_pop(L, 1);
+    }
+
     // menu = { command = "...", title = "..." }: F1 in the room runs the
     // command; a window with this title comes to the eye as it opens.
     idx = SECTION("menu", "menu");
@@ -6550,6 +6694,7 @@ static int luaConfig(lua_State* L) {
 static void resetRoom() {
     g_room = {};
     g_read = {};
+    g_trashed.clear();
     g_wallFit = 0.0f; // the wall is built afresh, sized for the camera then
     companionHalt("aborted", "The room was reset");
     placeCompanion();

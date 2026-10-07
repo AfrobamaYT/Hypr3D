@@ -2089,6 +2089,15 @@ static void unghostWindows() {
 
 // --- continuous 3D frame pump ----------------------------------------------
 
+// Rendering on demand (frameFingerprint, below): frames in a row that showed
+// nothing new, and the pump's pace once the room is still.
+static constexpr int  kStillFrames      = 3;
+static constexpr auto kIdlePumpInterval = std::chrono::milliseconds(50);
+static uint64_t       g_frameSig        = 0;
+static int            g_stillFrames     = 0;
+static bool           runsOnTime();
+static bool           roomStill();
+
 static void stopFramePump() {
     if (!g_framePump)
         return;
@@ -2124,10 +2133,10 @@ static void startFramePump() {
                     g_captureReleasePending = false;
                 }
 
-                if (g_fsPhase != EFullscreenPhase::In2D)
+                if (g_fsPhase != EFullscreenPhase::In2D && !roomStill())
                     damageCurrentMonitor();
 
-                self->updateTimeout(kFramePumpInterval);
+                self->updateTimeout(roomStill() ? kIdlePumpInterval : kFramePumpInterval);
             },
             nullptr
         );
@@ -5133,10 +5142,12 @@ class CHypr3DPassElement final : public IPassElement {
 
 // Throttled snapshot of the live state, written where I can read it directly
 // instead of asking the user to describe what they see.
-static void dumpStatus() {
+// force: the frame a room goes still -- the last state there is to show,
+// which the 0.25 s pace could leave unwritten for as long as it stays still.
+static void dumpStatus(bool force = false) {
     const auto NOW = std::chrono::steady_clock::now();
 
-    if (std::chrono::duration<float>(NOW - g_diagLastDump).count() < 0.25f)
+    if (!force && std::chrono::duration<float>(NOW - g_diagLastDump).count() < 0.25f)
         return;
 
     g_diagLastDump = NOW;
@@ -5383,7 +5394,8 @@ static void dumpStatus() {
         }
     }
 
-    out << "captureFrames=" << g_captureFrames << "\n";
+    out << "captureFrames=" << g_captureFrames << " still=" << g_stillFrames
+        << " onTime=" << (runsOnTime() ? 1 : 0) << "\n";
 
     // Player body trace: wall glue, stick-slip or a resync fight show up
     // here directly (position/velocity vs the commanded velocity).
@@ -5396,6 +5408,84 @@ static void dumpStatus() {
             << s_moveVel.y << "," << s_moveVel.z << ") grounded="
             << g_grounded << " flying=" << g_playerFlying << "\n";
     }
+}
+
+// --- rendering on demand ----------------------------------------------------
+// The room drew every frame at the monitor's rate, standing still too: 552
+// frames in 10 s, 28 % of a core and 23 % of the RTX 3080 for a picture that
+// did not change (measured 2026-10-07) -- on a laptop, the battery. As
+// Godot's low-processor mode and three.js's render-on-demand do, it asks for
+// the next frame only while something changes: each frame folds what makes
+// the picture into a fingerprint, and after kStillFrames identical ones, with
+// nothing running on time, it stops asking. Input asks for a frame itself
+// (every handler damages), a window's new content through Hyprland's own
+// damage, and the frame pump looks for time-driven work 20 times a second.
+// (State and the pump's interval: before the pump.)
+static uint64_t frameFingerprint() {
+    uint64_t   h = 1469598103934665603ull;
+    const auto BITS = [&](uint64_t v) {
+        h ^= v;
+        h *= 1099511628211ull;
+    };
+    // Quantized: a body at rest still moves by nanometres a step.
+    const auto NUM = [&](double v, double quantum) {
+        BITS(static_cast<uint64_t>(std::llround(v / quantum)));
+    };
+    const auto POS = [&](float x, float y, float z) {
+        NUM(x, 1e-4), NUM(y, 1e-4), NUM(z, 1e-4);
+    };
+    const auto& CAM = g_scene.camera();
+    POS(CAM.position.x, CAM.position.y, CAM.position.z);
+    NUM(CAM.yaw, 1e-5), NUM(CAM.pitch, 1e-5);
+    BITS(static_cast<uint64_t>(g_viewMode));
+    NUM(g_zoomLevel, 1e-4);
+    BITS(g_world.entities().size());
+    for (const auto& E : g_world.entities()) {
+        BITS(E.id);
+        POS(E.center.x, E.center.y, E.center.z);
+        NUM(E.yaw, 1e-5), NUM(E.pitch, 1e-5), NUM(E.roll, 1e-5);
+        NUM(E.width, 1e-4), NUM(E.height, 1e-4);
+    }
+    BITS(g_scene.sceneFingerprint());
+    if (g_bodyIf) {
+        for (const auto& J : g_joltBodies) {
+            if (!J.valid)
+                continue;
+            const auto P = g_bodyIf->GetPosition(J.body);
+            const auto R = g_bodyIf->GetRotation(J.body);
+            POS(P.GetX(), P.GetY(), P.GetZ());
+            NUM(R.GetX(), 1e-5), NUM(R.GetY(), 1e-5), NUM(R.GetZ(), 1e-5), NUM(R.GetW(), 1e-5);
+        }
+        if (!g_companion.body.IsInvalid()) {
+            const auto P = g_bodyIf->GetPosition(g_companion.body);
+            POS(P.GetX(), P.GetY(), P.GetZ());
+            NUM(g_companion.yaw, 1e-5);
+        }
+    }
+    BITS(g_read.id);
+    NUM(g_read.dim, 1e-3);
+    BITS(static_cast<uint64_t>(g_fsPhase));
+    NUM(g_fsAlpha, 1e-3), NUM(g_transition, 1e-3), NUM(g_diagAlpha, 1e-3);
+    return h;
+}
+
+// What moves on its own, with no state yet to show it: an animation clock,
+// work done off the main thread, a request waiting for the next frame.
+static bool runsOnTime() {
+    return g_debugHud                        // the HUD counts frames
+        || g_viewMode != 0                   // F5: the player's own animation
+        || g_scene.scenePending() || joltShapesPending()
+        || g_sightPending
+        || g_companion.mode != ECompanionMode::Idle
+        || !g_trashed.empty()
+        || (g_read.id && (!g_read.arrived || g_read.following || g_read.back))
+        || g_world.dragActive()
+        || g_transition != g_transitionTarget
+        || g_fsPhase == EFullscreenPhase::To2D || g_fsPhase == EFullscreenPhase::To3D;
+}
+
+static bool roomStill() {
+    return g_stillFrames >= kStillFrames && !runsOnTime();
 }
 
 static void onRenderStage(eRenderStage stage) {
@@ -5479,7 +5569,13 @@ static void onRenderStage(eRenderStage stage) {
         )
     );
 
-    damageCurrentMonitor();
+    const uint64_t SIG = frameFingerprint();
+    g_stillFrames = SIG == g_frameSig && !runsOnTime() ? g_stillFrames + 1 : 0;
+    g_frameSig = SIG;
+    if (!roomStill())
+        damageCurrentMonitor();
+    else if (g_stillFrames == kStillFrames)
+        dumpStatus(/*force=*/true);
 }
 
 // --- event handlers ---------------------------------------------------------
@@ -5527,6 +5623,7 @@ static void onMouseAxis(
 ) {
     if (!ownsInput())
         return;
+    damageCurrentMonitor(); // a still room draws again (roomStill)
 
     if (event.axis != WL_POINTER_AXIS_VERTICAL_SCROLL)
         return;
@@ -5695,6 +5792,7 @@ static void onMouseButton(
 ) {
     if (!ownsInput())
         return;
+    damageCurrentMonitor(); // a still room draws again (roomStill)
 
     const bool PRESSED =
         event.state == WL_POINTER_BUTTON_STATE_PRESSED;
@@ -6054,6 +6152,9 @@ static void onKeyboardKey(
 ) {
     if (!ownsInput())
         return;
+    // Every input wakes a still room (roomStill): a key changes its state
+    // in the next frame, and with no frame asked for there was none.
+    damageCurrentMonitor();
 
     if (!g_pSeatManager || g_pSeatManager->m_keyboard.expired())
         return;

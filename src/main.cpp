@@ -2204,7 +2204,7 @@ struct SRead {
     Vec3  roomCenter{};     // where it stood in the room
     float roomYaw = 0.f, roomPitch = 0.f, roomRoll = 0.f;
     Vec3  atCenter{};       // the reading pose, fixed on arrival
-    float atYaw = 0.f, atPitch = 0.f;
+    float atYaw = 0.f, atPitch = 0.f, atScale = 1.f;
 };
 static SRead g_read;
 static constexpr float kReadSeconds = 0.35f;
@@ -2212,19 +2212,25 @@ static constexpr float kReadSeconds = 0.35f;
 // The reading pose for a window of BOX (logical px, decorations included):
 // at the distance where the monitor's logical height fills the view, a
 // window at scale 1 shows one logical px per logical px of the screen (the
-// fullscreen transition's distance). Shifted by under a pixel so its edges
-// fall on pixel edges: half a pixel off, every texel is smeared over two.
+// fullscreen transition's distance) -- 8.5 m on a 1080 px monitor, and the
+// Moon station's deck edge, 7 m off, hid the lower half. So it comes to
+// kReadDistance, scaled down by the same ratio: the same angle, the same
+// pixels. Shifted by under a pixel so its edges fall on pixel edges: half a
+// pixel off, every texel is smeared over two.
+static constexpr float kReadDistance = 1.0f;
+
 static void readingPose(const PHLMONITOR& mon, const CBox& BOX, Vec3& center,
-                        float& yaw, float& pitch) {
+                        float& yaw, float& pitch, float& scale) {
     const auto& CAM = g_scene.camera();
     const Vec3  FWD = CAM.forward();
     const Vec3  RIGHT = CAM.right();
     const Vec3  UP = cross(RIGHT, FWD);
-    const float DIST = World3D::toWorld(static_cast<float>(mon->m_size.y)) * 0.5f /
+    const float ONE_TO_ONE = World3D::toWorld(static_cast<float>(mon->m_size.y)) * 0.5f /
         std::tan(kFovDeg * 3.14159265f / 360.0f);
+    scale = kReadDistance / ONE_TO_ONE;
 
     const double S  = mon->m_scale > 0.0 ? mon->m_scale : 1.0;
-    const double PX = 1.0 / (World3D::LOGICAL_PX_PER_UNIT * S); // world per pixel
+    const double PX = scale / (World3D::LOGICAL_PX_PER_UNIT * S); // world per pixel
     const auto   OFF = [](double screen, double window) {
         const double EDGE = (screen - window) * 0.5;
         return EDGE - std::floor(EDGE); // 0 or 0.5 for whole sizes
@@ -2232,7 +2238,7 @@ static void readingPose(const PHLMONITOR& mon, const CBox& BOX, Vec3& center,
     const double DX = OFF(mon->m_pixelSize.x, BOX.w * S);
     const double DY = OFF(mon->m_pixelSize.y, BOX.h * S);
 
-    center = CAM.position + FWD * DIST - RIGHT * static_cast<float>(DX * PX) +
+    center = CAM.position + FWD * kReadDistance - RIGHT * static_cast<float>(DX * PX) +
         UP * static_cast<float>(DY * PX);
     yaw   = -CAM.yaw;
     pitch = CAM.pitch;
@@ -2256,8 +2262,9 @@ static void applyReading(const PHLMONITOR& mon, const CBox& BOX, World3D::SEntit
         toScale = configWindowScale();
     } else if (g_read.arrived) {
         to = g_read.atCenter, toYaw = g_read.atYaw, toPitch = g_read.atPitch;
+        toScale = g_read.atScale;
     } else
-        readingPose(mon, BOX, to, toYaw, toPitch);
+        readingPose(mon, BOX, to, toYaw, toPitch, toScale);
 
     const float TWO_PI = 2.f * std::numbers::pi_v<float>;
     E.center = g_read.legCenter + (to - g_read.legCenter) * P;
@@ -2275,6 +2282,7 @@ static void applyReading(const PHLMONITOR& mon, const CBox& BOX, World3D::SEntit
     else if (!g_read.arrived) {
         g_read.arrived  = true;
         g_read.atCenter = to, g_read.atYaw = toYaw, g_read.atPitch = toPitch;
+        g_read.atScale  = toScale;
     }
 }
 

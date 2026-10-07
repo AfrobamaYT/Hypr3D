@@ -28,7 +28,12 @@
 #include <hyprland/src/output/Monitor.hpp>
 #include <hyprland/src/desktop/view/Window.hpp>
 #include <csignal>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <wayland-server-core.h>
 #include <unistd.h>
+#include <hyprland/src/Compositor.hpp>
 #include <hyprland/src/managers/ANRManager.hpp>
 #include <hyprland/src/helpers/AsyncDialogBox.hpp>
 #include <hyprland/src/managers/EventManager.hpp>
@@ -4407,6 +4412,121 @@ static void accelerateToward(Vec3& vel, const Vec3& dir, float wish, float accel
     vel.z += dir.z * STEP;
 }
 
+// Head tracking (config head = { enabled, port, look, move }), off unless
+// asked for: opentrack's "UDP over network" output -- six doubles, x y z in
+// cm and yaw pitch roll in degrees -- on 127.0.0.1:port (4242, opentrack's
+// default); the face tracking itself is opentrack's, from any webcam. look
+// turns the view by the head's turn (degrees per degree), move shifts the
+// eye by the head's shift (metres per metre): looking past a window's edge
+// by leaning, as Compiz did in 2010 and Breezy Desktop does with opentrack.
+// The Reddit finds praise it and also report nausea and jitter
+// (research/hypr3d-ideen-2026-10-06.md), so: off by default, smoothed, a
+// jump of more than 25 cm or 60 degrees in one packet thrown away, and
+// back to the centre a second after the packets stop. First person only.
+// Unverified with a real tracker: the signs (a tracker's yaw to the right is
+// taken as looking right); look or move < 0 turns an axis round.
+static bool  g_cfgHead     = false;
+static float g_cfgHeadPort = 4242.0f;
+static float g_cfgHeadLook = 1.0f;
+static float g_cfgHeadMove = 1.0f;
+struct SHead {
+    int              fd   = -1;
+    int              port = 0;
+    wl_event_source* source = nullptr;
+    double           target[6]{}; // the last packet: x y z cm, yaw pitch roll deg
+    double           shown[6]{};  // smoothed
+    bool             any = false;
+    std::chrono::steady_clock::time_point last;
+    uint64_t         packets = 0, dropped = 0;
+};
+static SHead g_head;
+static float s_headYawApplied = 0.0f, s_headPitchApplied = 0.0f; // rad, in CAM
+
+static int headReadable(int fd, uint32_t, void*) {
+    double buf[8];
+    for (;;) {
+        const ssize_t N = recv(fd, buf, sizeof(buf), 0);
+        if (N < 0)
+            break; // EAGAIN: all read
+        if (N != 6 * sizeof(double))
+            continue;
+        bool ok = true;
+        for (int i = 0; i < 6; ++i)
+            ok = ok && std::isfinite(buf[i]) && std::fabs(buf[i]) < 1000.0;
+        if (!ok) {
+            ++g_head.dropped;
+            continue;
+        }
+        if (g_head.any) {
+            const double MOVED = std::hypot(buf[0] - g_head.target[0], buf[1] - g_head.target[1], buf[2] - g_head.target[2]);
+            const double TURNED = std::max(std::fabs(buf[3] - g_head.target[3]), std::fabs(buf[4] - g_head.target[4]));
+            if (MOVED > 25.0 || TURNED > 60.0) {
+                ++g_head.dropped;
+                continue;
+            }
+        }
+        std::copy(buf, buf + 6, g_head.target);
+        g_head.any  = true;
+        g_head.last = std::chrono::steady_clock::now();
+        ++g_head.packets;
+    }
+    damageCurrentMonitor();
+    return 0;
+}
+
+static void headClose() {
+    if (g_head.source)
+        wl_event_source_remove(g_head.source);
+    if (g_head.fd >= 0)
+        close(g_head.fd);
+    g_head = {};
+}
+
+// Opens, moves or closes the socket after a config change.
+static void headApply() {
+    const int PORT = std::clamp(static_cast<int>(g_cfgHeadPort), 1, 65535);
+    if (!g_cfgHead || PORT != g_head.port)
+        headClose();
+    if (!g_cfgHead || g_head.fd >= 0 || !g_pCompositor || !g_pCompositor->m_wlEventLoop)
+        return;
+    const int FD = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    sockaddr_in at{};
+    at.sin_family      = AF_INET;
+    at.sin_port        = htons(static_cast<uint16_t>(PORT));
+    at.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // this machine only
+    if (FD < 0 || bind(FD, reinterpret_cast<sockaddr*>(&at), sizeof(at)) != 0) {
+        if (FD >= 0)
+            close(FD);
+        notify("[hypr3d] head tracking: 127.0.0.1:" + std::to_string(PORT) + " is taken or refused", CHyprColor{1.0f, 0.3f, 0.2f, 1.0f});
+        return;
+    }
+    g_head.fd     = FD;
+    g_head.port   = PORT;
+    g_head.source = wl_event_loop_add_fd(g_pCompositor->m_wlEventLoop, FD, WL_EVENT_READABLE, headReadable, nullptr);
+}
+
+// The head's offsets for this frame, eased: towards the last packet, or back
+// to the centre once the packets stopped.
+static bool headBusy() {
+    if (!g_cfgHead || !g_head.any)
+        return false;
+    for (int i = 0; i < 6; ++i)
+        if (std::fabs(g_head.shown[i] - g_head.target[i]) > 0.01)
+            return true;
+    return std::chrono::duration<float>(std::chrono::steady_clock::now() - g_head.last).count() < 1.2f;
+}
+
+static void headStep(float dt) {
+    if (g_cfgHead && g_head.any &&
+        std::chrono::duration<float>(std::chrono::steady_clock::now() - g_head.last).count() > 1.0f)
+        std::fill(g_head.target, g_head.target + 6, 0.0); // tracking stopped: back to the centre
+    const double K = 1.0 - std::exp(-dt / 0.05);
+    for (int i = 0; i < 6; ++i) {
+        const double TO = g_cfgHead ? g_head.target[i] : 0.0;
+        g_head.shown[i] += (TO - g_head.shown[i]) * K;
+    }
+}
+
 // Walk bob (view-only): sine phase in radians + eased amplitude. The body
 // pose stays physical -- the offset rides on the camera each frame and is
 // re-derived from the clean eye point, so it never feeds back into Jolt.
@@ -4914,6 +5034,24 @@ static void update3D(float dt) {
         if (FIRST)
             viewY -= s_viewDrop + s_landDip;
         CAM.position.y += std::clamp(viewY, -kViewOffsetMax, kViewOffsetMax);
+
+        // Head tracking (g_head): the eye shifted by the head, the view
+        // turned by it -- the turn on top of the mouse's, so what was added
+        // last frame comes off first.
+        headStep(dt);
+        const bool  HEAD  = FIRST && g_fsPhase == EFullscreenPhase::None;
+        const float YAW   = HEAD ? static_cast<float>(g_head.shown[3] * std::numbers::pi / 180.0) * g_cfgHeadLook : 0.0f;
+        const float PITCH = HEAD ? static_cast<float>(g_head.shown[4] * std::numbers::pi / 180.0) * g_cfgHeadLook : 0.0f;
+        CAM.yaw += YAW - s_headYawApplied;
+        CAM.pitch = std::clamp(CAM.pitch + PITCH - s_headPitchApplied, -1.55f, 1.55f);
+        s_headYawApplied = YAW, s_headPitchApplied = PITCH;
+        if (HEAD) {
+            const float M = g_cfgHeadMove / 100.0f; // cm -> m
+            const Vec3  FWD = CAM.flatForward(), RIGHT = CAM.right();
+            CAM.position = CAM.position + RIGHT * static_cast<float>(g_head.shown[0] * M) +
+                Vec3{0.f, static_cast<float>(g_head.shown[1] * M), 0.f} -
+                FWD * static_cast<float>(g_head.shown[2] * M);
+        }
     }
 
     // Map-drag carry: the grabbed object's CENTER rides the crosshair at
@@ -5412,6 +5550,9 @@ static void dumpStatus(bool force = false) {
         out << "camera: pos=(" << CAM.position.x << "," << CAM.position.y << "," << CAM.position.z
             << ") yaw=" << CAM.yaw << " pitch=" << CAM.pitch << " view=" << g_viewMode
             << " remembered=" << (g_room.valid ? 1 : 0) << "/" << g_room.poses.size() << "\n";
+        out << "head: on=" << (g_cfgHead ? 1 : 0) << " port=" << g_head.port << " packets=" << g_head.packets
+            << " dropped=" << g_head.dropped << " shown=" << g_head.shown[0] << "," << g_head.shown[1] << ","
+            << g_head.shown[2] << " yaw=" << g_head.shown[3] << " pitch=" << g_head.shown[4] << "\n";
         out << "gun: out=" << (g_gun ? 1 : 0) << " holding=" << g_gunHold.id << " shots=" << g_gunShots.size() << "\n";
         out << "read: id=" << g_read.id << " menu=" << g_menuId << " arrived=" << (g_read.arrived ? 1 : 0)
             << " following=" << (g_read.following ? 1 : 0) << " at=(" << g_read.atCenter.x << ","
@@ -5585,6 +5726,7 @@ static bool runsOnTime() {
         || (g_read.id && (!g_read.arrived || g_read.following || g_read.back))
         || g_world.dragActive()
         || !g_gunShots.empty() || g_gunHold.active
+        || headBusy()
         || g_transition != g_transitionTarget
         || g_fsPhase == EFullscreenPhase::To2D || g_fsPhase == EFullscreenPhase::To3D;
 }
@@ -6737,6 +6879,19 @@ static int luaConfig(lua_State* L) {
         lua_pop(L, 1);
     }
 
+    idx = SECTION("head", "head");
+    if (idx == -1)
+        return luaL_error(L, "hypr3d.config: head must be a table");
+    if (idx > 0) {
+        if (!SET_BOOL(idx, "enabled", g_cfgHead, "head.enabled") ||
+            !SET_NUM(idx, "port", g_cfgHeadPort, "head.port") ||
+            !SET_NUM(idx, "look", g_cfgHeadLook, "head.look") ||
+            !SET_NUM(idx, "move", g_cfgHeadMove, "head.move"))
+            return luaL_error(L, "hypr3d.config: head = { enabled, port, look, move } is invalid");
+        lua_pop(L, 1);
+        headApply();
+    }
+
     idx = SECTION("player", "player");
     if (idx == -1)
         return luaL_error(L, "hypr3d.config: player must be a table");
@@ -7685,6 +7840,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
     syncRoomState(true);
 
     joltShutdown();
+    headClose();
 
     g_active = false;
     stopFramePump();

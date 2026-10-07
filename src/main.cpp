@@ -29,6 +29,7 @@
 #include <hyprland/src/desktop/view/Window.hpp>
 #include <hyprland/src/managers/EventManager.hpp>
 #include <hyprland/src/managers/SeatManager.hpp>
+#include <hyprland/src/managers/SessionLockManager.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
 #include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
 #include <hyprland/src/config/values/ConfigValues.hpp>
@@ -784,11 +785,20 @@ static void postRoomEvent(const std::string& json) {
         g_pEventManager->postEvent(SHyprIPCEvent{"hypr3d", json});
 }
 
+// A locked session (ext-session-lock) is the lock screen's alone: the room
+// draws nothing and takes no input. It used to draw over the lock surface at
+// RENDER_LAST_MOMENT -- every window, live, and the lock screen unseen
+// (measured 2026-10-07 in the caelestia sandbox, whose lock is a
+// WlSessionLock). Typed keys went to the lock there, not to the windows.
+static bool sessionLocked() {
+    return g_pSessionLockManager && g_pSessionLockManager->isSessionLocked();
+}
+
 // Open = on screen and taking commands: not while it fades out, not while a
 // fullscreen window has it paused.
 static bool roomOpen() {
     return g_active && g_transitionTarget > 0.5f &&
-        g_fsPhase != EFullscreenPhase::In2D;
+        g_fsPhase != EFullscreenPhase::In2D && !sessionLocked();
 }
 
 // The windows in the room with their names, sorted by name. Layers (bars,
@@ -1815,7 +1825,7 @@ static void resetCameraKeys() {
 static bool ownsInput() {
     // In2D is the fullscreen passthrough: Hyprland owns everything.
     return g_active && g_transition >= 0.9f &&
-        g_fsPhase != EFullscreenPhase::In2D;
+        g_fsPhase != EFullscreenPhase::In2D && !sessionLocked();
 }
 
 static void setFocusLock(bool on) {
@@ -3635,6 +3645,8 @@ static void enter3D() {
 }
 
 static void toggle3D() {
+    if (sessionLocked() && g_transitionTarget <= 0.5f)
+        return;
     g_transitionTarget =
         g_transitionTarget > 0.5f ? 0.0f : 1.0f;
 
@@ -3650,6 +3662,8 @@ static void toggle3D() {
 }
 
 static void open3D() {
+    if (sessionLocked())
+        return;
     g_transitionTarget = 1.0f;
     enter3D();
     damageCurrentMonitor();
@@ -4841,6 +4855,18 @@ static void onRenderStage(eRenderStage stage) {
     }
 
     dumpStatus();
+
+    // Locked: not one more frame of the room, and closed without the fade
+    // (the fade draws the room). The teardown runs from the event loop.
+    if (sessionLocked()) {
+        g_transitionTarget = 0.0f;
+        g_transition       = 0.0f;
+        requestDeactivate3D();
+        syncRoomState(false);
+        abortSight("The session is locked");
+        return;
+    }
+
     syncRoomState(false);
     deliverSight();
 
@@ -6314,12 +6340,16 @@ static int luaFocusLock(lua_State* L) {
     return 0;
 }
 
-static int luaToggle(lua_State*) {
+static int luaToggle(lua_State* L) {
+    if (sessionLocked() && !g_active)
+        return luaL_error(L, "hypr3d: the session is locked");
     toggle3D();
     return 0;
 }
 
-static int luaOpen(lua_State*) {
+static int luaOpen(lua_State* L) {
+    if (sessionLocked())
+        return luaL_error(L, "hypr3d: the session is locked");
     open3D();
     return 0;
 }

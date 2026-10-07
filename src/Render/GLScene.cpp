@@ -2149,6 +2149,165 @@ void GLScene::drawDebugOverlay(int width, int height) {
     glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(oldFBO));
     glViewport(oldViewport[0], oldViewport[1], oldViewport[2], oldViewport[3]);
 }
+void GLScene::drawRoom(const Mat4& vp, const ViewWindow& view,
+                       const std::vector<WindowRender>& windows, float dt,
+                       bool primary, bool sight) {
+    drawPanorama(view);
+
+    for (auto& S : m_slots) {
+        if (!S.model || !S.model->loaded())
+            continue;
+
+        S.model->draw(vp, m_camera.position);
+
+        // Red x-ray wireframe of the collision triangles (debug).
+        if (!sight)
+            S.model->drawDebug(vp);
+    }
+
+    if (m_pDbgOn && !sight)
+        drawCapsule(vp, m_pDbgCenter, nullptr, Vec3{0.2f, 1.0f, 0.3f}, false);
+    // Arch blue, the default accent of Larch's palette.
+    if (m_compOn && !sight)
+        drawCapsule(vp, m_compCenter, &m_compYaw, Vec3{0.09f, 0.576f, 0.82f}, true);
+    if ((m_playerVisible || sight) && m_player.loaded()) {
+        m_player.setPose(m_playerFeet, m_playerYaw, m_playerCfg.scale,
+                         m_playerCfg.posOffset + m_playerCfg.centerOffset,
+                         m_playerCfg.rotDeg);
+        m_player.setFlat(m_playerCfg.flat);
+        m_player.setEmissiveScale(m_playerCfg.emissiveScale);
+        if (primary)
+            m_player.update(dt);
+        m_player.draw(vp, m_camera.position);
+    } else if (sight) {
+        // The player without a model: orange, apart from the companion's
+        // blue and the Moon's grey. The capsule's centre is set every frame.
+        drawCapsule(vp, m_pDbgCenter, nullptr, Vec3{1.0f, 0.55f, 0.1f}, true);
+    }
+
+    if (m_gridVisible) {
+        drawFloor(vp);
+
+        glEnable(GL_BLEND);
+        glBlendFuncSeparate(
+            GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
+            GL_ZERO, GL_ONE
+        );
+        glDepthMask(GL_FALSE);
+
+        drawGrid(vp);
+    }
+
+    // Windows submit back to front and write depth: crossing quads cut into
+    // each other honestly, and translucency composites in order.
+    drawWindows(vp, windows);
+
+    glDepthMask(GL_TRUE);
+}
+
+void GLScene::drawSight(const std::vector<WindowRender>& windows) {
+    // One picture on its way back at a time; this one waits for it.
+    if (m_sightFence)
+        return;
+    m_sightWanted = false;
+
+    constexpr GLsizeiptr BYTES = GLsizeiptr{kSightWidth} * kSightHeight * 4;
+    if (!m_sightFBO) {
+        glGenFramebuffers(1, &m_sightFBO);
+        glGenRenderbuffers(1, &m_sightColor);
+        glGenRenderbuffers(1, &m_sightDepth);
+        glGenBuffers(1, &m_sightPBO);
+
+        glBindRenderbuffer(GL_RENDERBUFFER, m_sightColor);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, kSightWidth, kSightHeight);
+        glBindRenderbuffer(GL_RENDERBUFFER, m_sightDepth);
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, kSightWidth, kSightHeight);
+        glBindRenderbuffer(GL_RENDERBUFFER, 0);
+
+        glBindFramebuffer(GL_FRAMEBUFFER, m_sightFBO);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, m_sightColor);
+        glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, m_sightDepth);
+
+        GLint oldPack = 0;
+        glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &oldPack);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, m_sightPBO);
+        glBufferData(GL_PIXEL_PACK_BUFFER, BYTES, nullptr, GL_STREAM_READ);
+        glBindBuffer(GL_PIXEL_PACK_BUFFER, static_cast<GLuint>(oldPack));
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, m_sightFBO);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        sightFailed("The eye's framebuffer is incomplete");
+        return;
+    }
+
+    glViewport(0, 0, kSightWidth, kSightHeight);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_BLEND);
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LESS);
+    glDepthMask(GL_TRUE);
+    glClearColor(0.012f, 0.019f, 0.032f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    // 90 degrees across: the view plane at distance 1 spans -1..1.
+    constexpr float HALF_H = static_cast<float>(kSightHeight) / kSightWidth;
+    const ViewWindow VIEW{-1.0f, 1.0f, -HALF_H, HALF_H};
+    constexpr float ZNEAR = 0.05f, ZFAR = 200.0f;
+    const Mat4 projection = Mat4::frustum(VIEW.left * ZNEAR, VIEW.right * ZNEAR,
+                                          VIEW.bottom * ZNEAR, VIEW.top * ZNEAR, ZNEAR, ZFAR);
+
+    // The panorama and the shading read m_camera: the eye stands in for it.
+    std::swap(m_camera, m_sightCam);
+    drawRoom(projection * m_camera.view(), VIEW, windows, 0.0f, false, true);
+    std::swap(m_camera, m_sightCam);
+
+    GLint oldPack = 0;
+    glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &oldPack);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, m_sightPBO);
+    glReadPixels(0, 0, kSightWidth, kSightHeight, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, static_cast<GLuint>(oldPack));
+    m_sightFence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+    if (!m_sightFence)
+        sightFailed("glFenceSync failed");
+}
+
+void GLScene::readSight() {
+    if (!m_sightFence)
+        return;
+
+    const auto FENCE = static_cast<GLsync>(m_sightFence);
+    const GLenum STATE = glClientWaitSync(FENCE, 0, 0);
+    if (STATE == GL_TIMEOUT_EXPIRED)
+        return;
+    glDeleteSync(FENCE);
+    m_sightFence = nullptr;
+
+    if (m_sightDrop) {
+        m_sightDrop = false;
+        return;
+    }
+    if (STATE == GL_WAIT_FAILED) {
+        sightFailed("glClientWaitSync failed");
+        return;
+    }
+
+    constexpr GLsizeiptr BYTES = GLsizeiptr{kSightWidth} * kSightHeight * 4;
+    GLint oldPack = 0;
+    glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &oldPack);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, m_sightPBO);
+    const auto* MAPPED =
+        static_cast<const unsigned char*>(glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, BYTES, GL_MAP_READ_BIT));
+    if (MAPPED) {
+        m_sightPixels.assign(MAPPED, MAPPED + BYTES);
+        m_sightResult = ESight::Picture;
+        glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+    } else
+        sightFailed("glMapBufferRange failed");
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, static_cast<GLuint>(oldPack));
+}
+
 bool GLScene::render(
     unsigned int targetFBO,
     int width,
@@ -2278,56 +2437,11 @@ bool GLScene::render(
         refreshPanorama();
         refreshScene();
     }
-    drawPanorama(VIEW);
-
-    for (auto& S : m_slots) {
-        if (!S.model || !S.model->loaded())
-            continue;
-
-        S.model->draw(vp, m_camera.position);
-
-        // Red x-ray wireframe of the collision triangles (debug).
-        S.model->drawDebug(vp);
-    }
-
     // The player's character (hidden in first person): animated inside
     // render -- the clock and the vertex upload need the EGL context.
     if (primary)
         refreshPlayer();
-    if (m_pDbgOn)
-        drawCapsule(vp, m_pDbgCenter, nullptr, Vec3{0.2f, 1.0f, 0.3f}, false);
-    // Arch blue, the default accent of Larch's palette.
-    if (m_compOn)
-        drawCapsule(vp, m_compCenter, &m_compYaw, Vec3{0.09f, 0.576f, 0.82f}, true);
-    if (m_playerVisible && m_player.loaded()) {
-        m_player.setPose(m_playerFeet, m_playerYaw, m_playerCfg.scale,
-                         m_playerCfg.posOffset + m_playerCfg.centerOffset,
-                         m_playerCfg.rotDeg);
-        m_player.setFlat(m_playerCfg.flat);
-        m_player.setEmissiveScale(m_playerCfg.emissiveScale);
-        if (primary)
-            m_player.update(dt);
-        m_player.draw(vp, m_camera.position);
-    }
-
-    if (m_gridVisible) {
-        drawFloor(vp);
-
-        glEnable(GL_BLEND);
-        glBlendFuncSeparate(
-            GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
-            GL_ZERO, GL_ONE
-        );
-        glDepthMask(GL_FALSE);
-
-        drawGrid(vp);
-    }
-
-    // Windows submit back to front and write depth: crossing quads cut into
-    // each other honestly, and translucency composites in order.
-    drawWindows(vp, windows);
-
-    glDepthMask(GL_TRUE);
+    drawRoom(vp, VIEW, windows, dt, primary, false);
 
     // F3 HUD: always on top of the scene, never part of the 3D pass state.
     if (primary)
@@ -2350,6 +2464,15 @@ bool GLScene::render(
 
         m_probeValid    = true;
         m_probeRequested = false;
+    }
+
+    // The companion's eye: a picture an earlier frame drew, once the GPU is
+    // through with it, then the one asked for now. After the probe, which
+    // reads the screen's target.
+    if (primary) {
+        readSight();
+        if (m_sightWanted)
+            drawSight(windows);
     }
 
     // --- composite over whatever Hyprland already drew for this frame ---
@@ -2511,6 +2634,21 @@ void GLScene::shutdown() {
 }
 
 void GLScene::destroyGLObjects() {
+    if (m_sightFence) {
+        glDeleteSync(static_cast<GLsync>(m_sightFence));
+        m_sightFence = nullptr;
+    }
+    m_sightDrop = false;
+    if (m_sightPBO) {
+        glDeleteBuffers(1, &m_sightPBO);
+        m_sightPBO = 0;
+    }
+    if (m_sightFBO) {
+        glDeleteRenderbuffers(1, &m_sightDepth);
+        glDeleteRenderbuffers(1, &m_sightColor);
+        glDeleteFramebuffers(1, &m_sightFBO);
+        m_sightFBO = m_sightColor = m_sightDepth = 0;
+    }
     if (m_textVBO) {
         glDeleteBuffers(1, &m_textVBO);
         m_textVBO = 0;

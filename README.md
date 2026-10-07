@@ -74,6 +74,7 @@ hyprctl eval 'hl.plugin.hypr3d.companion("go_to", "foot")'
 | --- | --- |
 | `companion("go_to", target)` | walks a straight line and stops in front of the target, facing it |
 | `companion("look_at", target)` | turns to face the target |
+| `companion("see")` | takes one picture from its eye, at most one a second |
 | `companion("stop")` | stops at once |
 | `companion("state")` | posts the room event now |
 
@@ -91,7 +92,17 @@ What happens goes out on Hyprland's event socket (`.socket2.sock`) as
   when the room opens, closes (a fullscreen window closes it too) or a window
   comes or goes;
 - `{"event":"companion","state":"first_step"|"arrived"|"blocked"|"aborted","target":"foot",...}`,
-  with a `reason` for `blocked` and `aborted`.
+  with a `reason` for `blocked` and `aborted`;
+- `{"event":"sight","path":".../hypr3d-sight.jpg","width":768,"height":432,"fov":90,"taken":...}`
+  once the picture `see` asked for lies next to Hyprland's sockets, `taken` being
+  the frame that drew it -- or `{"event":"sight","error":"..."}` when the room
+  closed first or nothing came back within 2 s.
+
+The picture is the room as the companion sees it, 90 degrees across, level
+along its facing: you as your player model, or as an orange capsule without
+one. It is drawn with the next frame and read back a frame or more later
+without stalling the compositor; the frame that draws it costs about 0.6 ms
+more, the JPEG about 1 ms (measured on the Moon station).
 
 It appears on the first call, beside the spawn, and its body lives as long as
 the plugin: leaving the room keeps it where it stood, `reset()` puts it back

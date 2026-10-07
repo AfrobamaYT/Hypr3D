@@ -132,6 +132,38 @@ class GLScene {
         m_compOn     = on;
     }
 
+    // The companion's eye (companion("see")): one picture of the room from
+    // `eye`, 90 degrees across, drawn with the next frame into a target of
+    // its own. It comes back without stalling the compositor: glReadPixels
+    // into a pixel pack buffer, mapped once its fence has passed, a frame or
+    // more later -- the way OBS's gl-stagesurf.c reads its frames. In it the
+    // player stands as his model, or as an orange capsule without one; the
+    // companion's own capsule is not drawn.
+    static constexpr int kSightWidth = 768, kSightHeight = 432;
+    void requestSight(const Camera& eye) {
+        m_sightCam    = eye;
+        m_sightWanted = true;
+    }
+    // Forgets a picture asked for or under way.
+    void dropSight() {
+        m_sightWanted = false;
+        m_sightDrop   = m_sightFence != nullptr;
+        m_sightResult = ESight::None;
+        m_sightPixels.clear();
+    }
+    enum class ESight { None, Picture, Failed };
+    // What the eye finished since the last call: the picture's RGBA rows,
+    // bottom up, moved into `rgba`, or why there is none.
+    ESight takeSight(std::vector<unsigned char>& rgba, std::string& why) {
+        const ESight R = m_sightResult;
+        m_sightResult  = ESight::None;
+        if (R == ESight::Picture)
+            rgba.swap(m_sightPixels);
+        if (R == ESight::Failed)
+            why = m_sightWhy;
+        return R;
+    }
+
     // View zoom (the C key): magnification narrows the render fov
     // symmetrically around the crosshair, so aiming stays exact.
     void setZoom(float magnification) {
@@ -263,6 +295,12 @@ class GLScene {
     void drawFloor(const Mat4& vp);
     void drawGrid(const Mat4& vp);
     void drawPanorama(const ViewWindow& view);
+    // Everything in the room through `vp`, into the bound target: the
+    // screen's view, or (`sight`) the companion's eye -- no debug lines, no
+    // companion, the player always.
+    void drawRoom(const Mat4& vp, const ViewWindow& view,
+                  const std::vector<WindowRender>& windows, float dt,
+                  bool primary, bool sight);
     void refreshPanorama();
 
     void drawWindows(const Mat4& vp, const std::vector<WindowRender>& windows);
@@ -366,6 +404,22 @@ class GLScene {
     float                           m_compYaw = 0.0f;
     void drawCapsule(const Mat4& vp, const Vec3& center, const float* yaw,
                      const Vec3& color, bool depthTest);
+    // The companion's eye, see requestSight.
+    Camera                          m_sightCam;
+    bool                            m_sightWanted = false;
+    bool                            m_sightDrop   = false; // the readback under way is unwanted
+    void*                           m_sightFence  = nullptr; // GLsync
+    unsigned int                    m_sightFBO = 0, m_sightColor = 0, m_sightDepth = 0;
+    unsigned int                    m_sightPBO = 0;
+    ESight                          m_sightResult = ESight::None;
+    std::vector<unsigned char>      m_sightPixels;
+    std::string                     m_sightWhy;
+    void drawSight(const std::vector<WindowRender>& windows);
+    void readSight();
+    void sightFailed(std::string why) {
+        m_sightResult = ESight::Failed;
+        m_sightWhy    = std::move(why);
+    }
     SPlayerCfg                      m_playerCfg;
     std::string                     m_playerPath;      // tilde-expanded
     std::filesystem::file_time_type m_playerMtime{};

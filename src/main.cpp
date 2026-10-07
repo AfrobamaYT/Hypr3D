@@ -51,6 +51,7 @@ extern "C" {
 }
 
 #include <linux/input-event-codes.h>
+#include <turbojpeg.h>
 #include <xkbcommon/xkbcommon.h>
 
 #include "Render/GLScene.hpp"
@@ -68,7 +69,10 @@ extern "C" {
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cerrno>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -721,6 +725,15 @@ static SCompanion g_companion;
 // starts), not in every room: without an AI it would only stand there.
 static bool g_companionCalled = false;
 
+// companion("see"): one picture from its eye at a time, at most one a
+// second (agreed with the AI side, 2026-10-07). Asked here, handed to the
+// scene by updateCompanion where the body's place is known, delivered by
+// deliverSight.
+static bool      g_sightAsked   = false; // not yet handed to the scene
+static bool      g_sightPending = false; // asked and not yet delivered
+static long long g_sightAskedNs = 0;
+static long long g_sightTakenNs = 0;     // the frame that drew it
+
 static constexpr float kCompanionSpeed = 3.0f;  // m/s; the player flies at 4
 static constexpr float kCompanionTurn  = 8.0f;  // rad/s
 static constexpr float kNearPlayer     = 1.5f;  // go_to "player" ends here
@@ -1135,6 +1148,98 @@ static void updateCompanion(float dt) {
         g_companion.body,
         JPH::Vec3(vx, FLOOR ? std::max(V.GetY(), -40.f) : 0.f, vz));
     g_scene.setCompanion(AT, g_companion.yaw, true);
+
+    // The eye rides where the player's does, level, along its facing.
+    if (g_sightAsked) {
+        Camera eye;
+        eye.position = Vec3{AT.x, AT.y + PLAYER_EYE_OFF, AT.z};
+        eye.yaw      = g_companion.yaw;
+        eye.pitch    = 0.f;
+        g_scene.requestSight(eye);
+        g_sightAsked   = false;
+        g_sightTakenNs = monotonicNs();
+    }
+}
+
+static void sightEvent(const std::string& fields) {
+    postRoomEvent("{\"event\":\"sight\"," + fields + ",\"t\":" +
+                  std::to_string(monotonicNs()) + "}");
+}
+
+// Forgets a picture asked for, and says why -- a bridge waiting for it
+// must not wait forever.
+static void abortSight(const std::string& why) {
+    if (!g_sightPending)
+        return;
+    g_sightAsked   = false;
+    g_sightPending = false;
+    g_scene.dropSight();
+    sightEvent("\"error\":" + jsonString(why));
+}
+
+// Once per frame: the eye's picture as a JPEG next to Hyprland's sockets,
+// and the event that says where. Written whole and renamed into place, so a
+// reader never sees half of it. The encoding takes 0.6 ms for a picture of
+// the station, 1.1 ms for noise (measured 2026-10-07, libjpeg-turbo 3) --
+// once a second at most, so it runs here rather than in a thread of its own.
+static void deliverSight() {
+    if (!g_sightPending)
+        return;
+    if (!roomOpen()) {
+        abortSight("The room closed before the picture was taken");
+        return;
+    }
+
+    std::vector<unsigned char> rgba;
+    std::string why;
+    switch (g_scene.takeSight(rgba, why)) {
+        case GLScene::ESight::None:
+            if (monotonicNs() - g_sightAskedNs > 2'000'000'000LL)
+                abortSight("No picture came back within 2 s");
+            return;
+        case GLScene::ESight::Failed:
+            abortSight(why);
+            return;
+        case GLScene::ESight::Picture: break;
+    }
+
+    constexpr int W = GLScene::kSightWidth, H = GLScene::kSightHeight;
+    const std::unique_ptr<void, decltype(&tj3Destroy)> TJ{tj3Init(TJINIT_COMPRESS), tj3Destroy};
+    unsigned char* jpeg = nullptr;
+    size_t size = 0;
+    if (!TJ || tj3Set(TJ.get(), TJPARAM_QUALITY, 80) != 0 ||
+        tj3Set(TJ.get(), TJPARAM_SUBSAMP, TJSAMP_420) != 0 ||
+        tj3Set(TJ.get(), TJPARAM_BOTTOMUP, 1) != 0 ||
+        tj3Compress8(TJ.get(), rgba.data(), W, 0, H, TJPF_RGBA, &jpeg, &size) != 0) {
+        tj3Free(jpeg);
+        abortSight(std::string("JPEG: ") + (TJ ? tj3GetErrorStr(TJ.get()) : "tj3Init failed"));
+        return;
+    }
+
+    // Hyprland's instance directory, where its sockets are.
+    const char* RUNTIME = std::getenv("XDG_RUNTIME_DIR");
+    const char* SIG     = std::getenv("HYPRLAND_INSTANCE_SIGNATURE");
+    if (!RUNTIME || !SIG) {
+        tj3Free(jpeg);
+        abortSight("XDG_RUNTIME_DIR or HYPRLAND_INSTANCE_SIGNATURE is not set");
+        return;
+    }
+    const std::string PATH = std::string(RUNTIME) + "/hypr/" + SIG + "/hypr3d-sight.jpg";
+    const std::string TMP  = PATH + ".part";
+    std::FILE* f = std::fopen(TMP.c_str(), "wb");
+    const bool WRITTEN = f && std::fwrite(jpeg, 1, size, f) == size;
+    const bool CLOSED  = f && std::fclose(f) == 0;
+    tj3Free(jpeg);
+    if (!WRITTEN || !CLOSED || std::rename(TMP.c_str(), PATH.c_str()) != 0) {
+        std::remove(TMP.c_str());
+        abortSight("Cannot write " + PATH + ": " + std::strerror(errno));
+        return;
+    }
+
+    g_sightPending = false;
+    sightEvent("\"path\":" + jsonString(PATH) + ",\"width\":" + std::to_string(W) +
+               ",\"height\":" + std::to_string(H) + ",\"fov\":90,\"bytes\":" +
+               std::to_string(size) + ",\"taken\":" + std::to_string(g_sightTakenNs));
 }
 
 // The room event: open or closed, and when open what can be walked to.
@@ -3357,6 +3462,7 @@ static void deactivate3D() {
 
     g_active = false;
     syncRoomState(true);
+    abortSight("The room closed before the picture was taken");
     stopFramePump();
 
     // Fullscreen passthrough state: back to plain 3D-off. Restore the real
@@ -4736,6 +4842,7 @@ static void onRenderStage(eRenderStage stage) {
 
     dumpStatus();
     syncRoomState(false);
+    deliverSight();
 
     const float dt = updateTransition();
 
@@ -6134,8 +6241,29 @@ static int luaReset(lua_State*) {
 static bool companionLua(lua_State* L) {
     const char* VERB = lua_type(L, 1) == LUA_TSTRING ? lua_tostring(L, 1) : "";
     const std::string verb = VERB;
-    if (verb == "state" || verb == "stop" || verb == "go_to" || verb == "look_at")
+    if (verb == "state" || verb == "stop" || verb == "go_to" || verb == "look_at" ||
+        verb == "see")
         g_companionCalled = true;
+
+    if (verb == "see") {
+        const long long NOW = monotonicNs();
+        if (!roomOpen())
+            lua_pushstring(L, "companion: the room is closed");
+        else if (g_sightPending)
+            lua_pushstring(L, "companion: the last picture is still on its way");
+        else if (NOW - g_sightAskedNs < 1'000'000'000LL) {
+            char buf[96];
+            std::snprintf(buf, sizeof(buf), "companion: one picture a second; ask again in %.1f s",
+                          (1e9 - static_cast<double>(NOW - g_sightAskedNs)) / 1e9);
+            lua_pushstring(L, buf);
+        } else {
+            g_sightAsked   = true;
+            g_sightPending = true;
+            g_sightAskedNs = NOW;
+            return true;
+        }
+        return false;
+    }
 
     if (verb == "state") {
         postRoomState();
@@ -6146,7 +6274,7 @@ static bool companionLua(lua_State* L) {
         return true;
     }
     if (verb != "go_to" && verb != "look_at") {
-        lua_pushstring(L, "companion: the verb is go_to, look_at, stop or state");
+        lua_pushstring(L, "companion: the verb is go_to, look_at, see, stop or state");
         return false;
     }
     if (lua_type(L, 2) != LUA_TSTRING) {

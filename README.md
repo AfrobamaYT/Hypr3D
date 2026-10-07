@@ -130,6 +130,17 @@ hyprctl eval 'hl.plugin.hypr3d.portal("deltarune")'   -- removes it
 Each start goes out on socket2 as `{"event":"portal","name":"deltarune","started":true,...}`.
 A portal lives as long as the plugin; a wrong call fails with the reason.
 
+### The menu
+
+```lua
+hl.plugin.hypr3d.config({ menu = { command = "my-room-menu", title = "My room" } })
+```
+
+F1 in the room runs `command` (through Hyprland's executor, as an exec
+keybind); a window whose title is `title` comes to the eye at 1:1 as it
+opens, as F2 brings one, and goes when it closes. The menu itself is any
+program that opens such a window -- Larch's is `larch-room-menu`.
+
 ## Controls
 
 | Input                         | Action                                         |
@@ -147,6 +158,7 @@ A portal lives as long as the plugin; a wrong call fails with the reason.
 | Super + Mouse wheel scrolling | Zoom window                                    |
 | Super + Left Alt              | Toggle keyboard mode (movement / window input) |
 | F3                            | Toggle debug HUD                               |
+| F1                            | The room's menu (config `menu.command`)        |
 | F2                            | Read: the aimed window comes to you at 1:1, again sends it back |
 | F4                            | Cinema: the aimed window as big as the view, the room dark around it; again sends it back |
 | F5                            | Switch camera view                             |

@@ -2275,6 +2275,10 @@ struct SRead {
     float atYaw = 0.f, atPitch = 0.f, atScale = 1.f;
 };
 static SRead g_read;
+// The room's menu (config menu = { command, title }): F1 runs the command,
+// and the window with this title comes to the eye when it opens.
+static std::string    g_cfgMenuCommand, g_cfgMenuTitle;
+static std::uintptr_t g_menuId = 0; // the menu window last brought
 static constexpr float kReadSeconds = 0.35f;
 static constexpr float kCinemaFill  = 0.9f; // of the view's width or height
 static constexpr float kCinemaDim   = 0.8f; // the room at a fifth of its light
@@ -2363,11 +2367,11 @@ static void applyReading(const PHLMONITOR& mon, const CBox& BOX, World3D::SEntit
     }
 }
 
-// F2 or F4 on the aimed window; the same key again sends it back, the other
-// one turns reading into the cinema and back. The next leg starts from
-// wherever the window is now.
-static void toggleReading(bool cinema) {
-    const std::uintptr_t ID = g_read.id ? g_read.id : g_lastAimedId;
+// F2 or F4 on the aimed window (or on `only`, the menu); the same key again
+// sends it back, the other one turns reading into the cinema and back. The
+// next leg starts from wherever the window is now.
+static void toggleReading(bool cinema, std::uintptr_t only = 0) {
+    const std::uintptr_t ID = only ? only : g_read.id ? g_read.id : g_lastAimedId;
     const auto* E = ID ? g_world.find(ID) : nullptr;
     if (!E) {
         notify(cinema ? "[hypr3d] F4: aim at a window to show it big" :
@@ -2731,8 +2735,24 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
 
     if (g_read.id && std::ranges::none_of(ENTITIES, [](const auto& E) { return E.id == g_read.id; }))
         g_read = {}; // it closed
-    g_scene.setFeatured(g_read.id, g_read.dim);
+
+    // The menu window, as it opens, comes to the eye at 1:1 -- over a window
+    // being read, which goes back first.
+    std::uintptr_t menu = 0;
+    if (!g_cfgMenuTitle.empty())
+        for (const auto& E : ENTITIES)
+            if (const auto W = Compat::findWindowById(E.id); W && W->m_title == g_cfgMenuTitle)
+                menu = E.id;
+    const bool MENU_NEW = menu && menu != g_menuId;
+    g_menuId = menu;
     g_world.setEntities(std::move(ENTITIES), false);
+    if (MENU_NEW) {
+        if (g_read.id && g_read.id != menu)
+            endReading(true);
+        if (!g_read.id)
+            toggleReading(false, menu);
+    }
+    g_scene.setFeatured(g_read.id, g_read.dim);
 
     // --- build the draw list from world + snapshot ---
     g_renderWindows.clear();
@@ -5811,6 +5831,16 @@ static void onKeyboardKey(
     if (g_keyboardMode == EKeyboardMode::Window)
         return;
 
+    // F1: the room's menu, as VRChat's (config menu.command).
+    if (PRESSED && SYM == XKB_KEY_F1) {
+        if (g_cfgMenuCommand.empty())
+            notify("[hypr3d] F1: no menu set (config menu.command)", CHyprColor{0.2f, 0.8f, 0.4f, 1.0f});
+        else if (!Config::Supplementary::executor()->spawn(g_cfgMenuCommand))
+            notify("[hypr3d] F1: the menu command did not start", CHyprColor{1.0f, 0.2f, 0.2f, 1.0f});
+        info.cancelled = true;
+        return;
+    }
+
     // F2: the aimed window to the eye at 1:1, and back. F4: the cinema.
     if (PRESSED && (SYM == XKB_KEY_F2 || SYM == XKB_KEY_F4)) {
         toggleReading(SYM == XKB_KEY_F4);
@@ -6047,6 +6077,19 @@ static int luaConfig(lua_State* L) {
         // anything below is clamped up to it.
         g_cfgWindowDepth = std::max(0.0f, g_cfgWindowDepth);
 
+        lua_pop(L, 1);
+    }
+
+    // menu = { command = "...", title = "..." }: F1 in the room runs the
+    // command; a window with this title comes to the eye as it opens.
+    idx = SECTION("menu", "menu");
+    if (idx == -1)
+        return luaL_error(L, "hypr3d.config: menu must be a table");
+    if (idx > 0) {
+        if (!SET_STRING(idx, "command", g_cfgMenuCommand, "menu.command"))
+            return luaL_error(L, "hypr3d.config: menu.command must be a string");
+        if (!SET_STRING(idx, "title", g_cfgMenuTitle, "menu.title"))
+            return luaL_error(L, "hypr3d.config: menu.title must be a string");
         lua_pop(L, 1);
     }
 

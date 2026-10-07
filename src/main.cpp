@@ -358,6 +358,7 @@ static std::string g_cfgPanorama;                // panorama image path
 static std::string g_cfgMonitor;                 // monitor name (e.g. "DP-1"), empty = focused
 static bool        g_cfgGrid = true;             // base grid platform on/off
 static bool        g_cfgShadows = true;          // shadows under the windows (updateShadows)
+static bool        g_cfgHud = true;              // the rice's bar and notifications in view (g_hudItems)
 static bool        g_cfgSpan = true;             // the room across every monitor
 
 // --- windows ----------------------------------------------------------------
@@ -2373,6 +2374,23 @@ struct SRead {
     std::chrono::steady_clock::time_point tick; // followMenu's last frame
 };
 static SRead g_read;
+// The HUD (config world.hud): the rice's top and overlay layers -- its bar,
+// its notifications, its drawers -- over the picture where they stand in 2D,
+// in view wherever the player looks, as a game's HUD is. On the wall a
+// notification came where the 2D picture had it, out of sight behind the
+// player; the Reddit finds report the same of Xreal's virtual screens.
+// caelestia draws bar and notifications into ONE screen-sized layer, so they
+// come over the picture together; background and bottom layers (the
+// wallpaper) stay on the wall. Shown, not aimed at: the crosshair passes
+// through to the room, as through the screen-sized layer it would otherwise
+// always hit.
+struct SHudItem {
+    std::uintptr_t id = 0;
+    PHLMONITORREF  monitor;
+    CBox           box; // monitor-local, logical px
+};
+static std::vector<SHudItem> g_hudItems;
+
 // The room's menu (config menu = { command, title }): F1 runs the command,
 // and the window with this title comes to the eye when it opens.
 static std::string    g_cfgMenuCommand, g_cfgMenuTitle;
@@ -2814,7 +2832,12 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         }
     }
 
+    g_hudItems.clear();
     for (const auto& info : INFOS) {
+        if (g_cfgHud && info.isLayer && info.layer && info.layer->m_layer >= 2) {
+            g_hudItems.push_back({info.id, info.monitor, info.monitorLocalBox});
+            continue;
+        }
         // Track each window's last stable (non-transition) box -- see
         // g_fsStableBoxes. Skipped while the exit re-assert is running: a
         // late Hyprland-side restore could pollute the memory with the
@@ -4992,6 +5015,33 @@ static void update3D(float dt) {
         forwardPointerToAim(inputTimeMs());
 }
 
+// The HUD's quads for the monitor being drawn: its own layers, at their 2D
+// place, from their snapshots.
+static std::vector<GLScene::SHudQuad> hudQuadsFor(const PHLMONITOR& mon) {
+    std::vector<GLScene::SHudQuad> out;
+    if (!mon || mon->m_size.x <= 0 || mon->m_size.y <= 0)
+        return out;
+    for (const auto& H : g_hudItems) {
+        if (H.monitor.lock() != mon)
+            continue;
+        const auto* SNAP = g_capture.get(H.id);
+        if (!SNAP || (SNAP->texID == 0 && !SNAP->bigTex) || SNAP->texSpan.x <= 0 || SNAP->texSpan.y <= 0)
+            continue;
+        const double W = mon->m_size.x, HGT = mon->m_size.y;
+        const double SW = SNAP->texSpan.x, SH = SNAP->texSpan.y;
+        GLScene::SHudQuad Q;
+        Q.texture = SNAP->bigTex ? SNAP->bigTex : SNAP->texID;
+        Q.x0 = static_cast<float>(H.box.x / W * 2.0 - 1.0);
+        Q.x1 = static_cast<float>((H.box.x + H.box.w) / W * 2.0 - 1.0);
+        Q.y0 = static_cast<float>(H.box.y / HGT * 2.0 - 1.0); // -1 = the top
+        Q.y1 = static_cast<float>((H.box.y + H.box.h) / HGT * 2.0 - 1.0);
+        Q.u0 = static_cast<float>(H.box.x / SW), Q.u1 = static_cast<float>((H.box.x + H.box.w) / SW);
+        Q.v0 = static_cast<float>(H.box.y / SH), Q.v1 = static_cast<float>((H.box.y + H.box.h) / SH);
+        out.push_back(Q);
+    }
+    return out;
+}
+
 class CHypr3DPassElement final : public IPassElement {
   public:
     // `view` set: a neighbour the room spans -- the same room through its own
@@ -5048,6 +5098,7 @@ class CHypr3DPassElement final : public IPassElement {
 
         Render::GL::g_pHyprOpenGL->makeEGLCurrent();
 
+        g_scene.setHud(hudQuadsFor(renderData.pMonitor.lock()));
         const auto R_T0 = std::chrono::steady_clock::now();
         const bool result = g_scene.render(
             framebufferID,
@@ -6311,6 +6362,9 @@ static int luaConfig(lua_State* L) {
     //                                       -- collidable, at world zero)
     //         shadows = true,               -- a soft shadow on the floor
     //                                       -- under each window
+    //         hud = true,                   -- the rice's bar and
+    //                                       -- notifications over the view,
+    //                                       -- as in 2D (false: on the wall)
     //     },
     //     windows = {
     //         window_scale = 0.5,           -- room multiplier on window size
@@ -6479,6 +6533,8 @@ static int luaConfig(lua_State* L) {
             return luaL_error(L, "hypr3d.config: world.grid must be a boolean");
         if (!SET_BOOL(idx, "shadows", g_cfgShadows, "world.shadows"))
             return luaL_error(L, "hypr3d.config: world.shadows must be a boolean");
+        if (!SET_BOOL(idx, "hud", g_cfgHud, "world.hud"))
+            return luaL_error(L, "hypr3d.config: world.hud must be a boolean");
         if (!SET_BOOL(idx, "span", g_cfgSpan, "world.span"))
             return luaL_error(L, "hypr3d.config: world.span must be a boolean");
         if (!SET_NUM(idx, "gravity", g_cfgGravity, "world.gravity"))

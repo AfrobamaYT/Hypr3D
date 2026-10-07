@@ -179,6 +179,17 @@ class GLScene {
     // Height over width of a portal's picture; 0 while it is not loaded.
     float portalAspect(const std::string& name) const;
 
+    // Panels over the picture (main's HUD: the rice's bar and notifications
+    // in view, as in 2D), set per monitor before its render. In the target's
+    // NDC -- Hyprland's framebuffers put y = -1 at the TOP -- and in UVs of
+    // the top-down snapshot texture.
+    struct SHudQuad {
+        unsigned int texture = 0;
+        float        x0 = 0.f, y0 = 0.f, x1 = 0.f, y1 = 0.f; // left/top, right/bottom
+        float        u0 = 0.f, v0 = 0.f, u1 = 0.f, v1 = 0.f; // the same corners
+    };
+    void setHud(std::vector<SHudQuad>&& quads) { m_hud = std::move(quads); }
+
     // Shadows on the floor under the windows: a soft blob each, as games
     // ground a floating object (a blob shadow) and visionOS a window. main
     // finds the floor and sizes them; centre on the floor, `right` the
@@ -350,6 +361,10 @@ class GLScene {
     int                       m_sceneAlphaCut = -1;
     void refreshPortals();
     void drawPortals(const Mat4& vp);
+    // The HUD (setHud).
+    std::vector<SHudQuad> m_hud;
+    unsigned int          m_hudVAO = 0, m_hudVBO = 0;
+    void drawHud(float alpha);
     // Shadows (setShadows).
     std::vector<SShadow> m_shadows;
     unsigned int         m_shadowTex = 0, m_shadowVAO = 0, m_shadowVBO = 0;

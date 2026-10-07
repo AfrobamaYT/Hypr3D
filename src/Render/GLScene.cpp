@@ -2386,6 +2386,44 @@ void GLScene::drawPortals(const Mat4& vp) {
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 
+void GLScene::drawHud(float alpha) {
+    if (m_hud.empty())
+        return;
+    if (!m_hudVAO) {
+        glGenVertexArrays(1, &m_hudVAO);
+        glGenBuffers(1, &m_hudVBO);
+        glBindVertexArray(m_hudVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, m_hudVBO);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), reinterpret_cast<void*>(0));
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float),
+                              reinterpret_cast<void*>(3 * sizeof(float)));
+    }
+    glUseProgram(m_sceneProgram);
+    const Mat4 I = Mat4::identity();
+    glUniformMatrix4fv(m_sceneMVP, 1, GL_FALSE, I.m.data());
+    glUniform4f(m_sceneUVRect, 0.f, 0.f, 1.f, 1.f);
+    glUniform1i(m_sceneTexture, 0);
+    glUniform1i(m_sceneTextured, 1);
+    glUniform4f(m_sceneColorUniform, 1.f, 1.f, 1.f, alpha);
+    glActiveTexture(GL_TEXTURE0);
+    glBindVertexArray(m_hudVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_hudVBO);
+    for (const auto& Q : m_hud) {
+        if (!Q.texture)
+            continue;
+        const float V[] = {Q.x0, Q.y0, 0.f, Q.u0, Q.v0, Q.x1, Q.y0, 0.f, Q.u1, Q.v0, Q.x1, Q.y1, 0.f, Q.u1, Q.v1,
+                           Q.x0, Q.y0, 0.f, Q.u0, Q.v0, Q.x1, Q.y1, 0.f, Q.u1, Q.v1, Q.x0, Q.y1, 0.f, Q.u0, Q.v1};
+        glBufferData(GL_ARRAY_BUFFER, sizeof(V), V, GL_DYNAMIC_DRAW);
+        glBindTexture(GL_TEXTURE_2D, Q.texture);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+
 void GLScene::drawShadows(const Mat4& vp) {
     if (m_shadows.empty())
         return;
@@ -2791,6 +2829,7 @@ bool GLScene::render(
     );
 
     drawFullscreen(std::clamp(alpha, 0.0f, 1.0f));
+    drawHud(std::clamp(alpha, 0.0f, 1.0f));
     if (primary)
         drawCrosshair(width, height);
 
@@ -2955,6 +2994,11 @@ void GLScene::destroyGLObjects() {
     if (m_shadowTex) {
         glDeleteTextures(1, &m_shadowTex);
         m_shadowTex = 0;
+    }
+    if (m_hudVAO) {
+        glDeleteVertexArrays(1, &m_hudVAO);
+        glDeleteBuffers(1, &m_hudVBO);
+        m_hudVAO = m_hudVBO = 0;
     }
     if (m_shadowVAO) {
         glDeleteVertexArrays(1, &m_shadowVAO);

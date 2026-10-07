@@ -164,6 +164,14 @@ class GLScene {
         return R;
     }
 
+    // The window being read or shown big (F2, F4): drawn after the rest of
+    // the room and never hidden by it, over the room darkened by `dim`
+    // (0 = as it is, 1 = black). id 0: none.
+    void setFeatured(std::uintptr_t id, float dim) {
+        m_featuredId  = id;
+        m_featuredDim = dim;
+    }
+
     // View zoom (the C key): magnification narrows the render fov
     // symmetrically around the crosshair, so aiming stays exact.
     void setZoom(float magnification) {
@@ -304,6 +312,12 @@ class GLScene {
     void refreshPanorama();
 
     void drawWindows(const Mat4& vp, const std::vector<WindowRender>& windows);
+    // The featured window (setFeatured) and the dark over the rest.
+    std::uintptr_t m_featuredId  = 0;
+    float          m_featuredDim = 0.0f;
+    bool           m_windowsOnTop = false; // drawWindows without the depth test
+    unsigned int   m_dimVAO = 0, m_dimVBO = 0;
+    void drawDim(float dim);
     void drawFullscreen(float alpha);
     void drawCrosshair(int width, int height);
 

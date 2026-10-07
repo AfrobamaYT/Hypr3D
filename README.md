@@ -126,6 +126,7 @@ beside the spawn.
 | Super + Left Alt              | Toggle keyboard mode (movement / window input) |
 | F3                            | Toggle debug HUD                               |
 | F2                            | Read: the aimed window comes to you at 1:1, again sends it back |
+| F4                            | Cinema: the aimed window as big as the view, the room dark around it; again sends it back |
 | F5                            | Switch camera view                             |
 
 # <a name="configuration"></a> Configuration

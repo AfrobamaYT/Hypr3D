@@ -2193,11 +2193,15 @@ static float configWindowScale() {
 // it back where it stood. The window moves, not the camera, the way a
 // fullscreen window comes to the screen: the player stays where he stands
 // and nothing collides. On the way there the reading pose follows the live
-// camera; once there it stays put in the room.
+// camera; once there it stays put in the room. F4 is the cinema: the same
+// way, but the window as large as the view takes it and the room dark
+// around it, as a cinema dims its lights.
 struct SRead {
     std::uintptr_t id      = 0;
+    bool           cinema  = false; // F4, not F2
     bool           back    = false; // on the way back to the room
     bool           arrived = false;
+    float          legDim  = 0.f, dim = 0.f; // the room's dark, 0..1
     std::chrono::steady_clock::time_point start;
     Vec3  legCenter{};      // the pose the current leg starts from
     float legYaw = 0.f, legPitch = 0.f, legRoll = 0.f, legScale = 1.f;
@@ -2208,6 +2212,8 @@ struct SRead {
 };
 static SRead g_read;
 static constexpr float kReadSeconds = 0.35f;
+static constexpr float kCinemaFill  = 0.9f; // of the view's width or height
+static constexpr float kCinemaDim   = 0.8f; // the room at a fifth of its light
 
 // The reading pose for a window of BOX (logical px, decorations included):
 // at the distance where the monitor's logical height fills the view, a
@@ -2219,7 +2225,7 @@ static constexpr float kReadSeconds = 0.35f;
 // pixel off, every texel is smeared over two.
 static constexpr float kReadDistance = 1.0f;
 
-static void readingPose(const PHLMONITOR& mon, const CBox& BOX, Vec3& center,
+static void readingPose(const PHLMONITOR& mon, const CBox& BOX, bool cinema, Vec3& center,
                         float& yaw, float& pitch, float& scale) {
     const auto& CAM = g_scene.camera();
     const Vec3  FWD = CAM.forward();
@@ -2235,8 +2241,13 @@ static void readingPose(const PHLMONITOR& mon, const CBox& BOX, Vec3& center,
         const double EDGE = (screen - window) * 0.5;
         return EDGE - std::floor(EDGE); // 0 or 0.5 for whole sizes
     };
-    const double DX = OFF(mon->m_pixelSize.x, BOX.w * S);
-    const double DY = OFF(mon->m_pixelSize.y, BOX.h * S);
+    double DX = OFF(mon->m_pixelSize.x, BOX.w * S);
+    double DY = OFF(mon->m_pixelSize.y, BOX.h * S);
+    if (cinema && BOX.w > 0 && BOX.h > 0) {
+        // Not 1:1 any more, so no pixel edges to meet.
+        scale *= std::min(kCinemaFill * mon->m_size.x / BOX.w, kCinemaFill * mon->m_size.y / BOX.h);
+        DX = DY = 0.0;
+    }
 
     center = CAM.position + FWD * kReadDistance - RIGHT * static_cast<float>(DX * PX) +
         UP * static_cast<float>(DY * PX);
@@ -2264,7 +2275,9 @@ static void applyReading(const PHLMONITOR& mon, const CBox& BOX, World3D::SEntit
         to = g_read.atCenter, toYaw = g_read.atYaw, toPitch = g_read.atPitch;
         toScale = g_read.atScale;
     } else
-        readingPose(mon, BOX, to, toYaw, toPitch, toScale);
+        readingPose(mon, BOX, g_read.cinema, to, toYaw, toPitch, toScale);
+    const float TO_DIM = g_read.cinema && !g_read.back ? kCinemaDim : 0.0f;
+    g_read.dim = g_read.legDim + (TO_DIM - g_read.legDim) * P;
 
     const float TWO_PI = 2.f * std::numbers::pi_v<float>;
     E.center = g_read.legCenter + (to - g_read.legCenter) * P;
@@ -2286,22 +2299,32 @@ static void applyReading(const PHLMONITOR& mon, const CBox& BOX, World3D::SEntit
     }
 }
 
-// F2 on the aimed window, or F2 again: the next leg starts from wherever the
-// window is now.
-static void toggleReading() {
+// F2 or F4 on the aimed window; the same key again sends it back, the other
+// one turns reading into the cinema and back. The next leg starts from
+// wherever the window is now.
+static void toggleReading(bool cinema) {
     const std::uintptr_t ID = g_read.id ? g_read.id : g_lastAimedId;
     const auto* E = ID ? g_world.find(ID) : nullptr;
     if (!E) {
-        notify("[hypr3d] F2: aim at a window to read it", CHyprColor{0.2f, 0.8f, 0.4f, 1.0f});
+        notify(cinema ? "[hypr3d] F4: aim at a window to show it big" :
+                        "[hypr3d] F2: aim at a window to read it",
+               CHyprColor{0.2f, 0.8f, 0.4f, 1.0f});
         return;
     }
     if (!g_read.id) {
         g_read            = {};
         g_read.id         = ID;
+        g_read.cinema     = cinema;
         g_read.roomCenter = E->center;
         g_read.roomYaw = E->yaw, g_read.roomPitch = E->pitch, g_read.roomRoll = E->roll;
-    } else
-        g_read.back = !g_read.back;
+    } else if (g_read.back) {
+        g_read.back   = false;
+        g_read.cinema = cinema;
+    } else if (g_read.cinema != cinema)
+        g_read.cinema = cinema;
+    else
+        g_read.back = true;
+    g_read.legDim    = g_read.dim;
     g_read.arrived   = false;
     g_read.start     = std::chrono::steady_clock::now();
     g_read.legCenter = E->center;
@@ -2321,6 +2344,7 @@ static void endReading(bool putBack) {
         E->yaw = g_read.roomYaw, E->pitch = g_read.roomPitch, E->roll = g_read.roomRoll;
     }
     g_read = {};
+    g_scene.setFeatured(0, 0.0f);
 }
 
 static void syncWorld(const PHLMONITOR& mon, float dt) {
@@ -2643,6 +2667,7 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
 
     if (g_read.id && std::ranges::none_of(ENTITIES, [](const auto& E) { return E.id == g_read.id; }))
         g_read = {}; // it closed
+    g_scene.setFeatured(g_read.id, g_read.dim);
     g_world.setEntities(std::move(ENTITIES), false);
 
     // --- build the draw list from world + snapshot ---
@@ -5721,9 +5746,9 @@ static void onKeyboardKey(
     if (g_keyboardMode == EKeyboardMode::Window)
         return;
 
-    // F2: the aimed window to the eye at 1:1, and back.
-    if (PRESSED && SYM == XKB_KEY_F2) {
-        toggleReading();
+    // F2: the aimed window to the eye at 1:1, and back. F4: the cinema.
+    if (PRESSED && (SYM == XKB_KEY_F2 || SYM == XKB_KEY_F4)) {
+        toggleReading(SYM == XKB_KEY_F4);
         info.cancelled = true;
         return;
     }

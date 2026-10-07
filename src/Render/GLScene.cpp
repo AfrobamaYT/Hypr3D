@@ -1850,8 +1850,11 @@ void GLScene::drawWindows(
     // already exact among the windows, and depth written by one of them made
     // a coplanar one drawn after it lose to rounding noise -- a desktop wall
     // puts the rice's screen-sized layer in the plane of every window, and
-    // the window behind it vanished.
-    glEnable(GL_DEPTH_TEST);
+    // the window behind it vanished. The featured window is not tested.
+    if (m_windowsOnTop)
+        glDisable(GL_DEPTH_TEST);
+    else
+        glEnable(GL_DEPTH_TEST);
     glDepthMask(GL_FALSE);
     glEnable(GL_BLEND);
     glBlendFuncSeparate(
@@ -2218,10 +2221,60 @@ void GLScene::drawRoom(const Mat4& vp, const ViewWindow& view,
     }
 
     // Windows last, back to front in the BSP's exact order: crossing quads
-    // are split along each other, and translucency composites in order.
-    drawWindows(vp, windows);
+    // are split along each other, and translucency composites in order. A
+    // featured window (F2, F4) comes after the rest and the dark over them --
+    // for the player's eyes: the companion's eye sees the room as it stands.
+    if (!m_featuredId || sight)
+        drawWindows(vp, windows);
+    else {
+        std::vector<WindowRender> rest, featured;
+        for (const auto& W : windows)
+            (W.id == m_featuredId ? featured : rest).push_back(W);
+        drawWindows(vp, rest);
+        if (m_featuredDim > 0.0f)
+            drawDim(m_featuredDim);
+        m_windowsOnTop = true;
+        drawWindows(vp, featured);
+        m_windowsOnTop = false;
+    }
 
     glDepthMask(GL_TRUE);
+}
+
+void GLScene::drawDim(float dim) {
+    if (!m_dimVAO) {
+        // Two triangles over the whole target, in clip space.
+        static constexpr float QUAD[] = {
+            -1.f, -1.f, 0.f, 0.f, 0.f,  1.f, -1.f, 0.f, 0.f, 0.f,  1.f, 1.f, 0.f, 0.f, 0.f,
+            -1.f, -1.f, 0.f, 0.f, 0.f,  1.f,  1.f, 0.f, 0.f, 0.f, -1.f, 1.f, 0.f, 0.f, 0.f,
+        };
+        glGenVertexArrays(1, &m_dimVAO);
+        glGenBuffers(1, &m_dimVBO);
+        glBindVertexArray(m_dimVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, m_dimVBO);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(QUAD), QUAD, GL_STATIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), reinterpret_cast<void*>(0));
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float),
+                              reinterpret_cast<void*>(3 * sizeof(float)));
+    }
+
+    glUseProgram(m_sceneProgram);
+    const Mat4 I = Mat4::identity();
+    glUniformMatrix4fv(m_sceneMVP, 1, GL_FALSE, I.m.data());
+    glUniform4f(m_sceneUVRect, 0.f, 0.f, 1.f, 1.f);
+    glUniform1i(m_sceneTextured, 0);
+    glUniform4f(m_sceneColorUniform, 0.f, 0.f, 0.f, std::clamp(dim, 0.0f, 1.0f));
+
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glEnable(GL_BLEND);
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+    glBindVertexArray(m_dimVAO);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 
 void GLScene::drawSight(const std::vector<WindowRender>& windows) {
@@ -2653,6 +2706,11 @@ void GLScene::shutdown() {
 }
 
 void GLScene::destroyGLObjects() {
+    if (m_dimVAO) {
+        glDeleteVertexArrays(1, &m_dimVAO);
+        glDeleteBuffers(1, &m_dimVBO);
+        m_dimVAO = m_dimVBO = 0;
+    }
     if (m_sightFence) {
         glDeleteSync(static_cast<GLsync>(m_sightFence));
         m_sightFence = nullptr;

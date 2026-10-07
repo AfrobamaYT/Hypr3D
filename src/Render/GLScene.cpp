@@ -455,7 +455,11 @@ void main() {
     static constexpr const char* blitFragmentShader = R"GLSL(
 #version 300 es
 
-precision mediump float;
+// highp: the flip below is arithmetic, and the RTX 3080 runs mediump
+// arithmetic as 16-bit floats -- 1.0 - v came out in steps of about half
+// a row of a 1080-row scene, a sawtooth that smeared every horizontal
+// edge (5.3 % of a terminal's pixels off, measured 2026-10-07).
+precision highp float;
 
 in vec2 vUV;
 

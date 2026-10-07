@@ -2110,6 +2110,7 @@ static uint64_t       g_frameSig        = 0;
 static int            g_stillFrames     = 0;
 static bool           runsOnTime();
 static bool           roomStill();
+static void           dumpStatus(bool force);
 
 static void stopFramePump() {
     if (!g_framePump)
@@ -2148,6 +2149,8 @@ static void startFramePump() {
 
                 if (g_fsPhase != EFullscreenPhase::In2D && !roomStill())
                     damageCurrentMonitor();
+                else if (roomStill())
+                    dumpStatus(false); // no frame writes it: a still room's last state, still read
 
                 self->updateTimeout(roomStill() ? kIdlePumpInterval : kFramePumpInterval);
             },
@@ -2659,6 +2662,74 @@ static void applyGunJolt(std::uintptr_t id, World3D::SEntity& E) {
     }
 }
 
+// The TV (config tv = { at = {x,y,z}, yaw = deg, width, height }): a screen
+// in the world a window can be put on -- carried with Super+LMB and let go
+// on it, the window snaps onto the picture, fitted, and stays; carried off
+// again, it is free. Super+wheel on it scales the window itself: its
+// resolution changes, the picture keeps its size, so the text grows or
+// shrinks as on a real TV. Pinned, it is resized to the screen's shape.
+// `at` is the picture's centre, `yaw` the yaw a window on it gets (180: it
+// faces -z), width and height the picture's in metres; width 0: no TV.
+static Vec3           g_tvAt{};
+static float          g_tvYawDeg = 0.0f, g_tvW = 0.0f, g_tvH = 0.0f;
+static std::uintptr_t g_tvWindowId = 0;
+
+static Vec3 tvNormal() {
+    const float Y = g_tvYawDeg * std::numbers::pi_v<float> / 180.0f;
+    return Vec3{std::sin(Y), 0.f, std::cos(Y)};
+}
+
+// The crosshair's ray on the TV's picture.
+static bool aimAtTV() {
+    if (g_tvW <= 0.0f || g_tvH <= 0.0f)
+        return false;
+    const auto& CAM = g_scene.camera();
+    const Vec3  O = CAM.position, D = CAM.centerRay(), N = tvNormal();
+    const float DN = dot(D, N);
+    if (std::fabs(DN) < 1e-4f)
+        return false;
+    const float T = dot(g_tvAt - O, N) / DN;
+    if (T <= 0.0f || T > 12.0f)
+        return false;
+    const Vec3 R{N.z, 0.f, -N.x}; // the picture's right, seen from in front
+    const Vec3 P = O + D * T - g_tvAt;
+    return std::fabs(dot(P, R)) <= g_tvW * 0.5f + 0.05f && std::fabs(P.y) <= g_tvH * 0.5f + 0.05f;
+}
+
+// Resizes a window's 2D box about its centre: the TV's shape, `height` px.
+static void tvResize(const PHLWINDOW& W, double height) {
+    const auto   BOX = Compat::currentWindowBox(W);
+    const double H = std::clamp(height, 360.0, 2160.0);
+    const double WD = std::round(H * g_tvW / g_tvH);
+    Compat::setWindowBox(W, CBox{BOX.x + (BOX.w - WD) / 2, BOX.y + (BOX.h - H) / 2, WD, std::round(H)});
+}
+
+// A carried window let go on the TV: it is put on it.
+static bool dropOnTV(std::uintptr_t id) {
+    const auto W = id ? Compat::findWindowById(id) : nullptr;
+    if (!W || !aimAtTV())
+        return false;
+    if (g_read.id == id)
+        endReading(false);
+    g_tvWindowId = id;
+    tvResize(W, Compat::currentWindowBox(W).h);
+    return true;
+}
+
+// One window of syncWorld's loop on the TV: fitted onto the picture, a
+// millimetre in front of the glass.
+static void applyTV(std::uintptr_t id, const CBox& BOX, World3D::SEntity& E) {
+    if (id != g_tvWindowId || g_tvW <= 0.0f || BOX.w <= 0 || BOX.h <= 0)
+        return;
+    const float BW = World3D::toWorld(BOX.w), BH = World3D::toWorld(BOX.h);
+    const float FIT = std::min(g_tvW / BW, g_tvH / BH);
+    E.center = g_tvAt + tvNormal() * 0.002f;
+    E.yaw    = g_tvYawDeg * std::numbers::pi_v<float> / 180.0f;
+    E.pitch = E.roll = 0.0f;
+    E.width  = BW * FIT;
+    E.height = BH * FIT;
+}
+
 // The crosshair's ray on the bin: its side within its height, or its opening.
 static bool aimAtBin() {
     if (g_trashRadius <= 0.0f)
@@ -3057,6 +3128,7 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
             g_trashed.erase(T);
         }
         applyGunJolt(info.id, entity);
+        applyTV(info.id, BOX, entity);
 
         // Fullscreen transition: the animation owns this quad's size, and it
         // MUST be applied here -- the draw list below is built from these
@@ -3098,6 +3170,8 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
 
     if (g_read.id && std::ranges::none_of(ENTITIES, [](const auto& E) { return E.id == g_read.id; }))
         g_read = {}; // it closed
+    if (g_tvWindowId && std::ranges::none_of(ENTITIES, [](const auto& E) { return E.id == g_tvWindowId; }))
+        g_tvWindowId = 0; // it closed: its address can come back for a new window
     std::erase_if(g_trashed, [&](const STrashed& t) {
         return std::ranges::none_of(ENTITIES, [&](const auto& E) { return E.id == t.id; });
     }); // closed: in the bin for good
@@ -3983,8 +4057,81 @@ static void finishClientButton(uint32_t timeMs) {
     g_clientButtonDown = false;
 }
 
+// F8: use a window as one uses it at a desk -- the TV's from the couch, or
+// any other. The camera holds still, the mouse moves a pointer across the
+// window (the crosshair drawn where it is), buttons and wheel act there, and
+// the window keeps the keyboard. F8 again gives the room its mouse back.
+// Escape stays the window's: a browser or a game needs it. Super+F still
+// takes the window to the real fullscreen and back.
+struct SUse {
+    std::uintptr_t id = 0;
+    Vector2D       local{};     // the pointer, surface-local px
+    EKeyboardMode  mode{};      // to restore
+    std::uintptr_t lockBefore = 0;
+};
+static SUse g_use;
+
+static void useEnd() {
+    if (!g_use.id)
+        return;
+    g_keyboardMode = g_use.mode;
+    g_focusLockId  = g_use.lockBefore;
+    g_use = {};
+    g_scene.setCursorPoint({}, false);
+    damageCurrentMonitor();
+}
+
+static void useBegin() {
+    const auto HIT    = aimHit();
+    const auto TARGET = HIT.hit ? targetFromHit(HIT.id) : SHitTarget{};
+    if (!TARGET.window) {
+        notify("[hypr3d] F8: aim at a window to use it", CHyprColor{0.2f, 0.8f, 0.4f, 1.0f});
+        return;
+    }
+    g_use.id         = Compat::windowId(TARGET.window);
+    g_use.local      = localFromHit(HIT);
+    g_use.mode       = g_keyboardMode;
+    g_use.lockBefore = g_focusLockId;
+    if (Compat::focusedWindow() != TARGET.window)
+        Compat::focusWindow(TARGET.window);
+    g_focusLockId  = g_use.id;
+    g_keyboardMode = EKeyboardMode::Window;
+    resetMovementKeys();
+    damageCurrentMonitor();
+}
+
+// Every frame: where the pointer is in the world, for the crosshair.
+static void useTick() {
+    if (!g_use.id)
+        return;
+    const auto* E = g_world.find(g_use.id);
+    if (!E || !Compat::findWindowById(g_use.id) || E->logicalWidth <= 0 || E->logicalHeight <= 0) {
+        useEnd(); // it closed
+        return;
+    }
+    const float U = (static_cast<float>(g_use.local.x) + E->surfaceOffsetX) / E->logicalWidth;
+    const float V = (static_cast<float>(g_use.local.y) + E->surfaceOffsetY) / E->logicalHeight;
+    g_scene.setCursorPoint(E->center + g_world.rightOf(g_use.id) * ((U - 0.5f) * E->width) +
+                               g_world.upOf(g_use.id) * ((0.5f - V) * E->height),
+                           true);
+}
+
+// The mouse moving the pointer of the window in use.
+static void useMove(double dx, double dy) {
+    const auto  W = Compat::findWindowById(g_use.id);
+    const auto* E = g_world.find(g_use.id);
+    if (!W || !E) {
+        useEnd();
+        return;
+    }
+    g_use.local.x = std::clamp(g_use.local.x + dx, 0.0, static_cast<double>(E->surfaceWidth));
+    g_use.local.y = std::clamp(g_use.local.y + dy, 0.0, static_cast<double>(E->surfaceHeight));
+    Compat::deliverMotion(W, g_use.local, inputTimeMs());
+    damageCurrentMonitor();
+}
+
 static void forwardPointerToAim(uint32_t timeMs) {
-    if (!ownsInput() || g_pointerDown)
+    if (!ownsInput() || g_pointerDown || g_use.id)
         return;
 
     const auto HIT = aimHit();
@@ -4042,6 +4189,10 @@ static bool onPointerMotion(double dx, double dy) {
         return false;
     if (gameHasMouse())
         return true; // the game had the motion already; the cursor stays put
+    if (g_use.id) {
+        useMove(dx, dy);
+        return true;
+    }
 
     g_input.addMotion(dx, dy);
     damageCurrentMonitor();
@@ -4328,7 +4479,10 @@ static void open3D() {
     );
 }
 
+static void useEnd();
+
 static void close3D() {
+    useEnd();
     g_transitionTarget = 0.0f;
     damageCurrentMonitor();
 
@@ -5195,6 +5349,7 @@ static void update3D(float dt) {
 
     gunTick();
     syncWorld(MON, dt);
+    useTick();
 
     applyFullscreenAnimation();
 
@@ -5553,6 +5708,12 @@ static void dumpStatus(bool force = false) {
         out << "head: on=" << (g_cfgHead ? 1 : 0) << " port=" << g_head.port << " packets=" << g_head.packets
             << " dropped=" << g_head.dropped << " shown=" << g_head.shown[0] << "," << g_head.shown[1] << ","
             << g_head.shown[2] << " yaw=" << g_head.shown[3] << " pitch=" << g_head.shown[4] << "\n";
+        out << "tv: w=" << g_tvW << " window=" << g_tvWindowId << " use=" << g_use.id << " at=" << g_use.local.x
+            << "," << g_use.local.y;
+        if (const auto* UE = g_use.id ? g_world.find(g_use.id) : nullptr)
+            out << " surface=" << UE->surfaceWidth << "x" << UE->surfaceHeight << " box=" << UE->logicalWidth << "x"
+                << UE->logicalHeight;
+        out << "\n";
         out << "gun: out=" << (g_gun ? 1 : 0) << " holding=" << g_gunHold.id << " shots=" << g_gunShots.size() << "\n";
         out << "read: id=" << g_read.id << " menu=" << g_menuId << " arrived=" << (g_read.arrived ? 1 : 0)
             << " following=" << (g_read.following ? 1 : 0) << " at=(" << g_read.atCenter.x << ","
@@ -5709,6 +5870,8 @@ static uint64_t frameFingerprint() {
     }
     BITS(g_read.id);
     NUM(g_read.dim, 1e-3);
+    BITS(g_use.id); // F8's pointer is drawn
+    NUM(g_use.local.x, 0.5), NUM(g_use.local.y, 0.5);
     BITS(static_cast<uint64_t>(g_fsPhase));
     NUM(g_fsAlpha, 1e-3), NUM(g_transition, 1e-3), NUM(g_diagAlpha, 1e-3);
     return h;
@@ -5936,6 +6099,17 @@ static void onMouseAxis(
     if (!g_superHeld)
         return;
 
+    // On the TV it scales the window instead: forward, its text larger.
+    if (g_tvWindowId) {
+        const auto HIT = aimHit();
+        if (const auto W = HIT.hit && HIT.id == g_tvWindowId ? Compat::findWindowById(HIT.id) : nullptr) {
+            tvResize(W, Compat::currentWindowBox(W).h * std::pow(1.12, -STEPS));
+            info.cancelled = true;
+            damageCurrentMonitor();
+            return;
+        }
+    }
+
     // A DYNAMIC scene object closer than any window zooms instead: its
     // center slides along the camera-object line, same multiplicative step,
     // same no-limits policy as the window zoom.
@@ -6113,6 +6287,14 @@ static void onMouseButton(
     const bool PRESSED =
         event.state == WL_POINTER_BUTTON_STATE_PRESSED;
 
+    // A window in use takes the buttons where its pointer is.
+    if (g_use.id) {
+        if (const auto W = Compat::findWindowById(g_use.id))
+            Compat::deliverClick(W, g_use.local, event.button, PRESSED, inputTimeMs());
+        info.cancelled = true;
+        return;
+    }
+
     // The process gun owns the left button while it is out.
     if (g_gun && event.button == BTN_LEFT) {
         info.cancelled = true;
@@ -6125,8 +6307,8 @@ static void onMouseButton(
 
     // Release the plugin gesture that owns this physical button.
     if (!PRESSED && g_pointerDown && event.button == g_pointerButton) {
-        if (g_pointerGesture == EPointerGesture::Move3D)
-            dropInBin(g_world.draggedId());
+        if (g_pointerGesture == EPointerGesture::Move3D && !dropInBin(g_world.draggedId()))
+            dropOnTV(g_world.draggedId());
         resetPointerGesture();
         info.cancelled = true;
         damageCurrentMonitor();
@@ -6317,6 +6499,8 @@ static void onMouseButton(
                 return;
             }
             s_zoomId = 0; // the drag owns this window's distance now
+            if (HIT.id == g_tvWindowId)
+                g_tvWindowId = 0; // carried off the TV
 
             // A drag on the assert window: the drag wins, stop fighting.
             if (g_fsAssertFrames > 0 && HIT.id == Compat::windowId(TARGET.window)) {
@@ -6547,6 +6731,16 @@ static void onKeyboardKey(
 
         info.cancelled = true;
         damageCurrentMonitor();
+        return;
+    }
+
+    // F8: use the window under the crosshair, or stop (g_use).
+    if (PRESSED && SYM == XKB_KEY_F8) {
+        if (g_use.id)
+            useEnd();
+        else
+            useBegin();
+        info.cancelled = true;
         return;
     }
 
@@ -6863,6 +7057,20 @@ static int luaConfig(lua_State* L) {
             return luaL_error(L, "hypr3d.config: trash.height must be a number");
         g_trashRadius = std::clamp(g_trashRadius, 0.0f, 5.0f);
         g_trashHeight = std::clamp(g_trashHeight, 0.0f, 5.0f);
+        lua_pop(L, 1);
+    }
+
+    idx = SECTION("tv", "tv");
+    if (idx == -1)
+        return luaL_error(L, "hypr3d.config: tv must be a table");
+    if (idx > 0) {
+        if (!SET_VEC3(idx, "at", g_tvAt, "tv.at") || !SET_NUM(idx, "yaw", g_tvYawDeg, "tv.yaw") ||
+            !SET_NUM(idx, "width", g_tvW, "tv.width") || !SET_NUM(idx, "height", g_tvH, "tv.height"))
+            return luaL_error(L, "hypr3d.config: tv = { at, yaw, width, height } is invalid");
+        g_tvW = std::clamp(g_tvW, 0.0f, 20.0f);
+        g_tvH = std::clamp(g_tvH, 0.0f, 20.0f);
+        if (g_tvW <= 0.0f)
+            g_tvWindowId = 0;
         lua_pop(L, 1);
     }
 

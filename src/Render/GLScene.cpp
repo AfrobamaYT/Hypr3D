@@ -1941,15 +1941,28 @@ void GLScene::drawCrosshair(int width, int height) {
     const float pxX = 2.0f / static_cast<float>(width);
     const float pxY = 2.0f / static_cast<float>(height);
 
+    // A window in use (setCursorPoint): the cross where its pointer is. The
+    // scene's NDC has y up, the target's (Hyprland's framebuffer) y down.
+    float atX = 0.0f, atY = 0.0f;
+    if (m_cursorOn) {
+        const auto& M = m_lastVP.m;
+        const float X = M[0] * m_cursorAt.x + M[4] * m_cursorAt.y + M[8] * m_cursorAt.z + M[12];
+        const float Y = M[1] * m_cursorAt.x + M[5] * m_cursorAt.y + M[9] * m_cursorAt.z + M[13];
+        const float W = M[3] * m_cursorAt.x + M[7] * m_cursorAt.y + M[11] * m_cursorAt.z + M[15];
+        if (W > 1e-4f)
+            atX = X / W, atY = -Y / W;
+    }
+
     constexpr float OUTER_PX   = 10.0f;
     constexpr float INNER_PX   = 3.5f;
     constexpr float THICK_PX   = 1.4f;
     constexpr float OUTLINE_PX = 1.0f;
 
-    const auto addRect = [](std::vector<float>& v, float x0, float y0, float x1, float y1) {
+    const auto addRect = [&](std::vector<float>& v, float x0, float y0, float x1, float y1) {
         const float z = 0.0f;
         const float u = 0.0f;
         const float t = 0.0f;
+        x0 += atX, x1 += atX, y0 += atY, y1 += atY;
         const float verts[] = {
             x0,y0,z,u,t, x1,y0,z,u,t, x1,y1,z,u,t,
             x0,y0,z,u,t, x1,y1,z,u,t, x0,y1,z,u,t,
@@ -2829,6 +2842,8 @@ bool GLScene::render(
     if (primary)
         refreshPlayer();
     drawRoom(vp, VIEW, windows, dt, primary, false);
+    if (primary)
+        m_lastVP = vp;
 
     // F3 HUD: always on top of the scene, never part of the 3D pass state.
     if (primary)

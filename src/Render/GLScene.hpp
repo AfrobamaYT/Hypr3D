@@ -108,6 +108,12 @@ class GLScene {
     void reset();
     void shutdown();
 
+    // The pointer of a window being used (main's F8): the crosshair drawn at
+    // this world point instead of the centre.
+    void setCursorPoint(const Vec3& at, bool on) {
+        m_cursorAt = at, m_cursorOn = on;
+    }
+
     // The process gun's sight (main's g_gun): the crosshair red while it is
     // out, and a ring around it filling with `charge` (0..1) while a kill is
     // held -- red when the window aimed at hangs.
@@ -432,6 +438,9 @@ class GLScene {
 
     unsigned int m_crosshairVAO = 0;
     bool         m_gunOn = false, m_gunHung = false;
+    bool         m_cursorOn = false;
+    Vec3         m_cursorAt{};
+    Mat4         m_lastVP{}; // the primary view's, for the cursor
     float        m_gunCharge = 0.0f;
     unsigned int m_ringVAO = 0, m_ringVBO = 0;
     unsigned int m_crosshairVBO = 0;

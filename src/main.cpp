@@ -27,6 +27,10 @@
 #include <hyprland/src/render/gl/GLFramebuffer.hpp>
 #include <hyprland/src/output/Monitor.hpp>
 #include <hyprland/src/desktop/view/Window.hpp>
+#include <csignal>
+#include <unistd.h>
+#include <hyprland/src/managers/ANRManager.hpp>
+#include <hyprland/src/helpers/AsyncDialogBox.hpp>
 #include <hyprland/src/managers/EventManager.hpp>
 #include <hyprland/src/managers/SeatManager.hpp>
 #include <hyprland/src/managers/SessionLockManager.hpp>
@@ -2608,6 +2612,45 @@ static std::vector<STrashed> g_trashed;
 static constexpr float kTrashSeconds = 0.45f;
 static constexpr float kTrashGrace   = 3.0f;
 
+// The process gun (F7) -- "360 noscope discord when it freezes", four people
+// in the Reddit finds. Aim at a window and shoot: a left click asks it to
+// close, as Super+Q asks, and it jolts back where it was hit; hold the button
+// kGunKillSeconds and its process is killed (SIGKILL), as Hyprland's
+// forcekillactive does -- for a program that hangs, which Hyprland's own
+// check (CANRManager) marks: the ring around the crosshair fills red. A
+// program asked to close may still ask to save; only the held kill does not
+// ask. F7 again or Escape puts it away; while it is out, the left button does
+// not reach the windows.
+static bool g_gun = false;
+struct SGunShot {
+    std::uintptr_t id = 0;
+    std::chrono::steady_clock::time_point at;
+    Vec3 push{}; // the shot's direction
+};
+static std::vector<SGunShot> g_gunShots; // windows still jolting back
+struct SGunHold {
+    bool           active = false;
+    std::uintptr_t id = 0;
+    std::chrono::steady_clock::time_point since;
+};
+static SGunHold        g_gunHold;
+static void            gunTick(); // with the trigger, by onMouseButton
+static constexpr float kGunKillSeconds  = 1.0f;
+static constexpr float kGunJoltSeconds  = 0.3f;
+static constexpr float kGunJolt         = 0.25f; // m back at the hit
+
+// A window hit a moment ago is pushed back along the shot and springs home.
+static void applyGunJolt(std::uintptr_t id, World3D::SEntity& E) {
+    const auto NOW = std::chrono::steady_clock::now();
+    for (const auto& S : g_gunShots) {
+        if (S.id != id)
+            continue;
+        const float T = std::chrono::duration<float>(NOW - S.at).count() / kGunJoltSeconds;
+        if (T < 1.0f)
+            E.center = E.center + S.push * (kGunJolt * (1.0f - T) * (1.0f - T));
+    }
+}
+
 // The crosshair's ray on the bin: its side within its height, or its opening.
 static bool aimAtBin() {
     if (g_trashRadius <= 0.0f)
@@ -3005,6 +3048,7 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
                 notify("[hypr3d] " + W->m_title + " stayed open; it is back", CHyprColor{1.0f, 0.6f, 0.2f, 1.0f});
             g_trashed.erase(T);
         }
+        applyGunJolt(info.id, entity);
 
         // Fullscreen transition: the animation owns this quad's size, and it
         // MUST be applied here -- the draw list below is built from these
@@ -3183,6 +3227,22 @@ static Vector2D localFromHit(const World3D::SHit& hit) {
     };
 }
 
+// Whether the pixel a ray hit shows anything: empty pixels of an overlay let
+// the ray through to the surface underneath.
+static bool hitVisible(const World3D::SHit& HIT) {
+    const auto* SNAPSHOT = g_capture.get(HIT.id);
+
+    if (SNAPSHOT && SNAPSHOT->alphaValid && !SNAPSHOT->alphaMask.empty()) {
+        const int MX = std::min(SNAPSHOT->alphaW - 1,
+            static_cast<int>(HIT.u * SNAPSHOT->alphaW));
+        const int MY = std::min(SNAPSHOT->alphaH - 1,
+            static_cast<int>(HIT.v * SNAPSHOT->alphaH));
+
+        return SNAPSHOT->alphaMask[static_cast<size_t>(MY) * SNAPSHOT->alphaW + MX] >= 8;
+    }
+    return true;
+}
+
 static World3D::SHit aimHit() {
     const auto& cam = g_scene.camera();
 
@@ -3192,20 +3252,8 @@ static World3D::SHit aimHit() {
     // is also what keeps aim/focus from flapping between an overlay and the
     // window it covers.
     for (const auto& HIT : g_world.pickAll(cam.position, cam.centerRay())) {
-        const auto* SNAPSHOT = g_capture.get(HIT.id);
-
-        if (SNAPSHOT && SNAPSHOT->alphaValid && !SNAPSHOT->alphaMask.empty()) {
-            const int MX = std::min(SNAPSHOT->alphaW - 1,
-                static_cast<int>(HIT.u * SNAPSHOT->alphaW));
-            const int MY = std::min(SNAPSHOT->alphaH - 1,
-                static_cast<int>(HIT.v * SNAPSHOT->alphaH));
-
-            const int A = SNAPSHOT->alphaMask[static_cast<size_t>(MY) * SNAPSHOT->alphaW + MX];
-
-            if (A < 8)
-                continue; // transparent pixel of an overlay: next surface
-        }
-
+        if (!hitVisible(HIT))
+            continue; // transparent pixel of an overlay: next surface
         return HIT;
     }
 
@@ -5004,6 +5052,7 @@ static void update3D(float dt) {
         updateWheelRoll();
     }
 
+    gunTick();
     syncWorld(MON, dt);
 
     applyFullscreenAnimation();
@@ -5360,6 +5409,7 @@ static void dumpStatus(bool force = false) {
         out << "camera: pos=(" << CAM.position.x << "," << CAM.position.y << "," << CAM.position.z
             << ") yaw=" << CAM.yaw << " pitch=" << CAM.pitch << " view=" << g_viewMode
             << " remembered=" << (g_room.valid ? 1 : 0) << "/" << g_room.poses.size() << "\n";
+        out << "gun: out=" << (g_gun ? 1 : 0) << " holding=" << g_gunHold.id << " shots=" << g_gunShots.size() << "\n";
         out << "read: id=" << g_read.id << " menu=" << g_menuId << " arrived=" << (g_read.arrived ? 1 : 0)
             << " following=" << (g_read.following ? 1 : 0) << " at=(" << g_read.atCenter.x << ","
             << g_read.atCenter.y << "," << g_read.atCenter.z << ") yaw=" << g_read.atYaw
@@ -5531,6 +5581,7 @@ static bool runsOnTime() {
         || !g_trashed.empty()
         || (g_read.id && (!g_read.arrived || g_read.following || g_read.back))
         || g_world.dragActive()
+        || !g_gunShots.empty() || g_gunHold.active
         || g_transition != g_transitionTarget
         || g_fsPhase == EFullscreenPhase::To2D || g_fsPhase == EFullscreenPhase::To3D;
 }
@@ -5837,6 +5888,75 @@ static void onMouseAxis(
     damageCurrentMonitor();
 }
 
+// What the gun aims at: the first window along the crosshair's ray. Not a
+// layer, and not Hyprland's own dialog: when a program hangs, Hyprland puts
+// "Application Not Responding" over it, and the gun aims through it at the
+// program it asks about (measured: the shot hit the dialog).
+static PHLWINDOW gunTarget() {
+    const auto& CAM = g_scene.camera();
+    for (const auto& HIT : g_world.pickAll(CAM.position, CAM.centerRay())) {
+        if (!hitVisible(HIT))
+            continue;
+        const auto T = targetFromHit(HIT.id);
+        if (!T.window || CAsyncDialogBox::isAsyncDialogBox(T.window->getPID()))
+            continue;
+        return T.window;
+    }
+    return nullptr;
+}
+
+// The process gun's trigger (g_gun): the window under the crosshair is shot.
+static void gunFire() {
+    const auto WINDOW = gunTarget();
+    if (!WINDOW)
+        return; // a layer or the void: nothing to shoot
+    const auto ID  = Compat::windowId(WINDOW);
+    const auto NOW = std::chrono::steady_clock::now();
+    std::erase_if(g_gunShots, [&](const SGunShot& S) { return S.id == ID; });
+    g_gunShots.push_back({ID, NOW, g_scene.camera().centerRay()});
+    g_gunHold = {true, ID, NOW};
+    if (g_pEventLoopManager)
+        g_pEventLoopManager->doLater([ID] {
+            if (const auto W = Compat::findWindowById(ID))
+                W->sendClose();
+        });
+}
+
+// Every frame: shots that are done, and the kill being held -- dropped if
+// the crosshair left the window, carried out when held long enough.
+static void gunTick() {
+    const auto NOW = std::chrono::steady_clock::now();
+    std::erase_if(g_gunShots, [&](const SGunShot& S) {
+        return std::chrono::duration<float>(NOW - S.at).count() >= kGunJoltSeconds;
+    });
+    float charge = 0.0f;
+    bool  hung   = false;
+    if (g_gun && g_gunHold.active) {
+        const auto WINDOW = gunTarget();
+        if (!WINDOW || Compat::windowId(WINDOW) != g_gunHold.id)
+            g_gunHold = {};
+        else {
+            hung   = g_pANRManager && g_pANRManager->isNotResponding(WINDOW);
+            charge = std::chrono::duration<float>(NOW - g_gunHold.since).count() / kGunKillSeconds;
+            if (charge >= 1.0f) {
+                const auto ID = g_gunHold.id;
+                g_gunHold = {};
+                charge    = 0.0f;
+                if (g_pEventLoopManager)
+                    g_pEventLoopManager->doLater([ID] {
+                        const auto W = Compat::findWindowById(ID);
+                        const pid_t PID = W ? W->getPID() : 0;
+                        if (PID > 1 && PID != getpid()) {
+                            ::kill(PID, SIGKILL);
+                            notify("[hypr3d] killed " + W->m_title, CHyprColor{1.0f, 0.3f, 0.2f, 1.0f});
+                        }
+                    });
+            }
+        }
+    }
+    g_scene.setGunSight(g_gun, charge, hung);
+}
+
 static void onMouseButton(
     IPointer::SButtonEvent event,
     Event::SCallbackInfo& info
@@ -5847,6 +5967,16 @@ static void onMouseButton(
 
     const bool PRESSED =
         event.state == WL_POINTER_BUTTON_STATE_PRESSED;
+
+    // The process gun owns the left button while it is out.
+    if (g_gun && event.button == BTN_LEFT) {
+        info.cancelled = true;
+        if (PRESSED)
+            gunFire();
+        else
+            g_gunHold = {};
+        return;
+    }
 
     // Release the plugin gesture that owns this physical button.
     if (!PRESSED && g_pointerDown && event.button == g_pointerButton) {
@@ -6272,6 +6402,14 @@ static void onKeyboardKey(
 
         info.cancelled = true;
         damageCurrentMonitor();
+        return;
+    }
+
+    // F7: the process gun out, or away (g_gun); Escape puts it away too.
+    if (PRESSED && (SYM == XKB_KEY_F7 || (g_gun && SYM == XKB_KEY_Escape))) {
+        g_gun     = SYM == XKB_KEY_F7 ? !g_gun : false;
+        g_gunHold = {};
+        info.cancelled = true;
         return;
     }
 

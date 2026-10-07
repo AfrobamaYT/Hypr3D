@@ -108,6 +108,13 @@ class GLScene {
     void reset();
     void shutdown();
 
+    // The process gun's sight (main's g_gun): the crosshair red while it is
+    // out, and a ring around it filling with `charge` (0..1) while a kill is
+    // held -- red when the window aimed at hangs.
+    void setGunSight(bool on, float charge, bool hung) {
+        m_gunOn = on, m_gunCharge = charge, m_gunHung = hung;
+    }
+
     // F3 debug HUD: collision wireframe + info text (coords/yaw/pitch/fps).
     void setDebugOverlay(bool on) {
         m_debugOverlay = on;
@@ -424,6 +431,9 @@ class GLScene {
     unsigned int m_fullscreenVBO = 0;
 
     unsigned int m_crosshairVAO = 0;
+    bool         m_gunOn = false, m_gunHung = false;
+    float        m_gunCharge = 0.0f;
+    unsigned int m_ringVAO = 0, m_ringVBO = 0;
     unsigned int m_crosshairVBO = 0;
 
     int m_sceneMVP = -1;

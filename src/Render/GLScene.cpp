@@ -16,6 +16,7 @@
 #include <hyprgraphics/image/Image.hpp>
 
 #include <algorithm>
+#include <array>
 #include <utility>
 #include <functional>
 #include <memory>
@@ -1999,9 +2000,59 @@ void GLScene::drawCrosshair(int width, int height) {
 
     // Black core with a white outline: the slightly larger white cross is
     // drawn first, so the black one keeps full contrast on any background.
+    // Red while the process gun is out.
     drawLayer(OUTER_PX + OUTLINE_PX, std::max(0.0f, INNER_PX - OUTLINE_PX),
         THICK_PX + 2.0f * OUTLINE_PX, 1.0f, 1.0f, 1.0f, 1.0f);
-    drawLayer(OUTER_PX, INNER_PX, THICK_PX, 0.0f, 0.0f, 0.0f, 1.0f);
+    if (m_gunOn)
+        drawLayer(OUTER_PX, INNER_PX, THICK_PX, 0.9f, 0.12f, 0.1f, 1.0f);
+    else
+        drawLayer(OUTER_PX, INNER_PX, THICK_PX, 0.0f, 0.0f, 0.0f, 1.0f);
+
+    // The kill being held: a ring filling clockwise from the top.
+    if (!m_gunOn || m_gunCharge <= 0.0f)
+        return;
+    if (!m_ringVAO) {
+        glGenVertexArrays(1, &m_ringVAO);
+        glGenBuffers(1, &m_ringVBO);
+        glBindVertexArray(m_ringVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, m_ringVBO);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), reinterpret_cast<void*>(0));
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float),
+                              reinterpret_cast<void*>(3 * sizeof(float)));
+    }
+    constexpr int   SEGMENTS = 48;
+    constexpr float RADIUS_PX = 18.0f, RING_PX = 3.0f;
+    const int       N = std::max(1, static_cast<int>(std::ceil(SEGMENTS * std::min(m_gunCharge, 1.0f))));
+    std::vector<float> ring;
+    ring.reserve(N * 30);
+    const auto AT = [&](float a, float r) {
+        return std::array<float, 2>{std::sin(a) * r * pxX, std::cos(a) * r * pxY};
+    };
+    for (int i = 0; i < N; ++i) {
+        const float A0 = 2.0f * 3.14159265f * std::min(m_gunCharge, 1.0f) * i / N;
+        const float A1 = 2.0f * 3.14159265f * std::min(m_gunCharge, 1.0f) * (i + 1) / N;
+        const auto  I0 = AT(A0, RADIUS_PX - RING_PX * 0.5f), O0 = AT(A0, RADIUS_PX + RING_PX * 0.5f);
+        const auto  I1 = AT(A1, RADIUS_PX - RING_PX * 0.5f), O1 = AT(A1, RADIUS_PX + RING_PX * 0.5f);
+        const float Q[] = {I0[0], I0[1], 0.f, 0.f, 0.f, O0[0], O0[1], 0.f, 0.f, 0.f, O1[0], O1[1], 0.f, 0.f, 0.f,
+                           I0[0], I0[1], 0.f, 0.f, 0.f, O1[0], O1[1], 0.f, 0.f, 0.f, I1[0], I1[1], 0.f, 0.f, 0.f};
+        ring.insert(ring.end(), std::begin(Q), std::end(Q));
+    }
+    glUseProgram(m_sceneProgram);
+    const Mat4 IDENTITY = Mat4::identity();
+    glUniformMatrix4fv(m_sceneMVP, 1, GL_FALSE, IDENTITY.m.data());
+    glUniform1i(m_sceneTextured, 0);
+    if (m_gunHung)
+        glUniform4f(m_sceneColorUniform, 0.95f, 0.15f, 0.1f, 1.0f);
+    else
+        glUniform4f(m_sceneColorUniform, 1.0f, 1.0f, 1.0f, 1.0f);
+    glUniform4f(m_sceneUVRect, 0.0f, 0.0f, 1.0f, 1.0f);
+    glBindVertexArray(m_ringVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_ringVBO);
+    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(ring.size() * sizeof(float)), ring.data(), GL_DYNAMIC_DRAW);
+    glDrawArrays(GL_TRIANGLES, 0, N * 6);
+    glBindVertexArray(0);
 }
 
 void GLScene::drawFullscreen(
@@ -2999,6 +3050,11 @@ void GLScene::destroyGLObjects() {
         glDeleteVertexArrays(1, &m_hudVAO);
         glDeleteBuffers(1, &m_hudVBO);
         m_hudVAO = m_hudVBO = 0;
+    }
+    if (m_ringVAO) {
+        glDeleteVertexArrays(1, &m_ringVAO);
+        glDeleteBuffers(1, &m_ringVBO);
+        m_ringVAO = m_ringVBO = 0;
     }
     if (m_shadowVAO) {
         glDeleteVertexArrays(1, &m_shadowVAO);

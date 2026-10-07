@@ -2056,7 +2056,10 @@ static void ghostWindows(const std::vector<Compat::SWindowInfo>& INFOS) {
         // user actually worked with. setWindowBox takes GLOBAL layout
         // coordinates: centre on this monitor, not on the layout origin
         // (which belongs to whichever monitor sits at 0,0, or none at all).
-        if (info.window && info.monitor) {
+        // A window that floats already is no tile: it keeps the size its
+        // rule or its client gave it -- the room's menu came out 960x540 and
+        // cut off, a dialog would come out as large.
+        if (info.window && info.monitor && !info.floating) {
             const auto& mon = info.monitor;
             const double CX =
                 mon->m_position.x + mon->m_size.x * 0.5 - kSpawnWidth * 0.5;

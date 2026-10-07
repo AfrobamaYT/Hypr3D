@@ -167,6 +167,13 @@ static std::uintptr_t g_skirtFinalRefreshId = 0;
 
 // The window that currently owns keyboard focus, as the aim logic last set it.
 static std::uintptr_t g_lastFocusId = 0;
+// The window the focus lock holds (0 = none): it keeps the keyboard while the
+// crosshair looks elsewhere. A GameMaker game under Proton takes no controller
+// input without focus (Deltarune, measured 2026-10-07), so a game played with
+// a pad in the room would stop at every glance away. Kept across leaving and
+// entering the room; released by F6, by focus_lock(false), or when its window
+// is gone.
+static std::uintptr_t g_focusLockId = 0;
 
 // 3D FPS-style mouse gestures. Super is the modifier: LMB moves the aimed
 // window in the 3D room, RMB resizes its real Hyprland/Wayland geometry.
@@ -1705,6 +1712,27 @@ static bool ownsInput() {
         g_fsPhase != EFullscreenPhase::In2D;
 }
 
+static void setFocusLock(bool on) {
+    const CHyprColor COLOR{0.2f, 0.8f, 0.4f, 1.0f};
+    if (!on) {
+        if (g_focusLockId == 0)
+            return;
+        // g_lastFocusId stays the held window, which has the keyboard: when
+        // the crosshair is on nothing the next frame drops it. Set to 0 here,
+        // nothing changed -- measured, the window kept the focus.
+        g_focusLockId = 0;
+        notify("[hypr3d] focus lock off: the keyboard follows the crosshair again", COLOR);
+        return;
+    }
+    const auto WINDOW = Compat::focusedWindow();
+    if (!WINDOW) {
+        notify("[hypr3d] focus lock: no window has the keyboard to keep", COLOR);
+        return;
+    }
+    g_focusLockId = Compat::windowId(WINDOW);
+    notify("[hypr3d] focus lock on: " + WINDOW->m_title + " keeps the keyboard (F6 releases)", COLOR);
+}
+
 static void clearAimFocus() {
     g_aim.reset();
     g_lastFocusId = 0;
@@ -1991,6 +2019,25 @@ static void updateAimFocus(float dt) {
     g_lastAimedId = AIMED;
 
     const std::uintptr_t FOCUS = g_aim.update(AIMED, dt);
+
+    // The lock outranks the crosshair; Hyprland's border on the held window
+    // is its visible frame, as no other window gets the focus.
+    if (g_focusLockId != 0) {
+        const auto LOCKED = Compat::findWindowById(g_focusLockId);
+        if (LOCKED) {
+            if (Compat::focusedWindow() != LOCKED)
+                Compat::focusWindow(LOCKED);
+            g_lastFocusId = g_focusLockId;
+            return;
+        }
+        // Its window is gone, and Hyprland has given the keyboard to some
+        // other window on the close -- measured, while the crosshair was on
+        // nothing. From the gone window the lines below go back to what the
+        // crosshair says, as they do when an unlocked window closes.
+        g_lastFocusId = g_focusLockId;
+        g_focusLockId = 0;
+        notify("[hypr3d] focus lock off: its window is gone", CHyprColor{0.2f, 0.8f, 0.4f, 1.0f});
+    }
 
     if (FOCUS == g_lastFocusId)
         return;
@@ -4344,6 +4391,9 @@ static void dumpStatus() {
         << " alphaSent=" << g_diagAlpha
         << " renderedOnce=" << (g_renderedOnce ? 1 : 0) << "\n";
 
+    out << "aimed=" << g_lastAimedId << " focus=" << g_lastFocusId
+        << " focusLock=" << g_focusLockId << "\n";
+
     out << "hookInstalled=" << (g_hookInstalled ? 1 : 0)
         << " hookActive=" << (Compat::pointerHookActive() ? 1 : 0)
         << " sinkCalls=" << g_diagSinkCalls
@@ -5004,7 +5054,7 @@ static void onMouseButton(
 
         const auto& CAM = g_scene.camera();
 
-        if (TARGET.window)
+        if (TARGET.window && g_focusLockId == 0)
             Compat::focusWindow(TARGET.window);
 
         // Resize is a window-only control: a scene model in front of the
@@ -5099,7 +5149,9 @@ static void onMouseButton(
     const Vector2D LOCAL = localFromHit(HIT);
 
     if (PRESSED) {
-        if (TARGET.window)
+        // Locked, a click reaches the window under the crosshair and the
+        // keyboard stays where it was locked.
+        if (TARGET.window && g_focusLockId == 0)
             Compat::focusWindow(TARGET.window);
 
         if (TARGET.layer)
@@ -5226,6 +5278,14 @@ static void onKeyboardKey(
 
         info.cancelled = true;
         damageCurrentMonitor();
+        return;
+    }
+
+    // F6 locks the keyboard on the window that has it, or releases it, in
+    // both keyboard modes -- like F3 it never belongs to the focused window.
+    if (PRESSED && SYM == XKB_KEY_F6) {
+        setFocusLock(g_focusLockId == 0);
+        info.cancelled = true;
         return;
     }
 
@@ -5986,6 +6046,14 @@ static int luaCompanion(lua_State* L) {
     return 0;
 }
 
+static int luaFocusLock(lua_State* L) {
+    // hl.plugin.hypr3d.focus_lock()        lock, or release when locked
+    // hl.plugin.hypr3d.focus_lock(true)    the window with the keyboard keeps it
+    // hl.plugin.hypr3d.focus_lock(false)   the keyboard follows the crosshair
+    setFocusLock(lua_isboolean(L, 1) ? lua_toboolean(L, 1) : g_focusLockId == 0);
+    return 0;
+}
+
 static int luaToggle(lua_State*) {
     toggle3D();
     return 0;
@@ -6087,6 +6155,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "config", luaConfig))
         throw std::runtime_error("[hypr3d] failed to register Lua config");
+
+    if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "focus_lock", luaFocusLock))
+        throw std::runtime_error("[hypr3d] failed to register Lua focus_lock");
 
     // Every handler is wrapped: an exception must NEVER escape into
     // Hyprland (std::terminate there kills the whole compositor). The

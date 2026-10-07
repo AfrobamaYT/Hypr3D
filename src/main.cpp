@@ -1839,8 +1839,17 @@ static void damageAllMonitors() {
 
 static PHLMONITOR g_currentRenderMon = nullptr;
 
-// The monitor the 3D view is built for: configured monitor, or focused monitor,
-// falling back to whatever render.pre last reported.
+// The monitor the room was entered from: the eye stays in front of it while
+// the room is open. The crosshair gives the aimed window the focus, and
+// Hyprland moves the monitor focus to that window's monitor -- following it,
+// the view was rebuilt around the top or the side monitor whenever a window
+// laid out there came under the crosshair, and the crosshair went with it
+// (measured on the owner's three monitors).
+static PHLMONITORREF g_viewMonitor;
+
+// The monitor the 3D view is built for: configured monitor, the one the room
+// was entered from, or the focused monitor, falling back to whatever
+// render.pre last reported.
 static PHLMONITOR targetMonitor() {
     if (!g_cfgMonitor.empty() && State::monitorState()) {
         for (const auto& mon : State::monitorState()->monitors()) {
@@ -1848,6 +1857,9 @@ static PHLMONITOR targetMonitor() {
                 return mon;
         }
     }
+
+    if (const auto VIEW = g_viewMonitor.lock(); g_active && VIEW && VIEW->m_enabled)
+        return VIEW;
 
     if (const auto FOCUSED = Compat::focusedMonitor())
         return FOCUSED;
@@ -4362,6 +4374,10 @@ static void enter3D() {
     // opened while open): what is live now is what to come back to.
     if (g_active)
         rememberRoom();
+
+    // The eye's monitor for this visit: where the room was opened from.
+    if (!g_active)
+        g_viewMonitor = targetMonitor();
 
     // Without this the render stage bails out immediately and the toggle does
     // nothing at all.

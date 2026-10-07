@@ -2248,8 +2248,18 @@ static float fsRawProgress() {
 // The room's uniform window scale. Shared by syncWorld (quad size) and the
 // fullscreen animation (its endpoints must match what the room renders, or
 // the transition visibly jumps).
+// The wall's scale (world.span): the desktop enters 1:1 at any distance as
+// long as its size shrinks with it -- the same angle, the same pixels. At
+// world.window_scale 0.5 a 1080 px monitor stands 4.2 m off, and on the
+// owner's three monitors its lower third was under the Moon station's deck
+// (measured 2026-10-07). So as the wall is built its scale is capped where
+// its lowest monitor ends just above the player's feet; it stays until
+// reset(), so the windows already on it keep their size. 0: not built yet.
+static float           g_wallFit      = 0.0f;
+static constexpr float kWallFloorGap  = 0.05f; // m between the wall and the feet
+
 static float configWindowScale() {
-    return g_cfgWindowScale;
+    return g_wallFit > 0.0f ? std::min(g_cfgWindowScale, g_wallFit) : g_cfgWindowScale;
 }
 
 // F2: the aimed window comes to the eye at 1:1 -- one of its pixels on one
@@ -2436,6 +2446,25 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
 
     const float MONW = mon->m_size.x;
     const float MONH = mon->m_size.y;
+
+    // Built afresh (nothing in the room yet): how large the wall may be.
+    if (g_cfgSpan && g_wallFit <= 0.0f && g_world.entities().empty()) {
+        const auto PLANE0 = viewPlane();
+        const auto MONS   = spannedMonitors();
+        if (PLANE0 && MONS.size() > 1) {
+            const auto& CAM = g_scene.camera();
+            const Vec3  FWD = CAM.forward();
+            const Vec3  UP  = cross(CAM.right(), FWD);
+            // A wall point's height over the eye, per world unit per px.
+            double lowest = 0.0;
+            for (const auto& M : MONS)
+                lowest = std::min(lowest, FWD.y * PLANE0->distance +
+                                              UP.y * (PLANE0->cy - (M->m_position.y + M->m_size.y)));
+            g_wallFit = lowest < 0.0 ?
+                static_cast<float>((Camera::kEyeHeight - kWallFloorGap) / -lowest / World3D::toWorld(1.0f)) :
+                g_cfgWindowScale;
+        }
+    }
 
     const float WIN_SCALE = configWindowScale();
 
@@ -3806,6 +3835,10 @@ static void placeAtSpawn() {
     // Camera forward is {sin yaw, ., -cos yaw}: looking at the origin
     // from (x, z) means yaw = atan2(-x, z).
     CAM.yaw = std::atan2(-g_playerSpawn.x, g_playerSpawn.z);
+    // Walking, the eye looks level: a wall of monitors built now stands
+    // upright on the floor instead of leaning back.
+    if (!g_playerFlying)
+        CAM.pitch = 0.0f;
 }
 
 static void enter3D() {
@@ -6517,6 +6550,7 @@ static int luaConfig(lua_State* L) {
 static void resetRoom() {
     g_room = {};
     g_read = {};
+    g_wallFit = 0.0f; // the wall is built afresh, sized for the camera then
     companionHalt("aborted", "The room was reset");
     placeCompanion();
     if (!g_active)

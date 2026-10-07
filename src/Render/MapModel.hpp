@@ -145,7 +145,7 @@ class CMapModel {
         unsigned int vao = 0, vbo = 0, ebo = 0;
         int          count = 0;   // index count (or vertex count unindexed)
         bool         indexed = false;
-        unsigned int texture = 0; // 0 = untextured (white fallback)
+        unsigned int texture = 0; // an untextured material gets a 1x1 white one
         float        color[4] = {1.f, 1.f, 1.f, 1.f};
         unsigned int emissiveTex = 0;
         float        emissiveFactor[3] = {1.f, 1.f, 1.f};

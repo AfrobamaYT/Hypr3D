@@ -682,9 +682,28 @@ void CMapModel::finishUpload() {
         if (T != 0)
             m_ownedTextures.push_back(T);
 
+    // A material with only a colour samples this 1x1 white texture: texture 0
+    // samples black, and every untextured model (a TV, a cabinet) came out
+    // black whatever its baseColorFactor said.
+    unsigned int white = 0;
+    for (const auto& P : DECODED->prims) {
+        if (P.baseImage >= 0 && TEXTURES[P.baseImage] != 0)
+            continue;
+        const unsigned char PIXEL[4] = {255, 255, 255, 255};
+        glGenTextures(1, &white);
+        glBindTexture(GL_TEXTURE_2D, white);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, PIXEL);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        m_ownedTextures.push_back(white);
+        break;
+    }
+
     for (auto& P : DECODED->prims) {
         SPrimitive out = P.params;
-        out.texture     = P.baseImage >= 0 ? TEXTURES[P.baseImage] : 0;
+        out.texture     = P.baseImage >= 0 && TEXTURES[P.baseImage] != 0 ? TEXTURES[P.baseImage] : white;
         out.emissiveTex = P.emissiveImage >= 0 ? TEXTURES[P.emissiveImage] : 0;
 
         glGenVertexArrays(1, &out.vao);

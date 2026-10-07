@@ -2267,7 +2267,8 @@ static float configWindowScale() {
 // it back where it stood. The window moves, not the camera, the way a
 // fullscreen window comes to the screen: the player stays where he stands
 // and nothing collides. On the way there the reading pose follows the live
-// camera; once there it stays put in the room. F4 is the cinema: the same
+// camera; once there it stays put in the room -- the menu follows the player
+// (followMenu). F4 is the cinema: the same
 // way, but the window as large as the view takes it and the room dark
 // around it, as a cinema dims its lights.
 struct SRead {
@@ -2283,6 +2284,8 @@ struct SRead {
     float roomYaw = 0.f, roomPitch = 0.f, roomRoll = 0.f;
     Vec3  atCenter{};       // the reading pose, fixed on arrival
     float atYaw = 0.f, atPitch = 0.f, atScale = 1.f;
+    bool  following = false; // the menu, gliding back in front (followMenu)
+    std::chrono::steady_clock::time_point tick; // followMenu's last frame
 };
 static SRead g_read;
 // The room's menu (config menu = { command, title }): F1 runs the command,
@@ -2333,6 +2336,60 @@ static void readingPose(const PHLMONITOR& mon, const CBox& BOX, bool cinema, Vec
     pitch = CAM.pitch;
 }
 
+// The menu follows the player, the way VR toolkits keep a menu at hand
+// (Unity XRI's LazyFollow, MRTK's RadialView): it stands still in the room
+// while it is being used, and glides back in front once the player has left
+// it -- the crosshair off it, or walked off its reading distance. Still while
+// aimed at, because the crosshair is the pointer here: a menu that turned
+// with every turn could never be pointed at off its centre. Back in front it
+// is at 1:1 again. Carrying it off with Super+LMB leaves it in the room.
+static constexpr float kMenuMargin = 0.08f; // m the crosshair may stray past its edge
+static constexpr float kMenuLeash  = 0.3f;  // m off the reading distance (XRI's max distance)
+static constexpr float kMenuSpeed  = 6.0f;  // 1/s, exponential (XRI's movement speed)
+
+static void followMenu(const PHLMONITOR& mon, const CBox& BOX) {
+    const auto  NOW = std::chrono::steady_clock::now();
+    const float DT  = std::clamp(std::chrono::duration<float>(NOW - g_read.tick).count(), 0.0f, 0.1f);
+    g_read.tick = NOW;
+    const auto& CAM = g_scene.camera();
+    if (!g_read.following) {
+        // Where the crosshair's ray meets the menu's plane, in its own axes
+        // (last frame's pose, which at rest is this one).
+        const Vec3  O = CAM.position, D = CAM.centerRay();
+        const Vec3  N = g_world.normalOf(g_read.id);
+        const Vec3  OFF = g_read.atCenter - O;
+        const float DN = dot(D, N);
+        bool        onIt = false;
+        if (std::fabs(DN) > 1e-4f) {
+            const float T = dot(OFF, N) / DN;
+            const Vec3  HIT = O + D * T - g_read.atCenter;
+            const float HW = World3D::toWorld(BOX.w) * g_read.atScale * 0.5f + kMenuMargin;
+            const float HH = World3D::toWorld(BOX.h) * g_read.atScale * 0.5f + kMenuMargin;
+            onIt = T > 0.0f && std::fabs(dot(HIT, g_world.rightOf(g_read.id))) <= HW &&
+                std::fabs(dot(HIT, g_world.upOf(g_read.id))) <= HH;
+        }
+        const float DIST = std::sqrt(dot(OFF, OFF));
+        if (onIt && std::fabs(DIST - kReadDistance) <= kMenuLeash)
+            return;
+        g_read.following = true;
+    }
+
+    Vec3  to{};
+    float toYaw = 0.f, toPitch = 0.f, toScale = 1.f;
+    readingPose(mon, BOX, false, to, toYaw, toPitch, toScale);
+    const float K = 1.0f - std::exp(-kMenuSpeed * DT);
+    const float DYAW = std::remainder(toYaw - g_read.atYaw, 2.f * std::numbers::pi_v<float>);
+    g_read.atCenter = g_read.atCenter + (to - g_read.atCenter) * K;
+    g_read.atYaw += DYAW * K;
+    g_read.atPitch += (toPitch - g_read.atPitch) * K;
+    g_read.atScale = toScale;
+    const Vec3 LEFT = to - g_read.atCenter;
+    if (dot(LEFT, LEFT) < 1e-6f && std::fabs(DYAW) < 1e-3f && std::fabs(toPitch - g_read.atPitch) < 1e-3f) {
+        g_read.atCenter = to, g_read.atYaw = toYaw, g_read.atPitch = toPitch; // on the pixel grid again
+        g_read.following = false;
+    }
+}
+
 // One window of syncWorld's loop: the reading animation owns its pose and
 // size. Applied in the loop, not after it: the draw list is built from these
 // values, and a later override reaches the screen a frame late.
@@ -2350,6 +2407,8 @@ static void applyReading(const PHLMONITOR& mon, const CBox& BOX, World3D::SEntit
         toYaw = g_read.roomYaw, toPitch = g_read.roomPitch, toRoll = g_read.roomRoll;
         toScale = configWindowScale();
     } else if (g_read.arrived) {
+        if (g_read.id == g_menuId && !g_read.cinema)
+            followMenu(mon, BOX);
         to = g_read.atCenter, toYaw = g_read.atYaw, toPitch = g_read.atPitch;
         toScale = g_read.atScale;
     } else
@@ -2374,6 +2433,7 @@ static void applyReading(const PHLMONITOR& mon, const CBox& BOX, World3D::SEntit
         g_read.arrived  = true;
         g_read.atCenter = to, g_read.atYaw = toYaw, g_read.atPitch = toPitch;
         g_read.atScale  = toScale;
+        g_read.tick     = std::chrono::steady_clock::now();
     }
 }
 
@@ -5161,6 +5221,10 @@ static void dumpStatus() {
         out << "camera: pos=(" << CAM.position.x << "," << CAM.position.y << "," << CAM.position.z
             << ") yaw=" << CAM.yaw << " pitch=" << CAM.pitch << " view=" << g_viewMode
             << " remembered=" << (g_room.valid ? 1 : 0) << "/" << g_room.poses.size() << "\n";
+        out << "read: id=" << g_read.id << " menu=" << g_menuId << " arrived=" << (g_read.arrived ? 1 : 0)
+            << " following=" << (g_read.following ? 1 : 0) << " at=(" << g_read.atCenter.x << ","
+            << g_read.atCenter.y << "," << g_read.atCenter.z << ") yaw=" << g_read.atYaw
+            << " pitch=" << g_read.atPitch << "\n";
 
         if (!g_companion.body.IsInvalid() && g_bodyIf) {
             static constexpr const char* MODES[] = {"idle", "walk", "turn"};

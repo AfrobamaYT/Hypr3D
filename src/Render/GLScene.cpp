@@ -16,6 +16,7 @@
 #include <hyprgraphics/image/Image.hpp>
 
 #include <algorithm>
+#include <utility>
 #include <functional>
 #include <memory>
 #include <cmath>
@@ -422,6 +423,8 @@ uniform int uTextured;
 uniform vec4 uColor;
 // Windows only (drawWindows), 0 for everything else.
 uniform float uLodBias;
+// Portals only: pixels less opaque than this are cut out, 0 for the rest.
+uniform float uAlphaCut;
 
 out vec4 fragColor;
 
@@ -430,6 +433,8 @@ void main() {
         fragColor = texture(uTexture, vUV, uLodBias) * uColor;
     else
         fragColor = uColor;
+    if (fragColor.a < uAlphaCut)
+        discard;
 }
 )GLSL";
 
@@ -678,6 +683,7 @@ void main() {
         );
 
     m_sceneLodBias = glGetUniformLocation(m_sceneProgram, "uLodBias");
+    m_sceneAlphaCut = glGetUniformLocation(m_sceneProgram, "uAlphaCut");
 
     m_blitTexture =
         glGetUniformLocation(
@@ -2207,6 +2213,8 @@ void GLScene::drawRoom(const Mat4& vp, const ViewWindow& view,
         drawCapsule(vp, m_pDbgCenter, nullptr, Vec3{1.0f, 0.55f, 0.1f}, true);
     }
 
+    drawPortals(vp);
+
     if (m_gridVisible) {
         drawFloor(vp);
 
@@ -2239,6 +2247,141 @@ void GLScene::drawRoom(const Mat4& vp, const ViewWindow& view,
     }
 
     glDepthMask(GL_TRUE);
+}
+
+void GLScene::setPortals(const std::vector<SPortalSpec>& portals) {
+    std::vector<SPortalGL> next;
+    next.reserve(portals.size());
+    for (const auto& SPEC : portals) {
+        SPortalGL P;
+        P.spec = SPEC;
+        // The same picture keeps its texture.
+        const auto OLD = std::find_if(m_portals.begin(), m_portals.end(),
+                                      [&](const SPortalGL& o) { return o.spec.name == SPEC.name; });
+        if (OLD != m_portals.end() && OLD->loaded == SPEC.image) {
+            P.tex    = std::exchange(OLD->tex, 0u);
+            P.aspect = OLD->aspect;
+            P.loaded = OLD->loaded;
+        }
+        next.push_back(std::move(P));
+    }
+    for (auto& OLD : m_portals)
+        if (OLD.tex)
+            m_portalTrash.push_back(OLD.tex);
+    m_portals = std::move(next);
+}
+
+float GLScene::portalAspect(const std::string& name) const {
+    for (const auto& P : m_portals)
+        if (P.spec.name == name)
+            return P.aspect;
+    return 0.0f;
+}
+
+void GLScene::refreshPortals() {
+    if (!m_portalTrash.empty()) {
+        glDeleteTextures(static_cast<GLsizei>(m_portalTrash.size()), m_portalTrash.data());
+        m_portalTrash.clear();
+    }
+    for (auto& P : m_portals) {
+        if (P.loaded == P.spec.image)
+            continue;
+        P.loaded = P.spec.image; // one attempt per path, failed or not
+        Hyprgraphics::CImage image(P.spec.image);
+        auto surface = image.success() ? image.cairoSurface() : nullptr;
+        if (!surface || surface->status() != CAIRO_STATUS_SUCCESS)
+            continue;
+        const int W = static_cast<int>(surface->size().x), H = static_cast<int>(surface->size().y);
+        const int STRIDE = surface->stride();
+        const auto* SRC  = surface->data();
+        if (W <= 0 || H <= 0 || !SRC)
+            continue;
+
+        // Cairo ARGB32 is premultiplied BGRA; the scene blends straight alpha.
+        std::vector<unsigned char> px(static_cast<size_t>(W) * H * 4);
+        for (int y = 0; y < H; ++y) {
+            const auto* row = SRC + static_cast<size_t>(y) * STRIDE;
+            auto* dst = px.data() + static_cast<size_t>(y) * W * 4;
+            for (int x = 0; x < W; ++x) {
+                const unsigned A = row[x * 4 + 3];
+                const auto UN = [A](unsigned c) { return A ? static_cast<unsigned char>(std::min(255u, c * 255u / A)) : 0; };
+                dst[x * 4 + 0] = UN(row[x * 4 + 2]);
+                dst[x * 4 + 1] = UN(row[x * 4 + 1]);
+                dst[x * 4 + 2] = UN(row[x * 4 + 0]);
+                dst[x * 4 + 3] = static_cast<unsigned char>(A);
+            }
+        }
+        if (P.tex)
+            glDeleteTextures(1, &P.tex);
+        glGenTextures(1, &P.tex);
+        glBindTexture(GL_TEXTURE_2D, P.tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+        glGenerateMipmap(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        P.aspect = static_cast<float>(H) / static_cast<float>(W);
+    }
+}
+
+void GLScene::drawPortals(const Mat4& vp) {
+    if (m_portals.empty())
+        return;
+    if (!m_portalVAO) {
+        glGenVertexArrays(1, &m_portalVAO);
+        glGenBuffers(1, &m_portalVBO);
+        glBindVertexArray(m_portalVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, m_portalVBO);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), reinterpret_cast<void*>(0));
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float),
+                              reinterpret_cast<void*>(3 * sizeof(float)));
+    }
+
+    glUseProgram(m_sceneProgram);
+    glUniformMatrix4fv(m_sceneMVP, 1, GL_FALSE, vp.m.data());
+    glUniform4f(m_sceneUVRect, 0.f, 0.f, 1.f, 1.f);
+    glUniform1i(m_sceneTexture, 0);
+    glUniform1i(m_sceneTextured, 1);
+    glUniform4f(m_sceneColorUniform, 1.f, 1.f, 1.f, 1.f);
+    // Its glow fades out softly, but only what is clearly there hides what
+    // stands behind: the cut writes depth for the opaque part alone.
+    glUniform1f(m_sceneAlphaCut, 0.35f);
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_TRUE);
+    glEnable(GL_BLEND);
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+    glBindVertexArray(m_portalVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_portalVBO);
+    glActiveTexture(GL_TEXTURE0);
+
+    for (const auto& P : m_portals) {
+        if (!P.tex || P.aspect <= 0.0f)
+            continue;
+        const float W = P.spec.width, H = P.spec.width * P.aspect;
+        const Vec3  FACE{std::sin(P.spec.yaw), 0.f, -std::cos(P.spec.yaw)};
+        // Seen from in front, looking along -FACE, the picture's left is on
+        // the viewer's left.
+        const Vec3 R  = normalize(cross(FACE * -1.0f, Vec3{0.f, 1.f, 0.f})) * (W * 0.5f);
+        const Vec3 C  = P.spec.base + Vec3{0.f, H * 0.5f, 0.f};
+        const Vec3 UP{0.f, H * 0.5f, 0.f};
+        const Vec3 TL = C - R + UP, TR = C + R + UP, BR = C + R - UP, BL = C - R - UP;
+        const float V[] = {
+            TL.x, TL.y, TL.z, 0.f, 0.f,  TR.x, TR.y, TR.z, 1.f, 0.f,  BR.x, BR.y, BR.z, 1.f, 1.f,
+            TL.x, TL.y, TL.z, 0.f, 0.f,  BR.x, BR.y, BR.z, 1.f, 1.f,  BL.x, BL.y, BL.z, 0.f, 1.f,
+        };
+        glBufferData(GL_ARRAY_BUFFER, sizeof(V), V, GL_DYNAMIC_DRAW);
+        glBindTexture(GL_TEXTURE_2D, P.tex);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+    }
+
+    glUniform1f(m_sceneAlphaCut, 0.0f);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 
 void GLScene::drawDim(float dim) {
@@ -2508,6 +2651,7 @@ bool GLScene::render(
     if (primary) {
         refreshPanorama();
         refreshScene();
+        refreshPortals();
     }
     // The player's character (hidden in first person): animated inside
     // render -- the clock and the vertex upload need the EGL context.
@@ -2706,6 +2850,21 @@ void GLScene::shutdown() {
 }
 
 void GLScene::destroyGLObjects() {
+    for (auto& P : m_portals)
+        if (P.tex) {
+            glDeleteTextures(1, &P.tex);
+            P.tex = 0;
+            P.loaded.clear();
+        }
+    if (!m_portalTrash.empty()) {
+        glDeleteTextures(static_cast<GLsizei>(m_portalTrash.size()), m_portalTrash.data());
+        m_portalTrash.clear();
+    }
+    if (m_portalVAO) {
+        glDeleteVertexArrays(1, &m_portalVAO);
+        glDeleteBuffers(1, &m_portalVBO);
+        m_portalVAO = m_portalVBO = 0;
+    }
     if (m_dimVAO) {
         glDeleteVertexArrays(1, &m_dimVAO);
         glDeleteBuffers(1, &m_dimVBO);

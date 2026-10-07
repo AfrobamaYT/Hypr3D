@@ -30,6 +30,7 @@
 #include <hyprland/src/managers/EventManager.hpp>
 #include <hyprland/src/managers/SeatManager.hpp>
 #include <hyprland/src/managers/SessionLockManager.hpp>
+#include <hyprland/src/config/supplementary/executor/Executor.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
 #include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
 #include <hyprland/src/config/values/ConfigValues.hpp>
@@ -1053,6 +1054,69 @@ static bool companionStart(bool walk, const std::string& name, std::string& why)
     g_companion.stuck     = 0.f;
     g_companion.lastSpeed = 0.f;
     return true;
+}
+
+// Portals (hl.plugin.hypr3d.portal): a picture standing in the room, and
+// walking into it runs its command through Hyprland's own executor -- the
+// one hl.exec_cmd and an exec keybind use, so a game started from a portal
+// is started as from a key. A portal lives as long as the plugin.
+struct SPortal {
+    GLScene::SPortalSpec spec;
+    std::string          command;
+    bool                 inside = false; // the player stood in it last frame
+    double               quietUntil = 0.0; // no second start before this
+};
+static std::vector<SPortal> g_portals;
+static double nowSeconds();
+static void   notify(const std::string& text, const CHyprColor& color);
+static constexpr float kPortalFront = 2.5f; // m in front of the player, for front = true
+
+static void syncPortals() {
+    std::vector<GLScene::SPortalSpec> specs;
+    for (const auto& P : g_portals)
+        specs.push_back(P.spec);
+    g_scene.setPortals(specs);
+}
+
+// The player's body centre: the capsule's, or under the eye without one.
+static Vec3 playerCenter() {
+    if (!g_playerBody.IsInvalid() && g_bodyIf) {
+        const auto P = g_bodyIf->GetPosition(g_playerBody);
+        return Vec3{P.GetX(), P.GetY(), P.GetZ()};
+    }
+    const auto& CAM = g_scene.camera();
+    return CAM.position - Vec3{0.f, PLAYER_EYE_OFF, 0.f};
+}
+
+// Once per frame: a player who steps into a portal's middle -- within the
+// inner 70 % of its width, within its height, a quarter metre either side of
+// its plane -- starts its command, once per entry, not twice in 3 s.
+static void updatePortals() {
+    if (g_portals.empty() || !roomOpen())
+        return;
+    const Vec3 P = playerCenter();
+    for (auto& PORTAL : g_portals) {
+        const float ASPECT = g_scene.portalAspect(PORTAL.spec.name);
+        if (ASPECT <= 0.0f)
+            continue;
+        const float W = PORTAL.spec.width, H = W * ASPECT;
+        const Vec3  FACE{std::sin(PORTAL.spec.yaw), 0.f, -std::cos(PORTAL.spec.yaw)};
+        const Vec3  RIGHT = normalize(cross(FACE * -1.0f, Vec3{0.f, 1.f, 0.f}));
+        const Vec3  D = P - PORTAL.spec.base;
+        const bool  INSIDE = std::fabs(dot(D, FACE)) < 0.25f && std::fabs(dot(D, RIGHT)) < W * 0.35f &&
+            D.y >= 0.0f && D.y <= H;
+        if (INSIDE && !PORTAL.inside && nowSeconds() >= PORTAL.quietUntil) {
+            PORTAL.quietUntil = nowSeconds() + 3.0;
+            const auto PID = Config::Supplementary::executor()->spawn(PORTAL.command);
+            postRoomEvent("{\"event\":\"portal\",\"name\":" + jsonString(PORTAL.spec.name) +
+                          ",\"started\":" + (PID ? "true" : "false") + ",\"t\":" +
+                          std::to_string(monotonicNs()) + "}");
+            notify(PID ? "[hypr3d] portal " + PORTAL.spec.name + ": starting" :
+                         "[hypr3d] portal " + PORTAL.spec.name + ": its command did not start",
+                   PID ? CHyprColor{0.2f, 0.8f, 0.4f, 1.0f} : CHyprColor{1.0f, 0.2f, 0.2f, 1.0f});
+        }
+        PORTAL.inside = INSIDE;
+    }
 }
 
 // Once per frame after the physics step: steer for the next one.
@@ -4244,6 +4308,7 @@ static void update3D(float dt) {
     ensurePlayerBody();
     syncFloorBody();
     updateCompanion(dt);
+    updatePortals();
 
     if (!g_playerBody.IsInvalid()) {
         auto& CAM = g_scene.camera();
@@ -6506,6 +6571,103 @@ static bool companionLua(lua_State* L) {
     return false;
 }
 
+// hl.plugin.hypr3d.portal(name, { image = "/path.png", command = "...",
+//     at = { x, y, z } or front = true, yaw = degrees, width = metres })
+// sets or replaces the portal `name`; hl.plugin.hypr3d.portal(name) removes
+// it. `front = true` stands it 2.5 m in front of the player, facing him;
+// `yaw` defaults to facing the spawn. A wrong argument fails with the reason,
+// before lua_error, as companionLua does.
+static bool portalLua(lua_State* L) {
+    if (lua_type(L, 1) != LUA_TSTRING) {
+        lua_pushstring(L, "portal: the first argument is its name");
+        return false;
+    }
+    const std::string NAME = lua_tostring(L, 1);
+    const auto IT = std::ranges::find_if(g_portals, [&](const SPortal& p) { return p.spec.name == NAME; });
+    if (lua_isnoneornil(L, 2)) {
+        if (IT == g_portals.end()) {
+            lua_pushstring(L, ("portal: there is no portal '" + NAME + "'").c_str());
+            return false;
+        }
+        g_portals.erase(IT);
+        syncPortals();
+        return true;
+    }
+    if (!lua_istable(L, 2)) {
+        lua_pushstring(L, "portal: the second argument is a table, or nothing to remove it");
+        return false;
+    }
+
+    const auto STRING = [&](const char* key) -> std::string {
+        lua_getfield(L, 2, key);
+        std::string out = lua_type(L, -1) == LUA_TSTRING ? lua_tostring(L, -1) : "";
+        lua_pop(L, 1);
+        return out;
+    };
+    const auto NUMBER = [&](const char* key, float fallback) -> float {
+        lua_getfield(L, 2, key);
+        const float out = lua_isnumber(L, -1) ? static_cast<float>(lua_tonumber(L, -1)) : fallback;
+        lua_pop(L, 1);
+        return out;
+    };
+
+    SPortal portal;
+    portal.spec.name  = NAME;
+    portal.spec.image = STRING("image");
+    portal.command    = STRING("command");
+    portal.spec.width = std::clamp(NUMBER("width", 1.8f), 0.3f, 10.0f);
+    if (portal.spec.image.empty() || !std::filesystem::is_regular_file(portal.spec.image)) {
+        lua_pushstring(L, ("portal: image '" + portal.spec.image + "' is not a file").c_str());
+        return false;
+    }
+    if (portal.command.empty()) {
+        lua_pushstring(L, "portal: it needs a command");
+        return false;
+    }
+
+    lua_getfield(L, 2, "front");
+    const bool FRONT = lua_toboolean(L, -1);
+    lua_pop(L, 1);
+    const auto& CAM = g_scene.camera();
+    if (FRONT) {
+        const Vec3 FEET = playerCenter() - Vec3{0.f, Camera::kBodyHeight * 0.5f, 0.f};
+        portal.spec.base = FEET + CAM.flatForward() * kPortalFront;
+        portal.spec.yaw  = CAM.yaw + std::numbers::pi_v<float>; // facing the player
+    } else {
+        lua_getfield(L, 2, "at");
+        const bool OK = lua_istable(L, -1);
+        float xyz[3] = {0.f, 0.f, 0.f};
+        for (int k = 0; OK && k < 3; ++k) {
+            lua_rawgeti(L, -1, k + 1);
+            xyz[k] = static_cast<float>(lua_tonumber(L, -1));
+            lua_pop(L, 1);
+        }
+        lua_pop(L, 1);
+        if (!OK) {
+            lua_pushstring(L, "portal: it needs at = { x, y, z } or front = true");
+            return false;
+        }
+        portal.spec.base = Vec3{xyz[0], xyz[1], xyz[2]};
+        const Vec3 TO = g_playerSpawn - portal.spec.base;
+        portal.spec.yaw = NUMBER("yaw", std::atan2(TO.x, -TO.z) * 180.0f / std::numbers::pi_v<float>) *
+            std::numbers::pi_v<float> / 180.0f;
+    }
+
+    if (IT != g_portals.end())
+        *IT = std::move(portal);
+    else
+        g_portals.push_back(std::move(portal));
+    syncPortals();
+    damageCurrentMonitor();
+    return true;
+}
+
+static int luaPortal(lua_State* L) {
+    if (!portalLua(L))
+        return lua_error(L);
+    return 0;
+}
+
 static int luaCompanion(lua_State* L) {
     if (!companionLua(L))
         return lua_error(L);
@@ -6616,6 +6778,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "close", luaClose))
         throw std::runtime_error("[hypr3d] failed to register Lua close");
+
+    if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "portal", luaPortal))
+        throw std::runtime_error("[hypr3d] failed to register Lua portal");
 
     if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "companion", luaCompanion))
         throw std::runtime_error("[hypr3d] failed to register Lua companion");

@@ -108,6 +108,28 @@ It appears on the first call, beside the spawn, and its body lives as long as
 the plugin: leaving the room keeps it where it stood, `reset()` puts it back
 beside the spawn.
 
+### Portals
+
+A portal is a picture standing in the room; walk into it and its command
+runs, through Hyprland's own executor -- as an exec keybind would run it:
+
+```bash
+hyprctl eval 'hl.plugin.hypr3d.portal("deltarune", { image = "/path/face.png", command = "steam steam://rungameid/1671210", at = { -6.5, 0, -1 }, yaw = 90 })'
+hyprctl eval 'hl.plugin.hypr3d.portal("deltarune", { image = "/path/face.png", command = "steam steam://rungameid/1671210", front = true })'
+hyprctl eval 'hl.plugin.hypr3d.portal("deltarune")'   -- removes it
+```
+
+| Field | What it is |
+| --- | --- |
+| `image` | the picture, PNG or JPEG; its transparent pixels are cut out |
+| `command` | run once each time the player steps into the portal's middle, not twice within 3 s |
+| `at` | the floor point under its middle; or `front = true`: 2.5 m in front of the player, facing him |
+| `yaw` | the direction it faces, degrees, as the camera's yaw; default: towards the spawn |
+| `width` | metres, default 1.8; the height follows the picture |
+
+Each start goes out on socket2 as `{"event":"portal","name":"deltarune","started":true,...}`.
+A portal lives as long as the plugin; a wrong call fails with the reason.
+
 ## Controls
 
 | Input                         | Action                                         |

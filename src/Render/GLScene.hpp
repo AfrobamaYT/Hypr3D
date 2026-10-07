@@ -164,6 +164,21 @@ class GLScene {
         return R;
     }
 
+    // Portals (hl.plugin.hypr3d.portal): a picture standing on the floor,
+    // `width` metres wide and as tall as the picture, facing `yaw` (the
+    // camera's convention: it looks along {sin yaw, 0, -cos yaw}). Its
+    // transparent pixels are cut out. Pictures load inside render, where
+    // the GL context is current.
+    struct SPortalSpec {
+        std::string name, image;
+        Vec3        base{}; // the floor point under its middle
+        float       yaw   = 0.0f;
+        float       width = 1.8f;
+    };
+    void setPortals(const std::vector<SPortalSpec>& portals);
+    // Height over width of a portal's picture; 0 while it is not loaded.
+    float portalAspect(const std::string& name) const;
+
     // The window being read or shown big (F2, F4): drawn after the rest of
     // the room and never hidden by it, over the room darkened by `dim`
     // (0 = as it is, 1 = black). id 0: none.
@@ -312,6 +327,19 @@ class GLScene {
     void refreshPanorama();
 
     void drawWindows(const Mat4& vp, const std::vector<WindowRender>& windows);
+    // Portals.
+    struct SPortalGL {
+        SPortalSpec  spec;
+        unsigned int tex    = 0;
+        float        aspect = 0.0f;
+        std::string  loaded; // the image path the texture holds
+    };
+    std::vector<SPortalGL>    m_portals;
+    std::vector<unsigned int> m_portalTrash; // textures to delete in render
+    unsigned int              m_portalVAO = 0, m_portalVBO = 0;
+    int                       m_sceneAlphaCut = -1;
+    void refreshPortals();
+    void drawPortals(const Mat4& vp);
     // The featured window (setFeatured) and the dark over the rest.
     std::uintptr_t m_featuredId  = 0;
     float          m_featuredDim = 0.0f;

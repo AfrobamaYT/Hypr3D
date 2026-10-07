@@ -2188,6 +2188,133 @@ static float configWindowScale() {
     return g_cfgWindowScale;
 }
 
+// F2: the aimed window comes to the eye at 1:1 -- one of its pixels on one
+// pixel of the screen, its texels on the pixel centres -- and F2 again sends
+// it back where it stood. The window moves, not the camera, the way a
+// fullscreen window comes to the screen: the player stays where he stands
+// and nothing collides. On the way there the reading pose follows the live
+// camera; once there it stays put in the room.
+struct SRead {
+    std::uintptr_t id      = 0;
+    bool           back    = false; // on the way back to the room
+    bool           arrived = false;
+    std::chrono::steady_clock::time_point start;
+    Vec3  legCenter{};      // the pose the current leg starts from
+    float legYaw = 0.f, legPitch = 0.f, legRoll = 0.f, legScale = 1.f;
+    Vec3  roomCenter{};     // where it stood in the room
+    float roomYaw = 0.f, roomPitch = 0.f, roomRoll = 0.f;
+    Vec3  atCenter{};       // the reading pose, fixed on arrival
+    float atYaw = 0.f, atPitch = 0.f;
+};
+static SRead g_read;
+static constexpr float kReadSeconds = 0.35f;
+
+// The reading pose for a window of BOX (logical px, decorations included):
+// at the distance where the monitor's logical height fills the view, a
+// window at scale 1 shows one logical px per logical px of the screen (the
+// fullscreen transition's distance). Shifted by under a pixel so its edges
+// fall on pixel edges: half a pixel off, every texel is smeared over two.
+static void readingPose(const PHLMONITOR& mon, const CBox& BOX, Vec3& center,
+                        float& yaw, float& pitch) {
+    const auto& CAM = g_scene.camera();
+    const Vec3  FWD = CAM.forward();
+    const Vec3  RIGHT = CAM.right();
+    const Vec3  UP = cross(RIGHT, FWD);
+    const float DIST = World3D::toWorld(static_cast<float>(mon->m_size.y)) * 0.5f /
+        std::tan(kFovDeg * 3.14159265f / 360.0f);
+
+    const double S  = mon->m_scale > 0.0 ? mon->m_scale : 1.0;
+    const double PX = 1.0 / (World3D::LOGICAL_PX_PER_UNIT * S); // world per pixel
+    const auto   OFF = [](double screen, double window) {
+        const double EDGE = (screen - window) * 0.5;
+        return EDGE - std::floor(EDGE); // 0 or 0.5 for whole sizes
+    };
+    const double DX = OFF(mon->m_pixelSize.x, BOX.w * S);
+    const double DY = OFF(mon->m_pixelSize.y, BOX.h * S);
+
+    center = CAM.position + FWD * DIST - RIGHT * static_cast<float>(DX * PX) +
+        UP * static_cast<float>(DY * PX);
+    yaw   = -CAM.yaw;
+    pitch = CAM.pitch;
+}
+
+// One window of syncWorld's loop: the reading animation owns its pose and
+// size. Applied in the loop, not after it: the draw list is built from these
+// values, and a later override reaches the screen a frame late.
+static void applyReading(const PHLMONITOR& mon, const CBox& BOX, World3D::SEntity& E) {
+    const float RAW = std::clamp(
+        std::chrono::duration<float>(std::chrono::steady_clock::now() - g_read.start).count() /
+            kReadSeconds,
+        0.0f, 1.0f);
+    const float P = RAW * RAW * (3.0f - 2.0f * RAW); // smoothstep
+
+    Vec3  to{};
+    float toYaw = 0.f, toPitch = 0.f, toRoll = 0.f, toScale = 1.f;
+    if (g_read.back) {
+        to = g_read.roomCenter;
+        toYaw = g_read.roomYaw, toPitch = g_read.roomPitch, toRoll = g_read.roomRoll;
+        toScale = configWindowScale();
+    } else if (g_read.arrived) {
+        to = g_read.atCenter, toYaw = g_read.atYaw, toPitch = g_read.atPitch;
+    } else
+        readingPose(mon, BOX, to, toYaw, toPitch);
+
+    const float TWO_PI = 2.f * std::numbers::pi_v<float>;
+    E.center = g_read.legCenter + (to - g_read.legCenter) * P;
+    E.yaw    = g_read.legYaw + std::remainder(toYaw - g_read.legYaw, TWO_PI) * P;
+    E.pitch  = g_read.legPitch + (toPitch - g_read.legPitch) * P;
+    E.roll   = g_read.legRoll + std::remainder(toRoll - g_read.legRoll, TWO_PI) * P;
+    const float SCALE = g_read.legScale + (toScale - g_read.legScale) * P;
+    E.width  = World3D::toWorld(BOX.w) * SCALE;
+    E.height = World3D::toWorld(BOX.h) * SCALE;
+
+    if (RAW < 1.0f)
+        return;
+    if (g_read.back)
+        g_read = {}; // the room's scale takes it over on the next frame
+    else if (!g_read.arrived) {
+        g_read.arrived  = true;
+        g_read.atCenter = to, g_read.atYaw = toYaw, g_read.atPitch = toPitch;
+    }
+}
+
+// F2 on the aimed window, or F2 again: the next leg starts from wherever the
+// window is now.
+static void toggleReading() {
+    const std::uintptr_t ID = g_read.id ? g_read.id : g_lastAimedId;
+    const auto* E = ID ? g_world.find(ID) : nullptr;
+    if (!E) {
+        notify("[hypr3d] F2: aim at a window to read it", CHyprColor{0.2f, 0.8f, 0.4f, 1.0f});
+        return;
+    }
+    if (!g_read.id) {
+        g_read            = {};
+        g_read.id         = ID;
+        g_read.roomCenter = E->center;
+        g_read.roomYaw = E->yaw, g_read.roomPitch = E->pitch, g_read.roomRoll = E->roll;
+    } else
+        g_read.back = !g_read.back;
+    g_read.arrived   = false;
+    g_read.start     = std::chrono::steady_clock::now();
+    g_read.legCenter = E->center;
+    g_read.legYaw = E->yaw, g_read.legPitch = E->pitch, g_read.legRoll = E->roll;
+    g_read.legScale  = E->logicalWidth > 0.f ?
+        E->width / World3D::toWorld(E->logicalWidth) : configWindowScale();
+    damageCurrentMonitor();
+}
+
+// Leaving, a fullscreen or a grab ends reading at once: the room pose back
+// unless the window is being carried off.
+static void endReading(bool putBack) {
+    if (!g_read.id)
+        return;
+    if (auto* E = putBack ? g_world.find(g_read.id) : nullptr) {
+        E->center = g_read.roomCenter;
+        E->yaw = g_read.roomYaw, E->pitch = g_read.roomPitch, E->roll = g_read.roomRoll;
+    }
+    g_read = {};
+}
+
 static void syncWorld(const PHLMONITOR& mon, float dt) {
     // Deliberately free of side effects on the layout and the renderer. This
     // runs from render.stage, i.e. between the frame's startRenderPass() and
@@ -2198,6 +2325,12 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
     // CMonitor::useFP16(). Capture and ghosting therefore happen outside the
     // frame -- see serviceCapture().
     const auto INFOS = eligibleWindowsSpanned();
+
+    // A grab takes the window being read where the hand goes; a fullscreen
+    // takes it to the screen. Either way it is not read any more.
+    if (g_read.id && ((g_pointerDown && g_pointerGesture != EPointerGesture::None) ||
+                      g_fsPhase != EFullscreenPhase::None))
+        endReading(false);
 
     g_winOutlines.clear();
 
@@ -2459,6 +2592,9 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         entity.width  = World3D::toWorld(BOX.w) * entity.spawnScale;
         entity.height = World3D::toWorld(BOX.h) * entity.spawnScale;
 
+        if (g_read.id == info.id)
+            applyReading(mon, BOX, entity);
+
         // Fullscreen transition: the animation owns this quad's size, and it
         // MUST be applied here -- the draw list below is built from these
         // values, so overriding later in applyFullscreenAnimation only
@@ -2497,6 +2633,8 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         ENTITIES.push_back(entity);
     }
 
+    if (g_read.id && std::ranges::none_of(ENTITIES, [](const auto& E) { return E.id == g_read.id; }))
+        g_read = {}; // it closed
     g_world.setEntities(std::move(ENTITIES), false);
 
     // --- build the draw list from world + snapshot ---
@@ -3465,6 +3603,7 @@ static void rememberRoom() {
 }
 
 static void deactivate3D() {
+    endReading(true);
     rememberRoom();
 
     finishClientButton(0);
@@ -5574,6 +5713,13 @@ static void onKeyboardKey(
     if (g_keyboardMode == EKeyboardMode::Window)
         return;
 
+    // F2: the aimed window to the eye at 1:1, and back.
+    if (PRESSED && SYM == XKB_KEY_F2) {
+        toggleReading();
+        info.cancelled = true;
+        return;
+    }
+
     // F5: cycle the view -- first person, third person behind, third
     // person in front.
     if (PRESSED && SYM == XKB_KEY_F5) {
@@ -6229,6 +6375,7 @@ static int luaConfig(lua_State* L) {
 // the room forgets how it was left.
 static void resetRoom() {
     g_room = {};
+    g_read = {};
     companionHalt("aborted", "The room was reset");
     placeCompanion();
     if (!g_active)

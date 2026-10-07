@@ -1833,8 +1833,13 @@ void GLScene::drawWindows(
     glUniform4f(m_sceneUVRect, 0.f, 0.f, 1.f, 1.f);
     glUniform1i(m_sceneTexture, 0);
 
+    // Tested against the room's depth, writing none: the BSP order above is
+    // already exact among the windows, and depth written by one of them made
+    // a coplanar one drawn after it lose to rounding noise -- a desktop wall
+    // puts the rice's screen-sized layer in the plane of every window, and
+    // the window behind it vanished.
     glEnable(GL_DEPTH_TEST);
-    glDepthMask(GL_TRUE);
+    glDepthMask(GL_FALSE);
     glEnable(GL_BLEND);
     glBlendFuncSeparate(
         GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
@@ -2198,8 +2203,8 @@ void GLScene::drawRoom(const Mat4& vp, const ViewWindow& view,
         drawGrid(vp);
     }
 
-    // Windows submit back to front and write depth: crossing quads cut into
-    // each other honestly, and translucency composites in order.
+    // Windows last, back to front in the BSP's exact order: crossing quads
+    // are split along each other, and translucency composites in order.
     drawWindows(vp, windows);
 
     glDepthMask(GL_TRUE);

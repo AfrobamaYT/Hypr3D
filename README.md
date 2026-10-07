@@ -103,8 +103,9 @@ beside the spawn.
 | -------------------------------| ------------------------------------------------|
 | Mouse move                    | Look around                                    |
 | WASD                          | Move                                           |
-| Space                         | Move up (flying) / Jump                        |
-| Shift                         | Move down (flying)                             |
+| Space                         | Jump (hold for higher) / move up (flying)      |
+| Space twice                   | Toggle flying                                  |
+| Shift                         | Crouch (walking) / move down (flying)          |
 | Ctrl                          | Sprint                                         |
 | C                             | Zoom, wheel adjusts                            |
 | Super + Left click            | Drag window                                    |
@@ -202,6 +203,7 @@ Everything is optional -- only set what you want to change.
 | grid     | bool   | true    | the starting 40x40 platform             |
 | monitor  | string | ""      | render the 3D view on this monitor (e.g. "DP-1") instead of the focused one |
 | span     | bool   | true    | with several monitors, one room across all of them: each monitor shows the part of the room where it sits in the layout (an off-axis view, like a triple-screen simulator), and the windows of every monitor enter as a wall where they stood; the eye sits in front of `monitor` (or the focused one). `false`: the room on that one monitor only |
+| gravity  | float  | 14.0    | how fast things fall (m/s²) -- the player too; the Moon is 1.62 |
 
 ### Windows
 
@@ -219,7 +221,7 @@ Everything is optional -- only set what you want to change.
 | animations       | [Animation Group](#animation-group) | {}          | which clip each movement state plays                    |
 | look_sensitivity | float                               | 0.0025      | how fast the camera turns (radians per pointer count)   |
 | look_inertia     | float                               | 0.03        | camera coasting after you stop the mouse (in seconds)   |
-| move_inertia     | float                               | 0.05        | coasting after you stop walking in seconds (in seconds) |
+| move_inertia     | float                               | 0.18        | flight: how long speeding up and coasting take (seconds) |
 | move_speed       | float                               | 4.0         | how fast you walk (m/s, running - 2.5x)                 |
 | spawn            | [Vector3](#vector3)                 | { 0, 0, 0 } | player spawn point                                      |
 | flying           | bool                                | true        | disables falling                                        |

@@ -360,7 +360,8 @@ static float       g_cfgWindowDepth   = 0.05f;   // slab thickness, 0 = flat qua
 
 // --- player -----------------------------------------------------------------
 static float       g_cfgLookInertia   = 0.03f;   // seconds, 0 = off
-static float       g_cfgMoveInertia   = 0.05f;   // seconds, 0 = off
+static float       g_cfgMoveInertia   = 0.18f;   // flight glide, seconds, 0 = off
+static float       g_cfgGravity       = 14.0f;   // world.gravity, m/s^2 down
 static float       g_cfgMoveSpeed     = 4.0f;    // world units / second
 static float       g_cfgSensitivity   = 0.0025f; // radians per pointer count
 static bool        g_playerFlying     = true;    // false = walk / jump / gravity
@@ -558,7 +559,7 @@ static bool joltInit() {
     g_joltSystem = new JPH::PhysicsSystem();
     g_joltSystem->Init(512, 0, 1024, 1024, g_bpLayers, g_objVsBp, g_objPair);
     // Same gravity as the player's walk physics.
-    g_joltSystem->SetGravity(JPH::Vec3(0.f, -14.f, 0.f));
+    g_joltSystem->SetGravity(JPH::Vec3(0.f, -g_cfgGravity, 0.f));
 
     g_bodyIf = &g_joltSystem->GetBodyInterface();
     done = true;
@@ -3588,6 +3589,55 @@ static float updateTransition() {
 // across frames so releasing the keys coasts down instead of cutting dead.
 static Vec3 s_moveVel{};
 
+// Walking is a game, not a camera on rails (the owner, 2026-10-07: "fühlt
+// sich sehr stiff an"): Quake's ground model -- friction, then acceleration
+// toward the wished speed -- and little steering in the air, so a jump
+// keeps its momentum. Coyote time and a jump buffer forgive Space pressed a
+// moment late or early; letting go of Space while rising cuts the jump.
+// Two presses of Space toggle flight, as in Minecraft; Shift crouches when
+// walking and sinks when flying; Ctrl sprints and widens the view a little.
+static constexpr float kGroundAccel    = 10.0f; // Quake/Source sv_accelerate
+static constexpr float kGroundFriction = 6.0f;  // sv_friction
+static constexpr float kStopSpeed      = 1.5f;  // m/s, friction's floor (sv_stopspeed)
+static constexpr float kAirAccel       = 2.0f;  // steering in the air
+static constexpr float kJumpSpeed      = 5.5f;  // m/s up: ~1.1 m at 14 m/s^2
+static constexpr float kCoyoteTime     = 0.12f; // s after leaving an edge
+static constexpr float kJumpBuffer     = 0.12f; // s a press waits for the ground
+static constexpr float kDoubleTap      = 0.30f; // s between the two presses
+static constexpr float kCrouchSpeed    = 0.45f; // of the walking speed
+static constexpr float kCrouchDrop     = 0.40f; // m the eye sinks
+// Crouch, landing dip and bob together stay under 0.45 m: further apart,
+// camera and body read as a teleport (update3D, 0.5 m) and the body would
+// be moved into the floor.
+static constexpr float kViewOffsetMax  = 0.45f;
+
+static double s_lastGroundedAt   = -1.0;
+static double s_jumpPressedAt    = -1.0;
+static double s_lastSpacePressAt = -1.0;
+static bool   s_jumpRising       = false;
+static bool   s_wasGrounded      = false;
+static float  s_lastFallSpeed    = 0.0f;
+static float  s_viewDrop         = 0.0f; // crouch, m below the eye
+static float  s_landDip          = 0.0f; // landing, m below the eye
+
+static double nowSeconds() {
+    return std::chrono::duration<double>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// Quake's PM_Accelerate: add speed along the wished direction up to the
+// wished speed, at most accel * wishspeed per second.
+static void accelerateToward(Vec3& vel, const Vec3& dir, float wish, float accel,
+                             float dt) {
+    const float CURRENT = vel.x * dir.x + vel.z * dir.z;
+    const float ADD = wish - CURRENT;
+    if (ADD <= 0.0f)
+        return;
+    const float STEP = std::min(accel * dt * wish, ADD);
+    vel.x += dir.x * STEP;
+    vel.z += dir.z * STEP;
+}
+
 // Walk bob (view-only): sine phase in radians + eased amplitude. The body
 // pose stays physical -- the offset rides on the camera each frame and is
 // re-derived from the clean eye point, so it never feeds back into Jolt.
@@ -3626,21 +3676,36 @@ static void applyCameraMovement(float dt) {
     const float tau    = g_cfgMoveInertia;
 
     if (!g_playerFlying) {
-        // --- walking: the keys own the horizontal plane; Jolt's gravity
-        // (system -14, the old player constant) owns the vertical one ---
-        const float SPEED = CAM.moveSpeed * (g_keySprint ? 2.5f : 1.0f);
-        const Vec3  TARGET =
-            CAM.flatForward() * (FORWARD * SPEED) +
-            CAM.right() * (STRAFE * SPEED);
+        // --- walking: friction and acceleration on the ground, a little
+        // steering in the air; Jolt's gravity owns the vertical axis ---
+        const bool  CROUCH = g_keyDown;
+        const float WISH = CAM.moveSpeed * (g_keySprint && !CROUCH ? 2.5f : 1.0f) *
+            (CROUCH ? kCrouchSpeed : 1.0f);
+        Vec3 dir = CAM.flatForward() * FORWARD + CAM.right() * STRAFE;
+        const float DLEN = std::sqrt(dir.x * dir.x + dir.z * dir.z);
+        if (DLEN > 1e-4f)
+            dir = dir * (1.0f / DLEN);
 
-        if (tau > 0.0f && dt > 0.0f)
-            s_moveVel += (TARGET - s_moveVel) * (1.0f - std::exp(-dt / tau));
-        else
-            s_moveVel = TARGET;
-
-        const bool MOVING_H = FORWARD != 0.f || STRAFE != 0.f;
-        if (!MOVING_H && std::fabs(s_moveVel.x) + std::fabs(s_moveVel.z) < 0.01f)
-            s_moveVel = {};
+        // From what the body really does: a wall or a prop takes its share.
+        Vec3 vel{s_moveVel.x, 0.f, s_moveVel.z};
+        if (!g_playerBody.IsInvalid() && g_bodyIf) {
+            const auto BV = g_bodyIf->GetLinearVelocity(g_playerBody);
+            vel = Vec3{BV.GetX(), 0.f, BV.GetZ()};
+        }
+        if (g_grounded) {
+            const float SPEED = std::sqrt(vel.x * vel.x + vel.z * vel.z);
+            if (SPEED > 0.0f) {
+                const float DROP = std::max(SPEED, kStopSpeed) * kGroundFriction * dt;
+                const float SCALE = std::max(0.0f, SPEED - DROP) / SPEED;
+                vel.x *= SCALE;
+                vel.z *= SCALE;
+            }
+            if (DLEN > 1e-4f)
+                accelerateToward(vel, dir, WISH, kGroundAccel, dt);
+        } else if (DLEN > 1e-4f)
+            accelerateToward(vel, dir, WISH, kAirAccel, dt);
+        s_moveVel = Vec3{vel.x, 0.f, vel.z};
+        (void)tau;
         return;
     }
 
@@ -3875,7 +3940,10 @@ static void update3D(float dt) {
 
     // C-key view zoom glide: exponential toward the target (the wheel level
     // while held, 1x when released), so both directions are smooth.
-    const float ZOOM_TARGET = g_zoomHeld ? g_zoomWheel : 1.0f;
+    // Sprinting widens the view a little, the common cue for speed.
+    const bool SPRINTING = g_keySprint && !g_keyDown &&
+        (g_keyFwd || g_keyBack || g_keyLeft || g_keyRight);
+    const float ZOOM_TARGET = (g_zoomHeld ? g_zoomWheel : 1.0f) * (SPRINTING ? 0.92f : 1.0f);
     g_zoomLevel += (ZOOM_TARGET - g_zoomLevel) *
         (1.0f - std::exp(-8.0f * dt));
     g_scene.setZoom(g_zoomLevel);
@@ -3887,6 +3955,18 @@ static void update3D(float dt) {
 
     if (!g_playerBody.IsInvalid()) {
         auto& CAM = g_scene.camera();
+
+        // Fell off the world -- past a map's edge, or walking with nothing
+        // below: back at the spawn, at rest, instead of falling forever.
+        if (g_bodyIf->GetPosition(g_playerBody).GetY() < -80.0f) {
+            placeAtSpawn();
+            g_bodyIf->SetPositionAndRotation(
+                g_playerBody,
+                JPH::RVec3(CAM.position.x, CAM.position.y - PLAYER_EYE_OFF, CAM.position.z),
+                JPH::Quat::sIdentity(), JPH::EActivation::Activate);
+            g_bodyIf->SetLinearVelocity(g_playerBody, JPH::Vec3::sZero());
+            s_moveVel = {};
+        }
 
         // collision = false: the capsule joins no contact pair at all --
         // it flies/falls through everything (the honest noclip).
@@ -3993,10 +4073,23 @@ static void update3D(float dt) {
             if (VY < -40.0f) // terminal velocity, as before
                 VY = -40.0f;
 
-            if (g_playerJumpQueued) {
-                g_playerJumpQueued = false;
-                if (g_grounded)
-                    VY = 5.5f;
+            // The jump: pressed up to kJumpBuffer before landing, or up to
+            // kCoyoteTime after the ground went away. Letting go of Space
+            // on the way up halves what is left of the rise.
+            g_playerJumpQueued = false;
+            const double NOW = nowSeconds();
+            if (g_grounded && VY <= 0.5f)
+                s_lastGroundedAt = NOW;
+            if (s_jumpPressedAt >= 0.0 && NOW - s_jumpPressedAt <= kJumpBuffer &&
+                s_lastGroundedAt >= 0.0 && NOW - s_lastGroundedAt <= kCoyoteTime) {
+                VY = kJumpSpeed;
+                s_jumpPressedAt = s_lastGroundedAt = -1.0;
+                s_jumpRising = true;
+            }
+            if (s_jumpRising && (VY <= 0.0f || !g_keyUp)) {
+                if (VY > 0.0f)
+                    VY *= 0.5f;
+                s_jumpRising = false;
             }
 
             g_bodyIf->SetLinearVelocity(g_playerBody, JPH::Vec3(
@@ -4026,13 +4119,31 @@ static void update3D(float dt) {
 
         // Both offsets ride the same eased envelope: the roll fades out
         // with the bob (walk_bob off, flight, air, transitions).
+        float viewY = 0.0f;
         if (s_bobAmp > 0.0005f) {
-            CAM.position.y += s_bobAmp * std::sin(s_bobPhase);
+            viewY += s_bobAmp * std::sin(s_bobPhase);
             CAM.roll = (s_bobAmp * (1.0f / kBobAmplitude)) * kBobRoll *
                 std::sin(s_bobPhase * 0.5f);
         } else {
             CAM.roll = 0.0f;
         }
+
+        // Crouch lowers the eye; a landing dips it by how hard it was and
+        // springs back. View only, first person, like the bob.
+        const bool FIRST = g_fsPhase == EFullscreenPhase::None && g_viewMode == 0;
+        const float DROP = FIRST && !g_playerFlying && g_keyDown ? kCrouchDrop : 0.0f;
+        s_viewDrop += (DROP - s_viewDrop) * (1.0f - std::exp(-12.0f * dt));
+        if (!g_playerFlying && g_grounded && !s_wasGrounded && s_lastFallSpeed > 2.0f)
+            s_landDip = std::min(0.12f, s_lastFallSpeed * 0.012f);
+        s_landDip *= std::exp(-10.0f * dt);
+        s_wasGrounded = g_grounded;
+        {
+            const auto PV = g_bodyIf->GetLinearVelocity(g_playerBody);
+            s_lastFallSpeed = g_grounded ? 0.0f : std::max(0.0f, -PV.GetY());
+        }
+        if (FIRST)
+            viewY -= s_viewDrop + s_landDip;
+        CAM.position.y += std::clamp(viewY, -kViewOffsetMax, kViewOffsetMax);
     }
 
     // Map-drag carry: the grabbed object's CENTER rides the crosshair at
@@ -5265,9 +5376,25 @@ static void onKeyboardKey(
     // SPACE KEYBOARD MODE ONLY: in Window mode the key belongs to the
     // focused window -- a jump here would fire on every typed space.
     if (PRESSED && SYM == XKB_KEY_space &&
-        g_keyboardMode == EKeyboardMode::Space &&
-        !g_playerFlying && g_grounded)
-        g_playerJumpQueued = true; // applied to the body in update3D
+        g_keyboardMode == EKeyboardMode::Space) {
+        const double NOW = nowSeconds();
+        if (s_lastSpacePressAt >= 0.0 && NOW - s_lastSpacePressAt <= kDoubleTap) {
+            // The second press of a double tap toggles flight; flying starts
+            // hovering where it is, walking falls from there.
+            g_playerFlying = !g_playerFlying;
+            s_lastSpacePressAt = s_jumpPressedAt = -1.0;
+            s_jumpRising = false;
+            s_moveVel.y = 0.0f;
+            if (g_playerFlying && !g_playerBody.IsInvalid() && g_bodyIf) {
+                const auto V = g_bodyIf->GetLinearVelocity(g_playerBody);
+                g_bodyIf->SetLinearVelocity(g_playerBody, JPH::Vec3(V.GetX(), 0.f, V.GetZ()));
+            }
+        } else {
+            s_lastSpacePressAt = NOW;
+            if (!g_playerFlying)
+                s_jumpPressedAt = NOW; // the jump itself happens in update3D
+        }
+    }
 
     // F3 toggles the debug HUD (collision wireframe + info overlay) in both
     // keyboard modes: it never belongs to the focused window.
@@ -5517,6 +5644,11 @@ static int luaConfig(lua_State* L) {
             return luaL_error(L, "hypr3d.config: world.grid must be a boolean");
         if (!SET_BOOL(idx, "span", g_cfgSpan, "world.span"))
             return luaL_error(L, "hypr3d.config: world.span must be a boolean");
+        if (!SET_NUM(idx, "gravity", g_cfgGravity, "world.gravity"))
+            return luaL_error(L, "hypr3d.config: world.gravity must be a number");
+        g_cfgGravity = std::clamp(g_cfgGravity, 0.5f, 40.0f);
+        if (g_joltSystem)
+            g_joltSystem->SetGravity(JPH::Vec3(0.f, -g_cfgGravity, 0.f));
         lua_pop(L, 1);
     }
 

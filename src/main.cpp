@@ -357,6 +357,7 @@ static bool g_hookInstalled = false;
 static std::string g_cfgPanorama;                // panorama image path
 static std::string g_cfgMonitor;                 // monitor name (e.g. "DP-1"), empty = focused
 static bool        g_cfgGrid = true;             // base grid platform on/off
+static bool        g_cfgShadows = true;          // shadows under the windows (updateShadows)
 static bool        g_cfgSpan = true;             // the room across every monitor
 
 // --- windows ----------------------------------------------------------------
@@ -1626,6 +1627,81 @@ static SModelRayHit modelRayHit(const Vec3& origin, const Vec3& dir,
     }
 
     return R;
+}
+
+// A soft shadow on the floor under every window (GLScene::setShadows), the
+// grounding the Reddit finds asked for: a window floating over nothing reads
+// as nowhere. The floor is where a ray straight down meets the room -- the
+// map, or the grid's slab (top at 0, -20..20). The blob covers the window's
+// footprint; the higher the window floats, the fainter and wider it gets, as
+// a shadow's penumbra grows with the gap. It is flat, so it is drawn only
+// over flat floor: under each corner of the footprint the floor lies within
+// kShadowFlat of the floor under the middle. A blob half over the Moon
+// station's deck edge hung in the air and darkened the edge's light across
+// the whole view (measured 2026-10-07); over an edge, a step or rough ground
+// there is no shadow rather than a wrong one.
+static constexpr float kShadowAlpha  = 0.55f; // a window standing on the floor
+static constexpr float kShadowFade   = 1.0f;  // m of height that take it to 1/e
+static constexpr float kShadowSpread = 0.15f; // m of blur at the floor, +0.25 per m up
+static constexpr float kShadowFlat   = 0.15f; // m the floor may vary under it
+
+// The floor's height under (x, z), looking down from y; false: none.
+static bool floorBelow(float x, float y, float z, float& floorY) {
+    const auto DOWN = modelRayHit(Vec3{x, y, z}, Vec3{0.f, -1.f, 0.f}, /*dynamicOnly=*/false);
+    if (DOWN.hit) {
+        floorY = y - DOWN.dist;
+        return true;
+    }
+    if (g_cfgGrid && y > 0.0f && std::fabs(x) < 20.0f && std::fabs(z) < 20.0f) {
+        floorY = 0.0f;
+        return true;
+    }
+    return false;
+}
+
+static void updateShadows() {
+    std::vector<GLScene::SShadow> out;
+    for (const auto& E : g_world.entities()) {
+        if (!g_cfgShadows)
+            break;
+        // Windows only: the rice's layers (its wallpaper, its bar) are in the
+        // world too, as wide as the wall, and cast a band across the view.
+        if (E.width <= 0.0f || E.height <= 0.0f || !Compat::findWindowById(E.id))
+            continue;
+        float floorY = 0.0f;
+        if (!floorBelow(E.center.x, E.center.y, E.center.z, floorY))
+            continue;
+        const Vec3  R = g_world.rightOf(E.id), U = g_world.upOf(E.id);
+        const float HR = std::hypot(R.x, R.z), HU = std::hypot(U.x, U.z);
+        const float BOTTOM = E.center.y - std::fabs(U.y) * E.height * 0.5f - std::fabs(R.y) * E.width * 0.5f;
+        const float GAP = std::max(0.0f, BOTTOM - floorY);
+        const float ALPHA = kShadowAlpha * std::exp(-GAP / kShadowFade);
+        if (ALPHA < 0.02f)
+            continue;
+        const float SPREAD = kShadowSpread + 0.25f * GAP;
+        GLScene::SShadow S;
+        S.center = Vec3{E.center.x, floorY + 0.01f, E.center.z};
+        S.right  = HR > 1e-3f ? Vec3{R.x / HR, 0.f, R.z / HR} : Vec3{1.f, 0.f, 0.f};
+        const Vec3 ALONG = S.right * (E.width * 0.5f * HR);
+        const Vec3 ACROSS = Vec3{-S.right.z, 0.f, S.right.x} * (E.height * 0.5f * HU + kShadowSpread);
+        bool flat = true;
+        for (const Vec3 C : {S.center - ALONG - ACROSS, S.center + ALONG - ACROSS,
+                             S.center + ALONG + ACROSS, S.center - ALONG + ACROSS}) {
+            float y = 0.0f;
+            if (!floorBelow(C.x, E.center.y, C.z, y) || std::fabs(y - floorY) > kShadowFlat) {
+                flat = false;
+                break;
+            }
+        }
+        if (!flat)
+            continue;
+        // The blob is dark over about its inner half: 1.4x the footprint.
+        S.halfW  = E.width * 0.5f * HR * 1.4f + SPREAD;
+        S.halfD  = E.height * 0.5f * HU * 1.4f + SPREAD;
+        S.alpha  = ALPHA;
+        out.push_back(S);
+    }
+    g_scene.setShadows(std::move(out));
 }
 
 // A model is IN FRONT of the aimed window when its ray hit is closer (or
@@ -2952,6 +3028,7 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
     const bool MENU_NEW = menu && menu != g_menuId;
     g_menuId = menu;
     g_world.setEntities(std::move(ENTITIES), false);
+    updateShadows();
     if (MENU_NEW) {
         if (g_read.id && g_read.id != menu)
             endReading(true);
@@ -6131,6 +6208,8 @@ static int luaConfig(lua_State* L) {
     //         panorama = "~/picture.png",   -- 360-degree room background
     //         grid = true,                  -- base grid platform (visible +
     //                                       -- collidable, at world zero)
+    //         shadows = true,               -- a soft shadow on the floor
+    //                                       -- under each window
     //     },
     //     windows = {
     //         window_scale = 0.5,           -- room multiplier on window size
@@ -6297,6 +6376,8 @@ static int luaConfig(lua_State* L) {
             return luaL_error(L, "hypr3d.config: world.monitor must be a string");
         if (!SET_BOOL(idx, "grid", g_cfgGrid, "world.grid"))
             return luaL_error(L, "hypr3d.config: world.grid must be a boolean");
+        if (!SET_BOOL(idx, "shadows", g_cfgShadows, "world.shadows"))
+            return luaL_error(L, "hypr3d.config: world.shadows must be a boolean");
         if (!SET_BOOL(idx, "span", g_cfgSpan, "world.span"))
             return luaL_error(L, "hypr3d.config: world.span must be a boolean");
         if (!SET_NUM(idx, "gravity", g_cfgGravity, "world.gravity"))

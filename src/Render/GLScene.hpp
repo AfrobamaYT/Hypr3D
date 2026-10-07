@@ -179,6 +179,16 @@ class GLScene {
     // Height over width of a portal's picture; 0 while it is not loaded.
     float portalAspect(const std::string& name) const;
 
+    // Shadows on the floor under the windows: a soft blob each, as games
+    // ground a floating object (a blob shadow) and visionOS a window. main
+    // finds the floor and sizes them; centre on the floor, `right` the
+    // horizontal unit axis of the window's width.
+    struct SShadow {
+        Vec3  center{}, right{1.f, 0.f, 0.f};
+        float halfW = 0.f, halfD = 0.f, alpha = 0.f;
+    };
+    void setShadows(std::vector<SShadow>&& shadows) { m_shadows = std::move(shadows); }
+
     // The window being read or shown big (F2, F4): drawn after the rest of
     // the room and never hidden by it, over the room darkened by `dim`
     // (0 = as it is, 1 = black). id 0: none.
@@ -340,6 +350,10 @@ class GLScene {
     int                       m_sceneAlphaCut = -1;
     void refreshPortals();
     void drawPortals(const Mat4& vp);
+    // Shadows (setShadows).
+    std::vector<SShadow> m_shadows;
+    unsigned int         m_shadowTex = 0, m_shadowVAO = 0, m_shadowVBO = 0;
+    void drawShadows(const Mat4& vp);
     // The featured window (setFeatured) and the dark over the rest.
     std::uintptr_t m_featuredId  = 0;
     float          m_featuredDim = 0.0f;

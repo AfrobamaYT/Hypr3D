@@ -2228,6 +2228,8 @@ void GLScene::drawRoom(const Mat4& vp, const ViewWindow& view,
         drawGrid(vp);
     }
 
+    drawShadows(vp);
+
     // Windows last, back to front in the BSP's exact order: crossing quads
     // are split along each other, and translucency composites in order. A
     // featured window (F2, F4) comes after the rest and the dark over them --
@@ -2379,6 +2381,86 @@ void GLScene::drawPortals(const Mat4& vp) {
     }
 
     glUniform1f(m_sceneAlphaCut, 0.0f);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+
+void GLScene::drawShadows(const Mat4& vp) {
+    if (m_shadows.empty())
+        return;
+    if (!m_shadowTex) {
+        // The blob: black, its alpha a Gaussian that reaches 0 at the edge
+        // of the square, so the quad's border never shows.
+        static constexpr int N = 64;
+        std::vector<unsigned char> px(N * N * 4, 0);
+        for (int y = 0; y < N; ++y)
+            for (int x = 0; x < N; ++x) {
+                const float U = (x + 0.5f) / N * 2.f - 1.f, V = (y + 0.5f) / N * 2.f - 1.f;
+                const float R2 = U * U + V * V;
+                const float A = std::exp(-R2 / (2.f * 0.35f * 0.35f)) * std::max(0.f, 1.f - R2);
+                px[(y * N + x) * 4 + 3] = static_cast<unsigned char>(std::lround(255.f * A));
+            }
+        glGenTextures(1, &m_shadowTex);
+        glBindTexture(GL_TEXTURE_2D, m_shadowTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, N, N, 0, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+    if (!m_shadowVAO) {
+        glGenVertexArrays(1, &m_shadowVAO);
+        glGenBuffers(1, &m_shadowVBO);
+        glBindVertexArray(m_shadowVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, m_shadowVBO);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), reinterpret_cast<void*>(0));
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float),
+                              reinterpret_cast<void*>(3 * sizeof(float)));
+    }
+
+    std::vector<float> V;
+    V.reserve(m_shadows.size() * 30);
+    for (const auto& S : m_shadows) {
+        const Vec3 R = S.right * S.halfW;
+        const Vec3 D = Vec3{-S.right.z, 0.f, S.right.x} * S.halfD;
+        const Vec3 A = S.center - R - D, B = S.center + R - D, C = S.center + R + D, E = S.center - R + D;
+        const float Q[] = {A.x, A.y, A.z, 0.f, 0.f, B.x, B.y, B.z, 1.f, 0.f, C.x, C.y, C.z, 1.f, 1.f,
+                           A.x, A.y, A.z, 0.f, 0.f, C.x, C.y, C.z, 1.f, 1.f, E.x, E.y, E.z, 0.f, 1.f};
+        V.insert(V.end(), std::begin(Q), std::end(Q));
+    }
+
+    glUseProgram(m_sceneProgram);
+    glUniformMatrix4fv(m_sceneMVP, 1, GL_FALSE, vp.m.data());
+    glUniform4f(m_sceneUVRect, 0.f, 0.f, 1.f, 1.f);
+    glUniform1i(m_sceneTexture, 0);
+    glUniform1i(m_sceneTextured, 1);
+    // On the floor, under everything that stands on it: tested against the
+    // depth, never written. main lifts it a centimetre off the floor; the
+    // offset here is constant, never by slope -- seen at a grazing angle a
+    // sloped offset pulled it in front of the deck's lit edge.
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(0.f, -4.f);
+    const GLboolean CULL = glIsEnabled(GL_CULL_FACE);
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_BLEND);
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, m_shadowTex);
+    glBindVertexArray(m_shadowVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_shadowVBO);
+    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(V.size() * sizeof(float)), V.data(), GL_DYNAMIC_DRAW);
+    for (size_t i = 0; i < m_shadows.size(); ++i) {
+        glUniform4f(m_sceneColorUniform, 1.f, 1.f, 1.f, m_shadows[i].alpha);
+        glDrawArrays(GL_TRIANGLES, static_cast<GLint>(i * 6), 6);
+    }
+    glDisable(GL_POLYGON_OFFSET_FILL);
+    if (CULL)
+        glEnable(GL_CULL_FACE);
     glBindTexture(GL_TEXTURE_2D, 0);
     glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
@@ -2869,6 +2951,15 @@ void GLScene::destroyGLObjects() {
         glDeleteVertexArrays(1, &m_dimVAO);
         glDeleteBuffers(1, &m_dimVBO);
         m_dimVAO = m_dimVBO = 0;
+    }
+    if (m_shadowTex) {
+        glDeleteTextures(1, &m_shadowTex);
+        m_shadowTex = 0;
+    }
+    if (m_shadowVAO) {
+        glDeleteVertexArrays(1, &m_shadowVAO);
+        glDeleteBuffers(1, &m_shadowVBO);
+        m_shadowVAO = m_shadowVBO = 0;
     }
     if (m_sightFence) {
         glDeleteSync(static_cast<GLsync>(m_sightFence));

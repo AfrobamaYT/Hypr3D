@@ -7351,6 +7351,83 @@ static bool portalLua(lua_State* L) {
     return true;
 }
 
+// hl.plugin.hypr3d.object(name, { path = "x.glb", scale = 1, flat = false,
+// physics = true }) -- an object put into the room at runtime, the Reddit
+// finds' "posters, furniture, a .glb dragged in" (twenty people): 1.2 m in
+// front of the player at chest height, it falls to the floor and is
+// grabbed, carried and thrown with Super+LMB like the config's dynamic
+// objects. physics = false: it stays in the air where it is put and where it
+// is carried -- a picture stood up on the floor fell flat (measured).
+// object(name) takes it out. The scene table of the next config() that has
+// one replaces it -- a new world is a new room. Kept apart from the config's
+// objects by a "~" before the name: the list is sorted by name and every
+// index-keyed structure follows it, so runtime objects sort after them.
+static constexpr float kObjectFront = 1.2f;
+
+static bool objectLua(lua_State* L) {
+    if (lua_type(L, 1) != LUA_TSTRING) {
+        lua_pushstring(L, "object: the first argument is its name");
+        return false;
+    }
+    const std::string NAME = std::string("~") + lua_tostring(L, 1);
+    const auto ERASE = [&](std::vector<SSceneObjectCfg>& list) {
+        return std::erase_if(list, [&](const SSceneObjectCfg& o) { return o.name == NAME; });
+    };
+    if (lua_isnoneornil(L, 2)) {
+        ERASE(g_sceneLuaState);
+        if (!ERASE(g_sceneObjects)) {
+            lua_pushstring(L, ("object: there is no object '" + NAME.substr(1) + "'").c_str());
+            return false;
+        }
+        damageCurrentMonitor();
+        return true;
+    }
+    if (!lua_istable(L, 2)) {
+        lua_pushstring(L, "object: the second argument is a table, or nothing to remove it");
+        return false;
+    }
+    SSceneObjectCfg OBJ;
+    OBJ.name = NAME;
+    lua_getfield(L, 2, "path");
+    OBJ.path = lua_type(L, -1) == LUA_TSTRING ? lua_tostring(L, -1) : "";
+    lua_pop(L, 1);
+    if (OBJ.path.empty() || !std::filesystem::is_regular_file(OBJ.path)) {
+        lua_pushstring(L, ("object: path '" + OBJ.path + "' is not a file").c_str());
+        return false;
+    }
+    lua_getfield(L, 2, "scale");
+    const float SCALE = lua_isnumber(L, -1) ? std::clamp(static_cast<float>(lua_tonumber(L, -1)), 0.01f, 100.0f) : 1.0f;
+    lua_pop(L, 1);
+    lua_getfield(L, 2, "flat");
+    OBJ.flat = lua_toboolean(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 2, "physics");
+    OBJ.physics = lua_isnil(L, -1) || lua_toboolean(L, -1);
+    lua_pop(L, 1);
+    OBJ.scale     = Vec3{SCALE, SCALE, SCALE};
+    OBJ.collision = true;
+    OBJ.dynamic   = true;
+    OBJ.center    = CMapModel::ECenter::Logical;
+    const auto& CAM = g_scene.camera();
+    OBJ.position = playerCenter() + CAM.flatForward() * kObjectFront + Vec3{0.f, 0.3f, 0.f};
+    OBJ.rotationDeg = Vec3{0.f, -CAM.yaw * 180.0f / std::numbers::pi_v<float>, 0.f}; // its front to the player
+
+    for (auto* list : {&g_sceneObjects, &g_sceneLuaState}) {
+        ERASE(*list);
+        list->push_back(OBJ);
+        std::sort(list->begin(), list->end(),
+                  [](const SSceneObjectCfg& A, const SSceneObjectCfg& B) { return A.name < B.name; });
+    }
+    damageCurrentMonitor();
+    return true;
+}
+
+static int luaObject(lua_State* L) {
+    if (!objectLua(L))
+        return lua_error(L);
+    return 0;
+}
+
 static int luaPortal(lua_State* L) {
     if (!portalLua(L))
         return lua_error(L);
@@ -7470,6 +7547,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "portal", luaPortal))
         throw std::runtime_error("[hypr3d] failed to register Lua portal");
+
+    if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "object", luaObject))
+        throw std::runtime_error("[hypr3d] failed to register Lua object");
 
     if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "companion", luaCompanion))
         throw std::runtime_error("[hypr3d] failed to register Lua companion");

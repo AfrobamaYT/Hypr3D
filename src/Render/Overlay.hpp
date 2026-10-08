@@ -61,6 +61,15 @@ namespace Overlay {
     // The process gun's mode pill, 48 px from the top while F7 is on.
     SImage paintGunPill(float scale);
 
+    // F3's room check: the world's name, rows of a label and a value, and
+    // the legend of the colours F3 draws in the room. The anchor is the
+    // panel's top left.
+    struct SRoomCheck {
+        std::string                                      world;
+        std::vector<std::pair<std::string, std::string>> rows;
+    };
+    SImage paintRoomCheck(const SRoomCheck& check, float scale);
+
     // A pill of key hints, as at the bottom of Super+F's screen.
     SImage paintHintPill(const std::vector<SKey>& keys, float scale);
 

@@ -127,6 +127,7 @@ class GLScene {
     enum class EAnchor : uint8_t {
         Center, // the screen's centre: the crosshair
         Top,    // the top middle
+        TopLeft,
         Bottom, // the bottom middle
         Cursor, // the pointer of a window in use (setCursorPoint)
     };
@@ -141,13 +142,17 @@ class GLScene {
         m_overlay = std::move(sprites);
     }
 
-    // F3 debug HUD: collision wireframe + info text (coords/yaw/pitch/fps).
-    void setDebugOverlay(bool on) {
-        m_debugOverlay = on;
-    }
-
-    void setDebugFps(float fps) {
-        m_debugFps = fps;
+    // F3's room check (main's overlay): how many map objects are loaded,
+    // of how many, with how many triangles.
+    struct SMapStats {
+        size_t loaded = 0, total = 0, triangles = 0;
+    };
+    SMapStats mapStats() const {
+        SMapStats S{0, m_slots.size(), 0};
+        for (const auto& SLOT : m_slots)
+            if (SLOT.model && SLOT.model->loaded())
+                ++S.loaded, S.triangles += SLOT.model->triangles().size();
+        return S;
     }
 
     // The base grid platform (world zero): visible + collidable.
@@ -363,7 +368,6 @@ class GLScene {
     void refreshScene();
     void refreshPlayer();
 
-    void drawDebugOverlay(int width, int height);
 
     void destroyGLObjects();
 
@@ -516,7 +520,6 @@ class GLScene {
     float m_time = 0.0f;
 
     // F3 debug HUD state.
-    bool                            m_debugOverlay = false;
     bool                            m_gridVisible  = true;
     float                           m_zoom         = 1.0f;
     CPlayerModel                    m_player;
@@ -554,9 +557,7 @@ class GLScene {
     bool                            m_playerVisible    = false;
     Vec3                            m_playerFeet{};
     float                           m_playerYaw        = 0.f;
-    float                           m_debugFps     = 0.f;
 
-    unsigned int                    m_textVAO = 0, m_textVBO = 0;
 
     // Scene slots: one per config object, index-aligned with the specs.
     struct SSlot {

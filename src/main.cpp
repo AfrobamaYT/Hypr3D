@@ -2794,6 +2794,10 @@ struct SAimOverlay {
     bool           waitArrive = false; // Super+F's screen: ring once it is in front
     double         ringAt = -10.0, pillAt = -10.0, movedAt = 0.0;
     Vector2D       usedAt{};
+    // F3's room check, repainted 4 x a second.
+    std::shared_ptr<const Overlay::SImage> check;
+    double         checkAt = -10.0;
+    float          checkScale = 0.0f;
     // For the status file.
     int         markKind = 0;
     std::string labelName;
@@ -5153,7 +5157,6 @@ static void update3D(float dt) {
     // Frame rate for the F3 HUD: slow exponential average over dt.
     if (dt > 0.0f)
         g_debugFps = g_debugFps * 0.9f + (1.0f / dt) * 0.1f;
-    g_scene.setDebugFps(g_debugFps);
 
     // Window alpha keepalive lives on the FS pump (damageWindowsWithLiveAlpha)
     // -- it must tick even when a frame is slow.
@@ -6706,7 +6709,7 @@ static std::string labelKeyOf(const Overlay::SLabel& l, float scale) {
 // its pointer is. It rings once when the window is in front, and on the
 // first move after 2 s still; Super+F's hint pill fades out after 3 s and
 // comes back with the ring.
-static void pointerTick(float scale) {
+static std::vector<GLScene::SOverlaySprite> pointerTick(float scale) {
     auto&        A   = g_aimOverlay;
     const double NOW = nowSeconds();
     const bool   SCREEN = g_read.id == g_use.id && g_read.screen;
@@ -6740,23 +6743,29 @@ static void pointerTick(float scale) {
     sprites.push_back({A.arrow, GLScene::EAnchor::Cursor, 0.0f, 1.0f});
     if (PILL > 0.0f)
         sprites.push_back({A.hints, GLScene::EAnchor::Bottom, -(44.0f + 52.0f) * scale, PILL});
-    g_scene.setOverlay(std::move(sprites));
     A.target    = "pointer:" + std::to_string(g_use.id);
     A.markKind  = -1;
     A.labelName = SCREEN ? "screen" : "";
     A.full = RING, A.folded = PILL;
+    return sprites;
 }
 
-// Every frame, after the aim and the drag moved: what the overlay shows.
-static void overlayTick() {
+// What the label calls a scene object: its label; a carryable one without
+// one goes by its name. Empty: scenery.
+static std::string objectLabel(size_t i) {
+    const auto& OBJ = g_sceneObjects[i];
+    if (!OBJ.label.empty() || !OBJ.dynamic)
+        return OBJ.label;
+    std::string n = OBJ.name;
+    if (!n.empty())
+        n[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(n[0])));
+    return n;
+}
+
+// The crosshair's mark and label for what the aim is on.
+static std::vector<GLScene::SOverlaySprite> aimTick(float SCALE) {
     using Overlay::EMark;
     using EStyle = Overlay::SLabel::EStyle;
-    const float SCALE = g_monitor ? static_cast<float>(g_monitor->m_scale) : 1.0f;
-    if (g_use.id) {
-        pointerTick(SCALE);
-        return;
-    }
-    g_aimOverlay.useId = 0;
 
     EMark                          mark   = EMark::Nothing;
     std::string                    target = "none";
@@ -6764,15 +6773,6 @@ static void overlayTick() {
     bool  wait = true, fold = true; // waits for the aim to rest 120 ms, folds after 2 s
     float labelDy = 26.0f, charge = 0.0f;
 
-    const auto objectLabel = [](size_t i) -> std::string {
-        const auto& OBJ = g_sceneObjects[i];
-        if (!OBJ.label.empty() || !OBJ.dynamic)
-            return OBJ.label;
-        std::string n = OBJ.name;
-        if (!n.empty())
-            n[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(n[0])));
-        return n;
-    };
     const Overlay::SKey CARRY{{"Super"}, "+ drag Carry"};
 
     if (g_gun) {
@@ -6909,11 +6909,77 @@ static void overlayTick() {
         sprites.push_back({g_aimOverlay.compact, GLScene::EAnchor::Center, 26.0f * SCALE, folded});
     if (g_gun)
         sprites.push_back({g_aimOverlay.pill, GLScene::EAnchor::Top, 48.0f * SCALE, 1.0f});
-    g_scene.setOverlay(std::move(sprites));
 
     g_aimOverlay.markKind  = static_cast<int>(mark);
     g_aimOverlay.labelName = label ? label->name : "";
     g_aimOverlay.full = full, g_aimOverlay.folded = folded;
+    return sprites;
+}
+
+// F3's room check: where the player is and looks, the frame rate, the map,
+// and what the crosshair hits how far away -- for checking the picking.
+// Repainted 4 x a second, with fixed digits, so the numbers do not jitter.
+static GLScene::SOverlaySprite roomCheckSprite(float scale) {
+    auto&        A   = g_aimOverlay;
+    const double NOW = nowSeconds();
+    if (!A.check || NOW - A.checkAt >= 0.25 || A.checkScale != scale) {
+        A.checkAt = NOW, A.checkScale = scale;
+        const auto& CAM = g_scene.camera();
+        const auto  F   = [](const char* fmt, auto... v) {
+            char buf[128];
+            std::snprintf(buf, sizeof(buf), fmt, v...);
+            return std::string(buf);
+        };
+        constexpr float DEG = 180.0f / std::numbers::pi_v<float>;
+        const float     YAW = std::fmod(std::fmod(CAM.yaw * DEG, 360.0f) + 360.0f, 360.0f);
+        const auto      MAP = g_scene.mapStats();
+        const auto      HIT = firstAlongAim();
+        std::string     aim = "nothing";
+        switch (HIT.kind) {
+            case SAimHit::EKind::Surface: {
+                const auto T = targetFromHit(HIT.id);
+                aim = T.window ? windowName(T.window) : T.layer ? T.layer->m_namespace : "a surface";
+                break;
+            }
+            case SAimHit::EKind::Object:
+                aim = objectLabel(HIT.index).empty() ? g_sceneObjects[HIT.index].name : objectLabel(HIT.index);
+                break;
+            case SAimHit::EKind::Portal: aim = g_portals[HIT.index].spec.name; break;
+            case SAimHit::EKind::None: break;
+        }
+        Overlay::SRoomCheck C;
+        // The world by its scenery: the first static object without a label
+        // (the lua table has no order, so not simply the first object).
+        for (const auto& OBJ : g_sceneObjects)
+            if (!OBJ.dynamic && OBJ.label.empty()) {
+                C.world = OBJ.name;
+                break;
+            }
+        C.rows  = {
+            {"Position", F("x %6.2f  y %5.2f  z %6.2f", CAM.position.x, CAM.position.y, CAM.position.z)},
+            {"View", F("yaw %5.1f\u00b0  pitch %5.1f\u00b0", YAW, CAM.pitch * DEG)},
+            {"Frame rate", F("%3.0f fps  %4.1f ms", g_debugFps, g_debugFps > 0.0f ? 1000.0f / g_debugFps : 0.0f)},
+            {"Map", F("%zu/%zu objects  %zu tris", MAP.loaded, MAP.total, MAP.triangles)},
+            {"Aim", HIT.kind == SAimHit::EKind::None ? aim : aim + F("  %.2f m", HIT.t)},
+        };
+        A.check = std::make_shared<const Overlay::SImage>(Overlay::paintRoomCheck(C, scale));
+    }
+    return {A.check, GLScene::EAnchor::TopLeft, 96.0f * scale, 1.0f, 96.0f * scale};
+}
+
+// Every frame, after the aim and the drag moved: what the overlay shows.
+static void overlayTick() {
+    const float SCALE = g_monitor ? static_cast<float>(g_monitor->m_scale) : 1.0f;
+    std::vector<GLScene::SOverlaySprite> sprites;
+    if (g_use.id)
+        sprites = pointerTick(SCALE);
+    else {
+        g_aimOverlay.useId = 0;
+        sprites = aimTick(SCALE);
+    }
+    if (g_debugHud)
+        sprites.push_back(roomCheckSprite(SCALE));
+    g_scene.setOverlay(std::move(sprites));
 }
 
 static void onMouseButton(
@@ -7374,7 +7440,6 @@ static void onKeyboardKeyRoom(
     if (PRESSED && SYM == XKB_KEY_F3) {
         g_debugHud = !g_debugHud;
         g_scene.setMapDebugCollisions(g_debugHud);
-        g_scene.setDebugOverlay(g_debugHud);
 
         info.cancelled = true;
         damageCurrentMonitor();

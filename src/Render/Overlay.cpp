@@ -1,6 +1,7 @@
 #include "Overlay.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <numbers>
 
@@ -31,7 +32,10 @@ namespace Overlay {
         constexpr SRGBA TEXT     = hex(0xeef2f5);
         constexpr SRGBA ERROR    = hex(0xff8a7a);
         constexpr SRGBA UI       = hex(0x5cb8e6);
+        constexpr SRGBA LABEL    = hex(0x8a959e);
+        constexpr SRGBA VALUE    = hex(0xd7dde2);
         constexpr const char* SANS = "Manrope";
+        constexpr const char* MONO = "JetBrains Mono";
 
         void source(cairo_t* cr, const SRGBA& c, double alpha = 1.0) {
             cairo_set_source_rgba(cr, c.r, c.g, c.b, c.a * alpha);
@@ -77,7 +81,7 @@ namespace Overlay {
         }
 
         SText text(const std::string& str, int weight, double px, const SRGBA& color, double scale,
-                   const char* family = SANS, double maxWidth = 0) {
+                   const char* family = SANS, double maxWidth = 0, double tracking = 0) {
             SText T;
             T.color  = color;
             T.layout = pango_cairo_create_layout(scratch());
@@ -94,6 +98,12 @@ namespace Overlay {
             pango_layout_set_font_description(T.layout, FD);
             pango_font_description_free(FD);
             pango_layout_set_text(T.layout, str.c_str(), -1);
+            if (tracking > 0) {
+                auto* ATTRS = pango_attr_list_new();
+                pango_attr_list_insert(ATTRS, pango_attr_letter_spacing_new(static_cast<int>(tracking * scale * PANGO_SCALE)));
+                pango_layout_set_attributes(T.layout, ATTRS);
+                pango_attr_list_unref(ATTRS);
+            }
             if (maxWidth > 0) {
                 pango_layout_set_width(T.layout, static_cast<int>(maxWidth * scale * PANGO_SCALE));
                 pango_layout_set_ellipsize(T.layout, PANGO_ELLIPSIZE_END);
@@ -266,7 +276,27 @@ namespace Overlay {
             return {70 * s, std::max(2.0, 46 * s), 70 * s, 94 * s};
         }
 
+        std::vector<float> paintFloatShadow(int W, int H, double x, double y, double w, double h, double r, double s);
+
+        // The shadow depends on the box alone, and F3's panel repaints 4 x a
+        // second at one size: the last few are kept.
         std::vector<float> floatShadow(int W, int H, double x, double y, double w, double h, double r, double s) {
+            struct SEntry {
+                std::array<double, 8> key;
+                std::vector<float>    a;
+            };
+            static std::vector<SEntry> cache;
+            const std::array<double, 8> KEY = {double(W), double(H), x, y, w, h, r, s};
+            for (const auto& E : cache)
+                if (E.key == KEY)
+                    return E.a;
+            if (cache.size() >= 6)
+                cache.erase(cache.begin());
+            cache.push_back({KEY, paintFloatShadow(W, H, x, y, w, h, r, s)});
+            return cache.back().a;
+        }
+
+        std::vector<float> paintFloatShadow(int W, int H, double x, double y, double w, double h, double r, double s) {
             auto* S  = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, W, H);
             auto* CR = cairo_create(S);
             roundRect(CR, x, y + 24 * s, w, h, r);
@@ -689,6 +719,75 @@ namespace Overlay {
         auto I = finish(S, &GLOW, {UI.r, UI.g, UI.b, 0.35}, 1.0);
         cairo_surface_destroy(S);
         I.ax = I.ay = static_cast<float>(C);
+        return I;
+    }
+    SImage paintRoomCheck(const SRoomCheck& check, float scale) {
+        const double s = std::max(0.5f, scale);
+        const double PW = 400 * s, PADX = 24 * s, PADY = 22 * s, GAP = 18 * s, COL = 108 * s, ROWGAP = 12 * s;
+        SText        head  = text("ROOM CHECK", 800, 14, UI, s, SANS, 0, 14 * 0.08);
+        SText        world = text(check.world, 400, 13, LABEL, s, MONO, 160);
+        std::vector<std::pair<SText, SText>> rows;
+        for (const auto& [L, V] : check.rows)
+            rows.emplace_back(text(L, 700, 15, LABEL, s), text(V, 500, 15, VALUE, s, MONO, (400 - 48 - 108)));
+        SText collision = text("Collision", 600, 15, SUB, s), body = text("Your body", 600, 15, SUB, s);
+        SText cap = text("F3", CAP.weight, CAP.px, CODE, s), hide = text("Hide", 700, 15, HINT, s);
+
+        double rowsH = 0;
+        for (const auto& [L, V] : rows)
+            rowsH += std::max(L.h, V.h);
+        rowsH += ROWGAP * std::max<double>(0, rows.size() - 1.0);
+        const double HEAD_H = std::max(head.h, world.h), LEGEND_H = std::max(collision.h, body.h);
+        const double PH = std::ceil(PADY * 2 + HEAD_H + GAP + rowsH + GAP + s + GAP + LEGEND_H + GAP + CAP.h * s);
+        const double R  = 22 * s;
+
+        const SMargins M  = floatMargins(s);
+        const int      W  = static_cast<int>(std::ceil(PW + M.l + M.r)), H = static_cast<int>(std::ceil(PH + M.t + M.b));
+        auto*          S  = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, W, H);
+        auto*          CR = cairo_create(S);
+        const double   X0 = std::round(M.l), Y0 = std::round(M.t);
+        drawPanel(CR, X0, Y0, PW, PH, R, s);
+
+        double       y = Y0 + PADY;
+        const double X = X0 + PADX;
+        // The header: a dot, ROOM CHECK, and the world on the right.
+        cairo_arc(CR, X + 4 * s, y + HEAD_H / 2, 4 * s, 0, 2 * std::numbers::pi);
+        source(CR, UI);
+        cairo_fill(CR);
+        draw(CR, head, X + 18 * s, y + (HEAD_H - head.h) / 2);
+        draw(CR, world, X0 + PW - PADX - world.w, y + (HEAD_H - world.h) / 2);
+        y += HEAD_H + GAP;
+        // The rows on their baselines.
+        for (const auto& [L, V] : rows) {
+            const double ASC = std::max(L.baseline, V.baseline);
+            draw(CR, L, X, y + ASC - L.baseline);
+            draw(CR, V, X + COL, y + ASC - V.baseline);
+            y += std::max(L.h, V.h) + ROWGAP;
+        }
+        y += GAP - ROWGAP;
+        cairo_rectangle(CR, X, y, PW - 2 * PADX, s);
+        source(CR, LINE);
+        cairo_fill(CR);
+        y += s + GAP;
+        // The legend: the colours F3 draws -- the collision triangles
+        // (MapModel's debug shader) and the player's capsule.
+        double x = X;
+        for (const auto& [T, C] : {std::pair<const SText*, SRGBA>{&collision, {1.0, 0.1, 0.1, 1.0}}, {&body, {0.2, 1.0, 0.3, 1.0}}}) {
+            roundRect(CR, x, y + LEGEND_H / 2 - 1.5 * s, 18 * s, 3 * s, 2 * s);
+            source(CR, C);
+            cairo_fill(CR);
+            draw(CR, *T, x + 26 * s, y + (LEGEND_H - T->h) / 2);
+            x += 26 * s + T->w + 24 * s;
+        }
+        y += LEGEND_H + GAP;
+        drawCap(CR, cap, X, y, CAP, s);
+        draw(CR, hide, X + capWidth(cap, CAP, s) + 12 * s, y + (CAP.h * s - hide.h) / 2);
+        cairo_destroy(CR);
+
+        auto A = floatShadow(W, H, X0, Y0, PW, PH, R, s);
+        auto I = finish(S, &A, {0, 0, 0, 0.5}, 1.0);
+        cairo_surface_destroy(S);
+        I.ax = static_cast<float>(X0);
+        I.ay = static_cast<float>(Y0);
         return I;
     }
 }

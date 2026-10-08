@@ -206,7 +206,7 @@ they change, for a menu to show.
 | Super + Mouse wheel click     | rotate window                                  |
 | Super + Mouse wheel scrolling | Zoom window                                    |
 | Super + Left Alt              | Toggle keyboard mode (movement / window input) |
-| F3                            | Toggle debug HUD                               |
+| F3                            | Room check: position, view, frame rate, map, what the crosshair hits how far; the collision triangles and your body drawn |
 | F1                            | The room's menu (config `menu.command`)        |
 | F2                            | Read: the aimed window comes to you at 1:1, again sends it back |
 | F4                            | Cinema: the aimed window as big as the view, the room dark around it; again sends it back |

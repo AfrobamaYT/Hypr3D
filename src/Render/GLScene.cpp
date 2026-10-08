@@ -1,6 +1,5 @@
 #include "GLScene.hpp"
 
-#include "../../third_party/font8x8_basic.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -2150,6 +2149,8 @@ void GLScene::drawOverlay(int width, int height) {
         float atX = width / 2.0f, atY = height / 2.0f;
         if (S.anchor == EAnchor::Top)
             atY = 0.0f;
+        else if (S.anchor == EAnchor::TopLeft)
+            atX = atY = 0.0f;
         else if (S.anchor == EAnchor::Bottom)
             atY = static_cast<float>(height);
         else if (S.anchor == EAnchor::Cursor) {
@@ -2212,147 +2213,6 @@ const unsigned char* GLScene::probeRGBA() const {
     return m_probe;
 }
 
-    // F3 HUD text: a streaming quad per set font bit, screen-space ortho.
-// font8x8 is public domain (daniel hepper / marcel sondaar).
-void GLScene::drawDebugOverlay(int width, int height) {
-    if (!m_debugOverlay)
-        return;
-
-    // The HUD must land in the scene texture or the composite never picks
-    // it up. Save and restore whatever framebuffer was current.
-    GLint oldFBO = 0, oldViewport[4] = {0, 0, 0, 0};
-    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &oldFBO);
-    glGetIntegerv(GL_VIEWPORT, oldViewport);
-
-    glBindFramebuffer(GL_FRAMEBUFFER, m_sceneFBO);
-    glViewport(0, 0, width, height);
-
-    // The lines: coordinates, view angles, fps, map size.
-    const auto& CAM = m_camera;
-    char line0[96], line1[96], line2[96], line3[96];
-    snprintf(line0, sizeof(line0), "XYZ %.2f %.2f %.2f",
-             CAM.position.x, CAM.position.y, CAM.position.z);
-    snprintf(line1, sizeof(line1), "YAW %.1f  PIT %.1f",
-             CAM.yaw * 180.0f / 3.14159265f, CAM.pitch * 180.0f / 3.14159265f);
-    snprintf(line2, sizeof(line2), "FPS %.0f", m_debugFps);
-    size_t tris = 0;
-    size_t loaded = 0;
-    for (const auto& S : m_slots)
-        if (S.model && S.model->loaded()) {
-            ++loaded;
-            tris += S.model->triangles().size();
-        }
-
-    snprintf(line3, sizeof(line3), "MAP %zu/%zu objects %zu tris",
-             loaded, m_slots.size(), tris);
-
-    const char* LINES[4] = {line0, line1, line2, line3};
-
-    constexpr float GLYPH = 8.0f;
-    constexpr float SCALE = 2.0f;   // 16 px tall text
-    constexpr float LINE  = GLYPH * SCALE + 4.0f;
-
-    std::vector<float> verts;
-    verts.reserve(64 * 1024);
-
-    // pos(3) + uv(2) -- the SCENE program's layout, so the text rides the
-    // same shader that already renders the floor and windows. A dedicated
-    // mini-program rendered nothing on real GLES; the scene program is the
-    // one path guaranteed to work.
-    const auto QUAD = [&](float l, float t, float r, float b) {
-        verts.insert(verts.end(), {
-            l, t, 0, 0, 0,  r, t, 0, 0, 0,  l, b, 0, 0, 0,
-            l, b, 0, 0, 0,  r, t, 0, 0, 0,  r, b, 0, 0, 0,
-        });
-    };
-
-    const auto EMIT_TEXT = [&](float x, float y) {
-        for (int li = 0; li < 4; ++li) {
-            float cx = x;
-            for (const char* P = LINES[li]; *P; ++P) {
-                const auto ROWS = font8x8_basic[static_cast<unsigned char>(*P)];
-                for (int row = 0; row < 8; ++row) {
-                    const unsigned BITS = ROWS[row];
-                    if (!BITS)
-                        continue;
-                    for (int col = 0; col < 8; ++col) {
-                        if (!(BITS & (1u << col)))
-                            continue;
-                        QUAD(cx + col * SCALE, y + li * LINE + row * SCALE,
-                             cx + col * SCALE + SCALE,
-                             y + li * LINE + row * SCALE + SCALE);
-                    }
-                }
-                cx += GLYPH * SCALE;
-            }
-        }
-    };
-
-    // Shadow text (offset +2,+2) then white -- readable without a bar.
-    EMIT_TEXT(10.0f, 12.0f);
-    const size_t SHADOW_VERTS = verts.size() / 5;
-    EMIT_TEXT(8.0f, 10.0f);
-
-    if (verts.empty())
-        return;
-
-    if (!m_textVAO) {
-        glGenVertexArrays(1, &m_textVAO);
-        glGenBuffers(1, &m_textVBO);
-        glBindVertexArray(m_textVAO);
-        glBindBuffer(GL_ARRAY_BUFFER, m_textVBO);
-        glEnableVertexAttribArray(0);
-        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float),
-                              reinterpret_cast<void*>(0));
-        glEnableVertexAttribArray(1);
-        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float),
-                              reinterpret_cast<void*>(3 * sizeof(float)));
-        glBindVertexArray(0);
-        glBindBuffer(GL_ARRAY_BUFFER, 0);
-    }
-
-    glBindVertexArray(m_textVAO);
-    glBindBuffer(GL_ARRAY_BUFFER, m_textVBO);
-    glBufferData(GL_ARRAY_BUFFER,
-                 static_cast<GLsizeiptr>(verts.size() * sizeof(float)),
-                 verts.data(), GL_DYNAMIC_DRAW);
-
-    // Pixel coords -> NDC, y down. The negative y scale mirrors winding,
-    // so face culling stays off for this pass.
-    const Mat4 ORTHO = Mat4::translation(Vec3{-1.f, 1.f, 0.f}) *
-        Mat4::scale(Vec3{2.0f / width, -2.0f / height, 1.0f});
-
-    glUseProgram(m_sceneProgram);
-    glUniformMatrix4fv(m_sceneMVP, 1, GL_FALSE, ORTHO.m.data());
-    glUniform4f(m_sceneUVRect, 0.f, 0.f, 1.f, 1.f);
-    glUniform1i(m_sceneTextured, 0);
-
-    glDisable(GL_DEPTH_TEST);
-    glDepthMask(GL_FALSE);
-    glEnable(GL_BLEND);
-    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
-    glDisable(GL_CULL_FACE);
-
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float),
-                          reinterpret_cast<void*>(0));
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float),
-                          reinterpret_cast<void*>(3 * sizeof(float)));
-
-    glUniform4f(m_sceneColorUniform, 0.f, 0.f, 0.f, 0.9f);
-    glDrawArrays(GL_TRIANGLES, 0, static_cast<GLint>(SHADOW_VERTS));
-
-    glUniform4f(m_sceneColorUniform, 1.f, 1.f, 1.f, 1.f);
-    glDrawArrays(GL_TRIANGLES, static_cast<GLint>(SHADOW_VERTS),
-                 static_cast<GLint>(verts.size() / 5 - SHADOW_VERTS));
-
-    glBindVertexArray(0);
-    glBindBuffer(GL_ARRAY_BUFFER, 0);
-    glDepthMask(GL_TRUE);
-    glEnable(GL_DEPTH_TEST);
-
-    glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(oldFBO));
-    glViewport(oldViewport[0], oldViewport[1], oldViewport[2], oldViewport[3]);
-}
 void GLScene::drawRoom(const Mat4& vp, const ViewWindow& view,
                        const std::vector<WindowRender>& windows, float dt,
                        bool primary, bool sight) {
@@ -2958,10 +2818,6 @@ bool GLScene::render(
     if (primary)
         m_lastVP = vp;
 
-    // F3 HUD: always on top of the scene, never part of the 3D pass state.
-    if (primary)
-        drawDebugOverlay(width, height);
-
     // Read back one pixel of the offscreen scene while it is still bound. A
     // floor point in the lower half of the screen, where ground and sky are
     // both opaque by construction: alpha below 255 here means the composite
@@ -3206,14 +3062,6 @@ void GLScene::destroyGLObjects() {
         glDeleteRenderbuffers(1, &m_sightColor);
         glDeleteFramebuffers(1, &m_sightFBO);
         m_sightFBO = m_sightColor = m_sightDepth = 0;
-    }
-    if (m_textVBO) {
-        glDeleteBuffers(1, &m_textVBO);
-        m_textVBO = 0;
-    }
-    if (m_textVAO) {
-        glDeleteVertexArrays(1, &m_textVAO);
-        m_textVAO = 0;
     }
     if (m_fullscreenVBO) {
         glDeleteBuffers(1, &m_fullscreenVBO);

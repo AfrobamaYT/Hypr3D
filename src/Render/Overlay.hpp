@@ -49,6 +49,7 @@ namespace Overlay {
             Compact, // the name only (after 2 s on the same target)
             Alert,   // name in red, the note under it
             Quiet,   // one line of grey text, no shadow
+            Toast,   // a note at the top: a heading, a line under it
         };
         EStyle            style = EStyle::Full;
         std::string       name, note;

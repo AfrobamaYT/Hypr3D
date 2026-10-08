@@ -2794,6 +2794,10 @@ struct SAimOverlay {
     bool           waitArrive = false; // Super+F's screen: ring once it is in front
     double         ringAt = -10.0, pillAt = -10.0, movedAt = 0.0;
     Vector2D       usedAt{};
+    // The bin's note when an app refused to close (applyTrash).
+    double         toastAt = -10.0;
+    std::shared_ptr<const Overlay::SImage> toast;
+    float          toastScale = 0.0f;
     // F3's room check, repainted 4 x a second.
     std::shared_ptr<const Overlay::SImage> check;
     double         checkAt = -10.0;
@@ -2995,9 +2999,7 @@ static bool applyTrash(STrashed& T, const CBox& BOX, World3D::SEntity& E) {
         if (T.asked && std::chrono::duration<float>(NOW - T.askedAt).count() > kTrashGrace) {
             T.refused = true;
             T.refusedAt = NOW;
-            if (const auto W = Compat::findWindowById(T.id))
-                notify("[hypr3d] " + W->m_title + " is still open -- it has unsaved work. Save in the window, then carry it to the bin again.",
-                       CHyprColor{1.0f, 0.6f, 0.2f, 1.0f});
+            g_aimOverlay.toastAt = nowSeconds(); // the note says why (overlayTick)
         }
         return true;
     }
@@ -6979,6 +6981,25 @@ static void overlayTick() {
     }
     if (g_debugHud)
         sprites.push_back(roomCheckSprite(SCALE));
+
+    // The bin's note, as the ball hops back out: it fades in over 220 ms
+    // sliding 12 px down, stays, and fades out after 2.4 s.
+    auto&        A = g_aimOverlay;
+    const double T = nowSeconds() - A.toastAt;
+    if (T >= 0.0 && T < 2.64) {
+        if (!A.toast || A.toastScale != SCALE) {
+            A.toastScale = SCALE;
+            A.toast      = std::make_shared<const Overlay::SImage>(Overlay::paintLabel(
+                {Overlay::SLabel::EStyle::Toast, "Still open \u2014 it has unsaved work",
+                      "Save in the window, then carry it to the bin again."},
+                SCALE));
+        }
+        const auto  CL    = [](double x) { return static_cast<float>(std::clamp(x, 0.0, 1.0)); };
+        const float ALPHA = larchEase(ELarchEase::Fade, CL(T / 0.22)) * (1.0f - larchEase(ELarchEase::Fade, CL((T - 2.42) / 0.22)));
+        const float SLIDE = -12.0f * (1.0f - larchEase(ELarchEase::Move, CL(T / 0.46)));
+        sprites.push_back({A.toast, GLScene::EAnchor::Top, (48.0f + SLIDE) * SCALE, ALPHA});
+        g_aimLabelBusy = true;
+    }
     g_scene.setOverlay(std::move(sprites));
 }
 

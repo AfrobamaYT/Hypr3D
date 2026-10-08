@@ -406,6 +406,36 @@ static Vec3 g_playerSpawn{0.0f, 0.0f, 0.0f};
 // Walking physics state (grounded comes from the Jolt body's ground ray).
 static bool g_grounded = false;
 
+// The room's settings as they are, for a menu to show: flying, gravity and the
+// HUD, one "key=value" per line in the Hyprland instance's directory
+// ($XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/hypr3d-state). Written
+// when they change -- Space twice changes flying without anyone asking, and
+// Larch's menu said "Walk" while the player flew. Replaced whole, never read
+// half written.
+static void writeRoomState() {
+    static std::string s_last;
+    const char* RUNTIME = std::getenv("XDG_RUNTIME_DIR");
+    const char* SIG     = std::getenv("HYPRLAND_INSTANCE_SIGNATURE");
+    if (!RUNTIME || !SIG)
+        return;
+    std::ostringstream out;
+    out << "flying=" << (g_playerFlying ? 1 : 0) << "\ngravity=" << g_cfgGravity << "\nhud=" << (g_cfgHud ? 1 : 0) << "\n";
+    const std::string TEXT = out.str();
+    if (TEXT == s_last)
+        return;
+    const std::string PATH = std::string(RUNTIME) + "/hypr/" + SIG + "/hypr3d-state";
+    {
+        std::ofstream f(PATH + ".part", std::ios::trunc);
+        if (!f)
+            return;
+        f << TEXT;
+    }
+    std::error_code ec;
+    std::filesystem::rename(PATH + ".part", PATH, ec);
+    if (!ec)
+        s_last = TEXT;
+}
+
 // --- scene: unlimited named glTF objects ------------------------------------
 struct SSceneObjectCfg {
     std::string name; // the lua table key ("scene.<name>")
@@ -6879,6 +6909,7 @@ static void onKeyboardKeyRoom(
             // The second press of a double tap toggles flight; flying starts
             // hovering where it is, walking falls from there.
             g_playerFlying = !g_playerFlying;
+            writeRoomState();
             s_lastSpacePressAt = s_jumpPressedAt = -1.0;
             s_jumpRising = false;
             s_moveVel.y = 0.0f;
@@ -7738,6 +7769,7 @@ static int luaConfig(lua_State* L) {
         g_scene.player()->setAnimSpeed(static_cast<CPlayerModel::EState>(slot),
                                        g_playerAnimSpeed[slot]);
 
+    writeRoomState();
     return 0;
 }
 

@@ -201,6 +201,20 @@ void restoreWindowLayout(SWindowLayoutSave& save) {
     if (!WINDOW || !WINDOW->m_target)
         return;
 
+    // A window that unmapped while the room was open -- hidden by its app,
+    // as Steam hides its small windows, or fading out after a close -- is
+    // alive without a workspace. Hyprland's assignToSpace moves a window
+    // from its workspace and looked at the missing one: SIGSEGV in
+    // CWorkspace::isVisible, the owner's Hyprland in safe mode (2026-10-08
+    // 23:52, a 147x198 Steam window; reproduced with span/unmap-crash.sh).
+    // It only leaves the room's ghost; mapped again, Hyprland lays it out
+    // as any window it maps.
+    if (!WINDOW->m_workspace) {
+        WINDOW->m_target->assignToSpace(nullptr);
+        WINDOW->m_target->setFloating(save.wasFloating);
+        return;
+    }
+
     // Put the target back into its space while it is still floating. For a
     // window that was floating before 3D, retain the real box produced by the
     // 3D resize. Tiled windows deliberately return to their original layout.

@@ -2787,6 +2787,13 @@ struct SAimOverlay {
     double      since = 0.0; // nowSeconds() of that change
     std::string markKey, labelKey, compactKey, pillKey;
     std::shared_ptr<const Overlay::SImage> mark, label, compact, pill;
+    // A window in use: its pointer, the ring, Super+F's hint pill.
+    std::string    pointerKey;
+    std::shared_ptr<const Overlay::SImage> arrow, ring, hints;
+    std::uintptr_t useId = 0;
+    bool           waitArrive = false; // Super+F's screen: ring once it is in front
+    double         ringAt = -10.0, pillAt = -10.0, movedAt = 0.0;
+    Vector2D       usedAt{};
     // For the status file.
     int         markKind = 0;
     std::string labelName;
@@ -6695,11 +6702,61 @@ static std::string labelKeyOf(const Overlay::SLabel& l, float scale) {
     return k;
 }
 
+// A window in use (F8, Super+F's screen, the F1 menu): Larch's pointer where
+// its pointer is. It rings once when the window is in front, and on the
+// first move after 2 s still; Super+F's hint pill fades out after 3 s and
+// comes back with the ring.
+static void pointerTick(float scale) {
+    auto&        A   = g_aimOverlay;
+    const double NOW = nowSeconds();
+    const bool   SCREEN = g_read.id == g_use.id && g_read.screen;
+    if (A.useId != g_use.id) {
+        A.useId = g_use.id, A.usedAt = g_use.local, A.movedAt = NOW;
+        A.waitArrive = SCREEN && !g_read.arrived;
+        if (!A.waitArrive)
+            A.ringAt = A.pillAt = NOW;
+    } else if (A.waitArrive && g_read.arrived) {
+        A.waitArrive = false;
+        A.ringAt = A.pillAt = NOW;
+    } else if (g_use.local != A.usedAt) {
+        if (NOW - A.movedAt >= 2.0)
+            A.ringAt = A.pillAt = NOW;
+        A.usedAt = g_use.local, A.movedAt = NOW;
+    }
+    if (A.pointerKey != std::to_string(scale)) {
+        A.pointerKey = std::to_string(scale);
+        A.arrow      = std::make_shared<const Overlay::SImage>(Overlay::paintArrow(scale));
+        A.ring       = std::make_shared<const Overlay::SImage>(Overlay::paintPointerRing(scale));
+        A.hints      = std::make_shared<const Overlay::SImage>(Overlay::paintHintPill({{{"Super", "F"}, "Back to the room"}}, scale));
+    }
+    const auto  FADE = [](double x) { return larchEase(ELarchEase::Fade, static_cast<float>(std::clamp(x, 0.0, 1.0))); };
+    const float RING = A.waitArrive ? 0.0f : 1.0f - FADE((NOW - A.ringAt) / 0.46);
+    const float PILL = SCREEN && !A.waitArrive ? FADE((NOW - A.pillAt) / 0.22) * (1.0f - FADE((NOW - A.pillAt - 3.0) / 0.22)) : 0.0f;
+    g_aimLabelBusy = A.waitArrive || NOW - A.ringAt < 0.46 || (SCREEN && NOW - A.pillAt < 3.22);
+
+    std::vector<GLScene::SOverlaySprite> sprites;
+    if (RING > 0.0f)
+        sprites.push_back({A.ring, GLScene::EAnchor::Cursor, 0.0f, RING});
+    sprites.push_back({A.arrow, GLScene::EAnchor::Cursor, 0.0f, 1.0f});
+    if (PILL > 0.0f)
+        sprites.push_back({A.hints, GLScene::EAnchor::Bottom, -(44.0f + 52.0f) * scale, PILL});
+    g_scene.setOverlay(std::move(sprites));
+    A.target    = "pointer:" + std::to_string(g_use.id);
+    A.markKind  = -1;
+    A.labelName = SCREEN ? "screen" : "";
+    A.full = RING, A.folded = PILL;
+}
+
 // Every frame, after the aim and the drag moved: what the overlay shows.
 static void overlayTick() {
     using Overlay::EMark;
     using EStyle = Overlay::SLabel::EStyle;
     const float SCALE = g_monitor ? static_cast<float>(g_monitor->m_scale) : 1.0f;
+    if (g_use.id) {
+        pointerTick(SCALE);
+        return;
+    }
+    g_aimOverlay.useId = 0;
 
     EMark                          mark   = EMark::Nothing;
     std::string                    target = "none";
@@ -6845,13 +6902,13 @@ static void overlayTick() {
     g_aimLabelBusy = label && T < (fold ? 2.25f : wait ? 0.37f : 0.25f);
 
     std::vector<GLScene::SOverlaySprite> sprites;
-    sprites.push_back({g_aimOverlay.mark, false, 0.0f, 1.0f});
+    sprites.push_back({g_aimOverlay.mark, GLScene::EAnchor::Center, 0.0f, 1.0f});
     if (full > 0.0f)
-        sprites.push_back({g_aimOverlay.label, false, labelDy * SCALE, full});
+        sprites.push_back({g_aimOverlay.label, GLScene::EAnchor::Center, labelDy * SCALE, full});
     if (folded > 0.0f)
-        sprites.push_back({g_aimOverlay.compact, false, 26.0f * SCALE, folded});
+        sprites.push_back({g_aimOverlay.compact, GLScene::EAnchor::Center, 26.0f * SCALE, folded});
     if (g_gun)
-        sprites.push_back({g_aimOverlay.pill, true, 48.0f * SCALE, 1.0f});
+        sprites.push_back({g_aimOverlay.pill, GLScene::EAnchor::Top, 48.0f * SCALE, 1.0f});
     g_scene.setOverlay(std::move(sprites));
 
     g_aimOverlay.markKind  = static_cast<int>(mark);

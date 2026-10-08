@@ -60,4 +60,12 @@ namespace Overlay {
 
     // The process gun's mode pill, 48 px from the top while F7 is on.
     SImage paintGunPill(float scale);
+
+    // A pill of key hints, as at the bottom of Super+F's screen.
+    SImage paintHintPill(const std::vector<SKey>& keys, float scale);
+
+    // The pointer of a window in use: Larch's arrow, its anchor the tip; and
+    // the ring that shows where it is, its anchor the centre.
+    SImage paintArrow(float scale);
+    SImage paintPointerRing(float scale);
 }

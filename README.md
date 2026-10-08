@@ -178,6 +178,12 @@ says that letting go closes it. With the process gun (F7) the mark is a red
 cross, the label adds the process number, and a pill at the top says the gun
 is out.
 
+A window in use -- Super+F's screen, the F1 menu, F8 -- shows Larch's arrow
+where its pointer is. A blue ring shows where it is when the window comes in
+front, and again on the first move after 2 s still. On Super+F's screen a
+pill at the bottom says how to get back; it fades out after 3 s and comes
+back with the ring.
+
 ### The room's state
 
 The plugin writes flying, gravity and the HUD as `key=value` lines to

@@ -577,4 +577,118 @@ namespace Overlay {
         I.ay = static_cast<float>(Y0);
         return I;
     }
+    SImage paintHintPill(const std::vector<SKey>& keys, float scale) {
+        const double s = std::max(0.5f, scale);
+        struct SGroup {
+            std::vector<SText> caps;
+            SText              label;
+            double             w = 0;
+        };
+        std::vector<SGroup> groups;
+        double              inner = 0;
+        for (const auto& K : keys) {
+            SGroup G;
+            for (const auto& C : K.caps) {
+                G.caps.push_back(text(C, CAP.weight, CAP.px, CODE, s));
+                G.w += capWidth(G.caps.back(), CAP, s) + 8 * s;
+            }
+            G.label = text(K.label, 700, 15, HINT, s);
+            G.w += 4 * s + G.label.w;
+            inner += G.w + (groups.empty() ? 0 : 30 * s);
+            groups.push_back(std::move(G));
+        }
+        const double   PW = std::ceil(inner + 40 * s), PH = 52 * s, R = 22 * s;
+        const SMargins M  = floatMargins(s);
+        const int      W = static_cast<int>(std::ceil(PW + M.l + M.r)), H = static_cast<int>(std::ceil(PH + M.t + M.b));
+        auto*          S  = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, W, H);
+        auto*          CR = cairo_create(S);
+        const double   X0 = std::round(M.l), Y0 = std::round(M.t);
+        drawPanel(CR, X0, Y0, PW, PH, R, s);
+        const double MID = Y0 + PH / 2;
+        double       x   = X0 + 20 * s;
+        for (const auto& G : groups) {
+            for (const auto& C : G.caps) {
+                drawCap(CR, C, x, MID - CAP.h * s / 2, CAP, s);
+                x += capWidth(C, CAP, s) + 8 * s;
+            }
+            x += 4 * s;
+            draw(CR, G.label, x, MID - G.label.h / 2);
+            x += G.label.w + 30 * s;
+        }
+        cairo_destroy(CR);
+        auto A = floatShadow(W, H, X0, Y0, PW, PH, R, s);
+        auto I = finish(S, &A, {0, 0, 0, 0.5}, 1.0);
+        cairo_surface_destroy(S);
+        I.ax = static_cast<float>(X0 + PW / 2);
+        I.ay = static_cast<float>(Y0);
+        return I;
+    }
+
+    SImage paintArrow(float scale) {
+        // The draft's path, 22 x 30 at scale 1, white with a 1.6 px dark
+        // edge, so it reads on light and dark content; a shadow
+        // 0 2px 4px rgba(0,0,0,.5) under it.
+        const double s    = std::max(0.5f, scale);
+        const double PAD  = 8 * s;
+        const int    W    = static_cast<int>(std::ceil(22 * s + 2 * PAD)), H = static_cast<int>(std::ceil(30 * s + 2 * PAD));
+        auto*        S    = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, W, H);
+        auto*        CR   = cairo_create(S);
+        cairo_translate(CR, PAD, PAD);
+        cairo_scale(CR, s, s);
+        static constexpr double P[][2] = {{1.5, 1.5}, {1.5, 24}, {7.2, 18.6}, {11, 27.6}, {15, 25.9}, {11.3, 17.1}, {19, 17.1}};
+        cairo_move_to(CR, P[0][0], P[0][1]);
+        for (size_t i = 1; i < std::size(P); ++i)
+            cairo_line_to(CR, P[i][0], P[i][1]);
+        cairo_close_path(CR);
+        source(CR, TITLE);
+        cairo_fill_preserve(CR);
+        cairo_set_line_join(CR, CAIRO_LINE_JOIN_ROUND);
+        cairo_set_line_width(CR, 1.6);
+        cairo_set_source_rgb(CR, 8 / 255.0, 9 / 255.0, 10 / 255.0);
+        cairo_stroke(CR);
+        cairo_destroy(CR);
+        // The shadow: the arrow's alpha, 2 px down, a Gaussian of 2 px.
+        auto       A = alphaOf(S);
+        const auto SH = static_cast<int>(std::lround(2 * s));
+        for (int y = H - 1; y >= 0; --y)
+            for (int x = 0; x < W; ++x)
+                A[static_cast<size_t>(y) * W + x] = y >= SH ? A[static_cast<size_t>(y - SH) * W + x] : 0.f;
+        gaussian(A, W, H, 2 * s);
+        auto I = finish(S, &A, {0, 0, 0, 0.5}, 1.0);
+        cairo_surface_destroy(S);
+        I.ax = static_cast<float>(PAD + 1.5 * s);
+        I.ay = static_cast<float>(PAD + 1.5 * s);
+        return I;
+    }
+
+    SImage paintPointerRing(float scale) {
+        // 44 px: a 2 px line inside its edge, rgba(92,184,230,.55), and a
+        // glow 0 0 18px rgba(92,184,230,.35) outside it.
+        const double s    = std::max(0.5f, scale);
+        const int    SIZE = static_cast<int>(std::ceil((44 + 2 * 20) * s / 2)) * 2;
+        auto*        S    = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, SIZE, SIZE);
+        auto*        CR   = cairo_create(S);
+        const double C    = SIZE / 2.0, R = 22 * s;
+        cairo_arc(CR, C, C, R, 0, 2 * std::numbers::pi);
+        cairo_set_source_rgba(CR, 0, 0, 0, 1);
+        cairo_fill(CR);
+        auto GLOW = alphaOf(S);
+        gaussian(GLOW, SIZE, SIZE, 9 * s);
+        const auto DISC = alphaOf(S);
+        cairo_set_operator(CR, CAIRO_OPERATOR_SOURCE);
+        cairo_set_source_rgba(CR, 0, 0, 0, 0);
+        cairo_paint(CR);
+        cairo_set_operator(CR, CAIRO_OPERATOR_OVER);
+        cairo_arc(CR, C, C, R - s, 0, 2 * std::numbers::pi);
+        cairo_set_line_width(CR, 2 * s);
+        cairo_set_source_rgba(CR, UI.r, UI.g, UI.b, 0.55);
+        cairo_stroke(CR);
+        cairo_destroy(CR);
+        for (size_t i = 0; i < GLOW.size(); ++i)
+            GLOW[i] *= 1.0f - DISC[i];
+        auto I = finish(S, &GLOW, {UI.r, UI.g, UI.b, 0.35}, 1.0);
+        cairo_surface_destroy(S);
+        I.ax = I.ay = static_cast<float>(C);
+        return I;
+    }
 }

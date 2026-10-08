@@ -116,20 +116,26 @@ class GLScene {
     void reset();
     void shutdown();
 
-    // The pointer of a window being used (main's F8): the crosshair drawn at
-    // this world point instead of the centre.
+    // The pointer of a window being used (main's g_use): the world point
+    // that overlay sprites anchored at EAnchor::Cursor are drawn at.
     void setCursorPoint(const Vec3& at, bool on) {
         m_cursorAt = at, m_cursorOn = on;
     }
 
     // The crosshair overlay (main's, Overlay::): the mark, the label under
-    // it, the gun's pill, as screen sprites. While any is set it replaces
-    // the plain cross; a window in use keeps the arrow instead.
+    // it, the gun's pill, a window in use's pointer, as screen sprites.
+    enum class EAnchor : uint8_t {
+        Center, // the screen's centre: the crosshair
+        Top,    // the top middle
+        Bottom, // the bottom middle
+        Cursor, // the pointer of a window in use (setCursorPoint)
+    };
     struct SOverlaySprite {
         std::shared_ptr<const Overlay::SImage> image;
-        bool  top   = false; // anchored at the top middle, else at the centre
-        float dy    = 0.0f;  // px down from the anchor
-        float alpha = 1.0f;
+        EAnchor anchor = EAnchor::Center;
+        float   dy     = 0.0f; // px down from the anchor
+        float   alpha  = 1.0f;
+        float   dx     = 0.0f; // px right of the anchor
     };
     void setOverlay(std::vector<SOverlaySprite> sprites) {
         m_overlay = std::move(sprites);
@@ -417,7 +423,6 @@ class GLScene {
     unsigned int   m_dimVAO = 0, m_dimVBO = 0;
     void drawDim(float dim);
     void drawFullscreen(float alpha);
-    void drawCrosshair(int width, int height);
     void drawOverlay(int width, int height);
 
   private:
@@ -469,14 +474,12 @@ class GLScene {
     unsigned int m_fullscreenVAO = 0;
     unsigned int m_fullscreenVBO = 0;
 
-    unsigned int m_crosshairVAO = 0;
     bool         m_cursorOn = false;
     Vec3         m_cursorAt{};
     Mat4         m_lastVP{}; // the primary view's, for the cursor
     std::vector<SOverlaySprite>                  m_overlay;
     std::unordered_map<uint64_t, unsigned int>   m_overlayTex; // by SImage::serial
     unsigned int                                 m_overlayVAO = 0, m_overlayVBO = 0;
-    unsigned int m_crosshairVBO = 0;
 
     int m_sceneMVP = -1;
     int m_sceneTexture = -1;

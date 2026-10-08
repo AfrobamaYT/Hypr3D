@@ -909,33 +909,6 @@ bool GLScene::createMeshes() {
 
     glBindVertexArray(0);
 
-    // The pointer arrow of a window in use (drawCrosshair), screen space.
-    glGenVertexArrays(1, &m_crosshairVAO);
-    glGenBuffers(1, &m_crosshairVBO);
-
-    glBindVertexArray(m_crosshairVAO);
-    glBindBuffer(GL_ARRAY_BUFFER, m_crosshairVBO);
-
-    const std::vector<float> crosshair(24 * 5, 0.0f);
-    glBufferData(
-        GL_ARRAY_BUFFER,
-        static_cast<GLsizeiptr>(crosshair.size() * sizeof(float)),
-        crosshair.data(),
-        GL_DYNAMIC_DRAW
-    );
-
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(
-        0, 3, GL_FLOAT, GL_FALSE,
-        5 * sizeof(float), reinterpret_cast<void*>(0)
-    );
-
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(
-        1, 2, GL_FLOAT, GL_FALSE,
-        5 * sizeof(float), reinterpret_cast<void*>(3 * sizeof(float))
-    );
-
     glBindVertexArray(0);
 
     return true;
@@ -2174,8 +2147,25 @@ void GLScene::drawOverlay(int width, int height) {
             glBindTexture(GL_TEXTURE_2D, tex);
         // Whole pixels, so the painted 1 px lines stay sharp. The target's
         // y = -1 is its top.
-        const float X0 = std::round(width / 2.0f - S.image->ax);
-        const float Y0 = std::round((S.top ? 0.0f : height / 2.0f) + S.dy - S.image->ay);
+        float atX = width / 2.0f, atY = height / 2.0f;
+        if (S.anchor == EAnchor::Top)
+            atY = 0.0f;
+        else if (S.anchor == EAnchor::Bottom)
+            atY = static_cast<float>(height);
+        else if (S.anchor == EAnchor::Cursor) {
+            // The world point of setCursorPoint through the primary view;
+            // the scene's NDC has y up, the target's y down.
+            const auto& M = m_lastVP.m;
+            const Vec3& P = m_cursorAt;
+            const float X = M[0] * P.x + M[4] * P.y + M[8] * P.z + M[12];
+            const float Y = M[1] * P.x + M[5] * P.y + M[9] * P.z + M[13];
+            const float W = M[3] * P.x + M[7] * P.y + M[11] * P.z + M[15];
+            if (!m_cursorOn || W <= 1e-4f)
+                continue;
+            atX = (X / W + 1.0f) * 0.5f * width, atY = (1.0f - Y / W) * 0.5f * height;
+        }
+        const float X0 = std::round(atX + S.dx - S.image->ax);
+        const float Y0 = std::round(atY + S.dy - S.image->ay);
         const float L = X0 / width * 2.f - 1.f, R = (X0 + S.image->w) / width * 2.f - 1.f;
         const float T = Y0 / height * 2.f - 1.f, B = (Y0 + S.image->h) / height * 2.f - 1.f;
         const float V[] = {L, T, 0.f, 0.f, 0.f, R, T, 0.f, 1.f, 0.f, R, B, 0.f, 1.f, 1.f,
@@ -2188,63 +2178,6 @@ void GLScene::drawOverlay(int width, int height) {
     glBindTexture(GL_TEXTURE_2D, 0);
     glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
-}
-
-void GLScene::drawCrosshair(int width, int height) {
-    if (!m_crosshairVAO || !m_crosshairVBO || width <= 0 || height <= 0)
-        return;
-
-    const float pxX = 2.0f / static_cast<float>(width);
-    const float pxY = 2.0f / static_cast<float>(height);
-
-    // A window in use (setCursorPoint): the cross where its pointer is. The
-    // scene's NDC has y up, the target's (Hyprland's framebuffer) y down.
-    float atX = 0.0f, atY = 0.0f;
-    if (m_cursorOn) {
-        const auto& M = m_lastVP.m;
-        const float X = M[0] * m_cursorAt.x + M[4] * m_cursorAt.y + M[8] * m_cursorAt.z + M[12];
-        const float Y = M[1] * m_cursorAt.x + M[5] * m_cursorAt.y + M[9] * m_cursorAt.z + M[13];
-        const float W = M[3] * m_cursorAt.x + M[7] * m_cursorAt.y + M[11] * m_cursorAt.z + M[15];
-        if (W > 1e-4f)
-            atX = X / W, atY = -Y / W;
-    }
-
-    // A window in use shows a mouse pointer, not a cross: the arrow every
-    // desktop draws, its tip where the window's pointer is -- with Super+F's
-    // screen the owner looked for the cursor and saw a small cross.
-    if (m_cursorOn) {
-        // The arrow in pixels, y down, tip at 0,0: the head and the tail.
-        static constexpr float ARROW[][2] = {
-            {0.f, 0.f}, {0.f, 17.f}, {12.f, 12.f},
-            {4.f, 12.5f}, {7.f, 11.f}, {10.5f, 19.f},
-            {4.f, 12.5f}, {10.5f, 19.f}, {7.5f, 20.5f},
-        };
-        const auto drawArrow = [&](float dx, float dy, float r, float g, float b) {
-            std::vector<float> verts;
-            verts.reserve(9 * 5);
-            for (const auto& P : ARROW)
-                verts.insert(verts.end(), {atX + (P[0] + dx) * pxX, atY + (P[1] + dy) * pxY, 0.f, 0.f, 0.f});
-            glUseProgram(m_sceneProgram);
-            const Mat4 IDENTITY = Mat4::identity();
-            glUniformMatrix4fv(m_sceneMVP, 1, GL_FALSE, IDENTITY.m.data());
-            glUniform1i(m_sceneTextured, 0);
-            glUniform4f(m_sceneColorUniform, r, g, b, 1.0f);
-            glUniform4f(m_sceneUVRect, 0.0f, 0.0f, 1.0f, 1.0f);
-            glBindBuffer(GL_ARRAY_BUFFER, m_crosshairVBO);
-            glBufferSubData(GL_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(verts.size() * sizeof(float)), verts.data());
-            glBindVertexArray(m_crosshairVAO);
-            glDrawArrays(GL_TRIANGLES, 0, 9);
-            glBindVertexArray(0);
-        };
-        // A black rim from four shifted copies, the white arrow over it.
-        for (const auto& O : {std::pair{-1.2f, 0.f}, {1.2f, 0.f}, {0.f, -1.2f}, {0.f, 1.2f}})
-            drawArrow(O.first, O.second, 0.f, 0.f, 0.f);
-        drawArrow(0.f, 0.f, 1.f, 1.f, 1.f);
-        return;
-    }
-
-    // Otherwise main's overlay: the mark for what the aim is on.
-    drawOverlay(width, height);
 }
 
 void GLScene::drawFullscreen(
@@ -3077,7 +3010,7 @@ bool GLScene::render(
     drawFullscreen(std::clamp(alpha, 0.0f, 1.0f));
     drawHud(std::clamp(alpha, 0.0f, 1.0f));
     if (primary)
-        drawCrosshair(width, height);
+        drawOverlay(width, height);
 
     // --- restore compositor state ---
     glUseProgram(static_cast<GLuint>(oldProgram));
@@ -3282,16 +3215,6 @@ void GLScene::destroyGLObjects() {
         glDeleteVertexArrays(1, &m_textVAO);
         m_textVAO = 0;
     }
-    if (m_crosshairVBO) {
-        glDeleteBuffers(1, &m_crosshairVBO);
-        m_crosshairVBO = 0;
-    }
-
-    if (m_crosshairVAO) {
-        glDeleteVertexArrays(1, &m_crosshairVAO);
-        m_crosshairVAO = 0;
-    }
-
     if (m_fullscreenVBO) {
         glDeleteBuffers(1, &m_fullscreenVBO);
         m_fullscreenVBO = 0;

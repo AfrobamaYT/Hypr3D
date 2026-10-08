@@ -92,6 +92,14 @@ include("${PHYSICS_REPO_ROOT}/Jolt/Jolt.cmake")
 # global symbol namespace ("multiply defined" on load).
 target_compile_options(Jolt PRIVATE -O2 -fvisibility=hidden -fvisibility-inlines-hidden)
 target_include_directories(Jolt PUBLIC "${PHYSICS_REPO_ROOT}")
+# Jolt turns JPH_DEBUG on -- and with it every assert, each an int3 that
+# takes Hyprland down -- whenever NDEBUG is not set, and Jolt.cmake sets
+# NDEBUG for its own Release configurations only. Arch packages build with
+# CMAKE_BUILD_TYPE=None: every released plugin had them on, and a degenerate
+# GJK step while walking through the Backrooms trapped the owner's session
+# (2026-10-08, !ioV.IsNearZero() in EPAPenetrationDepth.h). JPH_NO_DEBUG is
+# Jolt's own way out (Build/README.md); only a Debug build keeps them.
+target_compile_definitions(Jolt PUBLIC "$<$<NOT:$<CONFIG:Debug>>:JPH_NO_DEBUG>")
 link_libraries(Jolt)
 
 # Jolt.cmake forces C++17 in directory scope; ours is C++23.

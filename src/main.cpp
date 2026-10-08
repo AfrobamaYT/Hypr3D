@@ -4175,7 +4175,10 @@ static void useWindow(const PHLWINDOW& window, Vector2D local) {
         Compat::focusWindow(window);
     g_focusLockId  = g_use.id;
     g_keyboardMode = EKeyboardMode::Window;
-    resetMovementKeys();
+    // The camera keys only: Super stays held as it is. Cleared here, Super+F
+    // pressed twice with Super held let the second F through to the rice's
+    // fullscreen and took the player into 2D (measured).
+    resetCameraKeys();
     damageCurrentMonitor();
 }
 

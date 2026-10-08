@@ -54,6 +54,12 @@ class GLScene {
         // sides. Without an outline the slab is a plain box.
         float depth = 0.0f;
         std::shared_ptr<const std::vector<SOutlineLoop>> outlines;
+
+        // Crumpled like a sheet of paper: 0 = flat, 1 = a paper ball about
+        // a third of the window's size, turned `spin` radians about its up
+        // axis. Drawn as a creased mesh instead of the quad (drawCrumpled).
+        float crumple = 0.0f;
+        float spin    = 0.0f;
     };
 
     // Where one monitor looks through the view plane, in tangents of the view
@@ -265,6 +271,15 @@ class GLScene {
         return &m_player;
     }
 
+    // The waste bin's glow (Larch's motion draft): a soft ring of light
+    // around its rim -- it flashes as a ball goes in and breathes while the
+    // bin waits for the application. 0 = none.
+    void setBinHalo(const Vec3& rim, float radius, float intensity) {
+        m_binHaloAt = rim;
+        m_binHaloR  = radius;
+        m_binHaloI  = intensity;
+    }
+
     void setGridVisible(bool on) {
         m_gridVisible = on;
     }
@@ -361,6 +376,9 @@ class GLScene {
     void refreshPanorama();
 
     void drawWindows(const Mat4& vp, const std::vector<WindowRender>& windows);
+    // A window crumpled like paper (WindowRender::crumple): a creased mesh,
+    // opaque and depth-written, drawn before the translucent windows.
+    void drawCrumpled(const Mat4& vp, const WindowRender& window);
     // Portals.
     struct SPortalGL {
         SPortalSpec  spec;
@@ -382,6 +400,8 @@ class GLScene {
     std::vector<SShadow> m_shadows;
     unsigned int         m_shadowTex = 0, m_shadowVAO = 0, m_shadowVBO = 0;
     void drawShadows(const Mat4& vp);
+    void drawBinHalo(const Mat4& vp);
+    void ensureCrumpleBuffers();
     // The featured window (setFeatured) and the dark over the rest.
     std::uintptr_t m_featuredId  = 0;
     float          m_featuredDim = 0.0f;
@@ -423,6 +443,10 @@ class GLScene {
     // program's layout).
     unsigned int m_polyVAO = 0;
     unsigned int m_polyVBO = 0;
+    unsigned int m_crumpleVAO = 0;
+    unsigned int m_crumpleVBO = 0;
+    Vec3         m_binHaloAt{};
+    float        m_binHaloR = 0.0f, m_binHaloI = 0.0f;
 
     // Unit quad in the XZ plane. The ground.
     unsigned int m_floorVAO = 0;

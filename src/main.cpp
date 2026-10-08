@@ -93,6 +93,7 @@ extern "C" {
 #include <memory>
 #include <numbers>
 #include <optional>
+#include <hyprutils/animation/BezierCurve.hpp>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -2690,14 +2691,63 @@ static float g_trashRadius = 0.0f, g_trashHeight = 0.0f; // radius 0: no bin
 struct STrashed {
     std::uintptr_t id = 0;
     std::chrono::steady_clock::time_point start;
-    Vec3  fromCenter{};
+    Vec3  fromCenter{};   // where it hung, for the way back
     float fromYaw = 0.f, fromPitch = 0.f, fromRoll = 0.f, fromScale = 1.f;
+    Vec3  letGo{};        // where it was let go
+    float fromCrumple = 0.f, fromSpin = 0.f;
     bool  asked = false; // the close request went out
     std::chrono::steady_clock::time_point askedAt;
+    bool  refused = false; // stayed open: hopping back out, unfolding home
+    std::chrono::steady_clock::time_point refusedAt;
 };
 static std::vector<STrashed> g_trashed;
-static constexpr float kTrashSeconds = 0.45f;
-static constexpr float kTrashGrace   = 3.0f;
+static constexpr float kTrashGrace = 3.0f;
+
+// Where the window being carried hung when it was picked up: a window the
+// bin gives back unfolds on its way home to there, not to the bin's side.
+struct SCarriedFrom {
+    std::uintptr_t id = 0;
+    Vec3  center{};
+    float yaw = 0.f, pitch = 0.f, roll = 0.f;
+};
+static SCarriedFrom g_carriedFrom;
+
+// Larch's motion draft (2026-10-08) for the bin, in seconds: let go, the
+// ball arcs in (0.52, spinning once), drops below the rim (0.16, ease-in) and
+// the rim flashes (0.22); the app is asked to close. One that stays open: the
+// rim breathes while it waits up to kTrashGrace, then the ball hops out
+// (0.42) and unfolds on its way back to where the window hung (0.64).
+static constexpr float kBinArc = 0.52f, kBinDrop = 0.16f, kBinFlash = 0.22f;
+static constexpr float kBinHop = 0.42f, kBinUnfold = 0.64f;
+
+// Larch's motion curves (the design system's --larch-ease-move, -dive and
+// -fade), through Hyprland's own bezier.
+enum class ELarchEase { Move, Dive, Fade };
+static float larchEase(ELarchEase which, float x) {
+    static Hyprutils::Animation::CBezierCurve s_move, s_dive, s_fade;
+    static bool s_ready = false;
+    if (!s_ready) {
+        s_move.setup({Vector2D{0.2, 0.8}, Vector2D{0.2, 1.0}});
+        s_dive.setup({Vector2D{0.65, 0.0}, Vector2D{0.25, 1.0}});
+        s_fade.setup({Vector2D{0.25, 0.1}, Vector2D{0.25, 1.0}});
+        s_ready = true;
+    }
+    x = std::clamp(x, 0.0f, 1.0f);
+    return (which == ELarchEase::Move ? s_move : which == ELarchEase::Dive ? s_dive : s_fade).getYForPoint(x);
+}
+
+// How crumpled each window is (0 flat .. 1 a paper ball), and its turn: a
+// window carried toward the bin crumples with its distance to the bin's
+// opening -- flat until 1.6 m, a ball by 0.5 m -- and opens again when it is
+// carried away or let go elsewhere.
+struct SCrumple {
+    float e = 0.0f, spin = 0.0f;
+};
+static std::unordered_map<std::uintptr_t, SCrumple> g_crumple;
+
+// The bin's glow this frame, 1 = none: its halo (GLScene::setBinHalo)
+// flashes as a ball goes in and breathes while the bin waits for the app.
+static float g_binGlow = 1.0f;
 
 // The process gun (F7) -- "360 noscope discord when it freezes", four people
 // in the Reddit finds. Aim at a window and shoot: a left click asks it to
@@ -2851,50 +2901,98 @@ static bool dropInBin(std::uintptr_t id) {
     T.fromCenter = E->center;
     T.fromYaw = E->yaw, T.fromPitch = E->pitch, T.fromRoll = E->roll;
     T.fromScale = E->logicalWidth > 0.f ? E->width / World3D::toWorld(E->logicalWidth) : configWindowScale();
+    T.letGo = E->center;
+    if (g_carriedFrom.id == id) {
+        T.fromCenter = g_carriedFrom.center;
+        T.fromYaw = g_carriedFrom.yaw, T.fromPitch = g_carriedFrom.pitch, T.fromRoll = g_carriedFrom.roll;
+    }
+    if (const auto C = g_crumple.find(id); C != g_crumple.end())
+        T.fromCrumple = C->second.e, T.fromSpin = C->second.spin;
     g_trashed.push_back(T);
     return true;
 }
 
 // One window of syncWorld's loop on its way into the bin, or waiting there
-// for its application to close it. False: it stayed open -- back it comes.
+// for its application to close it, or hopping back out (see kBinArc). False:
+// it stayed open and is back where it hung.
 static bool applyTrash(STrashed& T, const CBox& BOX, World3D::SEntity& E) {
-    const auto NOW = std::chrono::steady_clock::now();
-    const float RAW = std::clamp(std::chrono::duration<float>(NOW - T.start).count() / kTrashSeconds, 0.0f, 1.0f);
-    const float P = RAW * RAW; // falling: slow, then fast
-    // Over the opening, then down into it: an arc that drops in at the end.
-    const Vec3 OVER = g_trashAt + Vec3{0.f, g_trashHeight + 0.35f, 0.f};
-    const Vec3 IN   = g_trashAt + Vec3{0.f, g_trashHeight * 0.5f, 0.f};
-    const Vec3 MID  = T.fromCenter + (OVER - T.fromCenter) * P;
-    E.center = MID + (IN - MID) * (P * P);
-    E.yaw    = T.fromYaw + 3.0f * P;   // tumbling as it crumples
-    E.pitch  = T.fromPitch + 2.2f * P;
-    E.roll   = T.fromRoll + 4.0f * P;
-    const float SCALE = T.fromScale * (1.0f - 0.985f * P);
-    E.width  = World3D::toWorld(BOX.w) * SCALE;
-    E.height = World3D::toWorld(BOX.h) * SCALE;
+    const auto  NOW  = std::chrono::steady_clock::now();
+    const float AGE  = std::chrono::duration<float>(NOW - T.start).count();
+    const Vec3  RIM  = g_trashAt + Vec3{0.f, g_trashHeight, 0.f};
+    const Vec3  DEEP = g_trashAt + Vec3{0.f, g_trashHeight * 0.45f, 0.f};
+    auto& C = g_crumple[T.id];
+    E.width  = World3D::toWorld(BOX.w) * T.fromScale;
+    E.height = World3D::toWorld(BOX.h) * T.fromScale;
+    E.yaw = T.fromYaw, E.pitch = T.fromPitch, E.roll = T.fromRoll;
 
-    if (RAW >= 1.0f && !T.asked) {
-        T.asked = true;
-        T.askedAt = NOW;
-        // Outside the frame: render.stage is no place to talk to clients.
-        const std::uintptr_t ID = T.id;
-        if (g_pEventLoopManager)
-            g_pEventLoopManager->doLater([ID] {
-                if (const auto W = Compat::findWindowById(ID))
-                    W->sendClose();
-            });
+    if (!T.refused) {
+        if (AGE < kBinArc) {
+            // Under gravity: straight across, up and down again -- a parabola
+            // over the rim, a full turn on the way, crumpled up at once.
+            const float P = AGE / kBinArc;
+            E.center = T.letGo + (RIM + Vec3{0.f, 0.06f, 0.f} - T.letGo) * P + Vec3{0.f, 4.0f * 0.3f * P * (1.0f - P), 0.f};
+            C.e    = T.fromCrumple + (1.0f - T.fromCrumple) * std::min(1.0f, P * 3.0f);
+            C.spin = T.fromSpin + 2.0f * 3.14159265f * P;
+        } else {
+            const float Q = std::clamp((AGE - kBinArc) / kBinDrop, 0.0f, 1.0f);
+            E.center = RIM + Vec3{0.f, 0.06f, 0.f} + (DEEP - RIM - Vec3{0.f, 0.06f, 0.f}) * (Q * Q); // ease-in
+            C.e = 1.0f;
+            C.spin = T.fromSpin + 2.0f * 3.14159265f;
+        }
+        // The rim: a flash as it goes in, then breathing once a second while
+        // the application decides.
+        const float FLASH = AGE - kBinArc;
+        if (FLASH >= 0.0f && FLASH < kBinFlash)
+            g_binGlow = std::max(g_binGlow, 1.0f + 2.0f * (1.0f - larchEase(ELarchEase::Fade, FLASH / kBinFlash)));
+        else if (T.asked)
+            g_binGlow = std::max(g_binGlow, 1.0f + 0.8f * (0.5f - 0.5f * std::cos(2.0f * 3.14159265f *
+                std::chrono::duration<float>(NOW - T.askedAt).count())));
+
+        if (AGE >= kBinArc + kBinDrop && !T.asked) {
+            T.asked = true;
+            T.askedAt = NOW;
+            // Outside the frame: render.stage is no place to talk to clients.
+            const std::uintptr_t ID = T.id;
+            if (g_pEventLoopManager)
+                g_pEventLoopManager->doLater([ID] {
+                    if (const auto W = Compat::findWindowById(ID))
+                        W->sendClose();
+                });
+        }
+        if (T.asked && std::chrono::duration<float>(NOW - T.askedAt).count() > kTrashGrace) {
+            T.refused = true;
+            T.refusedAt = NOW;
+            if (const auto W = Compat::findWindowById(T.id))
+                notify("[hypr3d] " + W->m_title + " is still open -- it has unsaved work. Save in the window, then carry it to the bin again.",
+                       CHyprColor{1.0f, 0.6f, 0.2f, 1.0f});
+        }
+        return true;
     }
-    if (T.asked && std::chrono::duration<float>(NOW - T.askedAt).count() > kTrashGrace) {
-        E.center = T.fromCenter;
-        E.yaw = T.fromYaw, E.pitch = T.fromPitch, E.roll = T.fromRoll;
-        E.width  = World3D::toWorld(BOX.w) * T.fromScale;
-        E.height = World3D::toWorld(BOX.h) * T.fromScale;
-        return false;
+
+    // Stayed open: out of the bin in a hop, then unfolding on the way back
+    // to where it hung, as it was.
+    const float BACK = std::chrono::duration<float>(NOW - T.refusedAt).count();
+    const Vec3  HOP  = g_trashAt + (T.fromCenter - g_trashAt) * 0.4f + Vec3{0.f, g_trashHeight + 0.25f, 0.f};
+    if (BACK < kBinHop) {
+        const float P = BACK / kBinHop;
+        E.center = DEEP + (HOP - DEEP) * P + Vec3{0.f, 4.0f * 0.35f * P * (1.0f - P), 0.f};
+        C.e    = 1.0f;
+        C.spin = T.fromSpin + 2.0f * 3.14159265f * (1.0f + 0.55f * P);
+        return true;
     }
-    return true;
+    const float P = larchEase(ELarchEase::Move, (BACK - kBinHop) / kBinUnfold);
+    E.center = HOP + (T.fromCenter - HOP) * P;
+    C.e    = 1.0f - P;
+    C.spin = (T.fromSpin + 2.0f * 3.14159265f * 1.55f) * (1.0f - P);
+    if (BACK < kBinHop + kBinUnfold)
+        return true;
+    E.center = T.fromCenter;
+    C = {};
+    return false;
 }
 
 static void syncWorld(const PHLMONITOR& mon, float dt) {
+    g_binGlow = 1.0f; // applyTrash raises it this frame
     // Deliberately free of side effects on the layout and the renderer. This
     // runs from render.stage, i.e. between the frame's startRenderPass() and
     // endRender(). Ghosting would trigger a relayout while the pass is half
@@ -3198,11 +3296,8 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         if (g_read.id == info.id)
             applyReading(mon, BOX, entity);
         if (const auto T = std::ranges::find_if(g_trashed, [&](const STrashed& t) { return t.id == info.id; });
-            T != g_trashed.end() && !applyTrash(*T, BOX, entity)) {
-            if (const auto W = Compat::findWindowById(T->id))
-                notify("[hypr3d] " + W->m_title + " stayed open; it is back", CHyprColor{1.0f, 0.6f, 0.2f, 1.0f});
+            T != g_trashed.end() && !applyTrash(*T, BOX, entity))
             g_trashed.erase(T);
-        }
         applyGunJolt(info.id, entity);
         applyTV(info.id, BOX, entity);
 
@@ -3251,6 +3346,9 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
     std::erase_if(g_trashed, [&](const STrashed& t) {
         return std::ranges::none_of(ENTITIES, [&](const auto& E) { return E.id == t.id; });
     }); // closed: in the bin for good
+    std::erase_if(g_crumple, [&](const auto& KV) {
+        return std::ranges::none_of(ENTITIES, [&](const auto& E) { return E.id == KV.first; });
+    });
 
     // The menu window, as it opens, comes to the eye at 1:1 -- over a window
     // being read, which goes back first.
@@ -3328,6 +3426,28 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
 
         render.alpha = IS_FS_WINDOW ? 1.0f : g_fsFade;
 
+        // Crumpling (see g_crumple): a carried window by its distance to the
+        // bin's opening, one in the bin by applyTrash; any other opens again.
+        if (std::ranges::none_of(g_trashed, [&](const STrashed& t) { return t.id == entity.id; })) {
+            float target = 0.0f;
+            if (g_trashRadius > 0.0f && g_world.dragActive() && g_world.draggedId() == entity.id) {
+                const Vec3  D = entity.center - (g_trashAt + Vec3{0.f, g_trashHeight, 0.f});
+                const float X = std::clamp((1.6f - std::sqrt(dot(D, D))) / 1.1f, 0.0f, 1.0f);
+                target = X * X * (3.0f - 2.0f * X);
+            }
+            if (target > 0.0f || g_crumple.contains(entity.id)) {
+                auto& C = g_crumple[entity.id];
+                C.e += (target - C.e) * (1.0f - std::exp(-dt / 0.08f));
+                C.spin = C.e * (160.0f * 3.14159265f / 180.0f);
+                if (target == 0.0f && C.e < 0.002f)
+                    g_crumple.erase(entity.id);
+            }
+        }
+        if (const auto C = g_crumple.find(entity.id); C != g_crumple.end()) {
+            render.crumple = C->second.e;
+            render.spin    = C->second.spin;
+        }
+
         // Depth slab (windows.depth): silhouette source priority -- the
         // outline traced from the snapshot texture's real alpha (exact
         // corner shape; the GPU-side copy is the only reliable read), then
@@ -3360,6 +3480,9 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
 
         g_renderWindows.push_back(render);
     }
+
+    // The bin's halo (see g_binGlow): above 1 it shows.
+    g_scene.setBinHalo(g_trashAt + Vec3{0.f, g_trashHeight, 0.f}, g_trashRadius, g_trashRadius > 0.0f ? g_binGlow - 1.0f : 0.0f);
 
     // Aim focus updates freeze during the fullscreen transition: the flying
     // quad sweeps the crosshair across other windows and would thrash focus.
@@ -5891,6 +6014,16 @@ static void dumpStatus(bool force = false) {
         out << "head: on=" << (g_cfgHead ? 1 : 0) << " port=" << g_head.port << " packets=" << g_head.packets
             << " dropped=" << g_head.dropped << " shown=" << g_head.shown[0] << "," << g_head.shown[1] << ","
             << g_head.shown[2] << " yaw=" << g_head.shown[3] << " pitch=" << g_head.shown[4] << "\n";
+        out << "crumple:";
+        for (const auto& [ID, C] : g_crumple)
+            out << " " << ID << "=" << C.e;
+        out << " glow=" << g_binGlow << " trashed=" << g_trashed.size() << " drag=" << (g_world.dragActive() ? g_world.draggedId() : 0)
+            << " trashR=" << g_trashRadius;
+        if (const auto* DE = g_world.dragActive() ? g_world.find(g_world.draggedId()) : nullptr) {
+            const Vec3 D = DE->center - (g_trashAt + Vec3{0.f, g_trashHeight, 0.f});
+            out << " toBin=" << std::sqrt(dot(D, D));
+        }
+        out << "\n";
         out << "tv: w=" << g_tvW << " window=" << g_tvWindowId << " use=" << g_use.id << " at=" << g_use.local.x
             << "," << g_use.local.y;
         if (const auto* UE = g_use.id ? g_world.find(g_use.id) : nullptr)
@@ -6068,7 +6201,7 @@ static bool runsOnTime() {
         || g_scene.scenePending() || joltShapesPending()
         || g_sightPending
         || g_companion.mode != ECompanionMode::Idle
-        || !g_trashed.empty()
+        || !g_trashed.empty() || !g_crumple.empty() // a ball unfolding
         || (g_read.id && (!g_read.arrived || g_read.following || g_read.back))
         || g_world.dragActive()
         || !g_gunShots.empty() || g_gunHold.active
@@ -6698,6 +6831,8 @@ static void onMouseButton(
                 return;
             }
             s_zoomId = 0; // the drag owns this window's distance now
+            if (const auto* CE = g_world.find(HIT.id))
+                g_carriedFrom = {HIT.id, CE->center, CE->yaw, CE->pitch, CE->roll};
             if (HIT.id == g_tvWindowId)
                 g_tvWindowId = 0; // carried off the TV
 

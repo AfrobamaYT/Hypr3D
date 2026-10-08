@@ -1641,6 +1641,13 @@ void GLScene::drawWindows(
         if (window.width <= 0.0f || window.height <= 0.0f)
             continue;
 
+        // Crumpled: an opaque creased mesh, written to depth before the
+        // translucent windows are blended over and behind it.
+        if (window.crumple > 0.001f) {
+            drawCrumpled(vp, window);
+            continue;
+        }
+
         const Mat4 model =
             Mat4::translation({window.x, window.y, window.z}) *
             Mat4::rotationY(window.yaw) *
@@ -1934,6 +1941,193 @@ void GLScene::drawWindows(
 
 // Restored from the pre-unification revision: the black cross with the
 // white outline at the screen centre (screen-space, scene program).
+// --- a window crumpled like paper ---------------------------------------------
+// Larch's motion draft (2026-10-08): a window carried to the waste bin
+// crumples with its distance to it and goes in as a paper ball. Done the way
+// games crumple paper -- a blend between the flat sheet and a crumpled target
+// shape, not a sheet simulation: the window's quad as a grid that wrinkles
+// first and then gathers into a lumpy ball, rebuilt on the CPU each frame for
+// the one window being thrown. Each facet is shaded by how it faces the eye,
+// so the creases show.
+static float crumpleHash(int x, int y, int z) {
+    uint32_t h = static_cast<uint32_t>(x) * 374761393u + static_cast<uint32_t>(y) * 668265263u +
+        static_cast<uint32_t>(z) * 2147483647u;
+    h = (h ^ (h >> 13)) * 1274126177u;
+    return static_cast<float>((h ^ (h >> 16)) & 0xffffu) / 65535.0f * 2.0f - 1.0f;
+}
+
+static float crumpleNoise(float x, float y, float z) {
+    const float FX = std::floor(x), FY = std::floor(y), FZ = std::floor(z);
+    const int   X = static_cast<int>(FX), Y = static_cast<int>(FY), Z = static_cast<int>(FZ);
+    const float TX = x - FX, TY = y - FY, TZ = z - FZ;
+    const float UX = TX * TX * (3.f - 2.f * TX), UY = TY * TY * (3.f - 2.f * TY), UZ = TZ * TZ * (3.f - 2.f * TZ);
+    const auto  LERP = [](float a, float b, float t) { return a + (b - a) * t; };
+    const float X00 = LERP(crumpleHash(X, Y, Z), crumpleHash(X + 1, Y, Z), UX);
+    const float X10 = LERP(crumpleHash(X, Y + 1, Z), crumpleHash(X + 1, Y + 1, Z), UX);
+    const float X01 = LERP(crumpleHash(X, Y, Z + 1), crumpleHash(X + 1, Y, Z + 1), UX);
+    const float X11 = LERP(crumpleHash(X, Y + 1, Z + 1), crumpleHash(X + 1, Y + 1, Z + 1), UX);
+    return LERP(LERP(X00, X10, UY), LERP(X01, X11, UY), UZ);
+}
+
+// Position + UV, the scene program's layout: the crumpled mesh and the bin's
+// halo share one buffer.
+void GLScene::ensureCrumpleBuffers() {
+    if (m_crumpleVAO)
+        return;
+    glGenVertexArrays(1, &m_crumpleVAO);
+    glGenBuffers(1, &m_crumpleVBO);
+    glBindVertexArray(m_crumpleVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_crumpleVBO);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), reinterpret_cast<void*>(0));
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), reinterpret_cast<void*>(3 * sizeof(float)));
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+
+void GLScene::drawCrumpled(const Mat4& vp, const WindowRender& w) {
+    constexpr int   NX = 28, NY = 18;
+    constexpr float PI = 3.14159265f;
+    const float E    = std::clamp(w.crumple, 0.0f, 1.0f);
+    const float K    = E * E * (3.0f - 2.0f * E);          // flat -> ball
+    const float W    = w.width, H = w.height;
+    // The ball: a third of the window's size, at most 0.12 m across the
+    // middle -- big enough to read as the window, small enough to drop into
+    // the bin's 0.58 m opening (a 0.25 m one covered the bin, measured).
+    const float R    = std::min(0.17f * std::sqrt(W * H), 0.12f);
+    const float FOLD = 0.07f * std::min(W, H) * 4.0f * E * (1.0f - E); // wrinkles, most half way
+    const float SEED = static_cast<float>(w.id % 977u) * 0.37f;         // each window its own way
+
+    // Tumbling as it crumples: about the up axis by the spin, a little over.
+    const Mat4 ROT = Mat4::rotationY(w.yaw) * Mat4::rotationX(w.pitch) * Mat4::rotationZ(w.roll) *
+        Mat4::rotationY(w.spin) * Mat4::rotationX(0.6f * w.spin);
+    const Vec3 CENTER{w.x, w.y, w.z};
+
+    std::vector<Vec3> P(static_cast<size_t>((NX + 1) * (NY + 1)));
+    for (int j = 0; j <= NY; ++j)
+        for (int i = 0; i <= NX; ++i) {
+            const float S = static_cast<float>(i) / NX, T = static_cast<float>(j) / NY;
+            Vec3 flat{(S - 0.5f) * W, (T - 0.5f) * H, 0.0f};
+            flat.z += FOLD * crumpleNoise(S * 5.0f + SEED, T * 5.0f * H / std::max(W, 1e-3f), 0.5f);
+            // The sheet gathered round: its columns around, its rows pole to
+            // pole, every point pushed in or out by ridged noise -- the lumps.
+            const float THETA = (S * 0.94f + 0.03f) * 2.0f * PI;
+            const float PHI   = std::acos(std::clamp(1.0f - 2.0f * T, -1.0f, 1.0f));
+            const Vec3  DIR{std::sin(PHI) * std::cos(THETA), -std::cos(PHI), std::sin(PHI) * std::sin(THETA)};
+            const float LUMP = 1.0f - std::fabs(crumpleNoise(DIR.x * 2.3f + SEED, DIR.y * 2.3f, DIR.z * 2.3f - SEED));
+            const Vec3  BALL = DIR * (R * (0.72f + 0.45f * LUMP));
+            const Vec3  L    = flat + (BALL - flat) * K;
+            P[static_cast<size_t>(j * (NX + 1) + i)] = CENTER +
+                Vec3{ROT.m[0] * L.x + ROT.m[4] * L.y + ROT.m[8] * L.z, ROT.m[1] * L.x + ROT.m[5] * L.y + ROT.m[9] * L.z,
+                     ROT.m[2] * L.x + ROT.m[6] * L.y + ROT.m[10] * L.z};
+        }
+
+    // Facets by brightness: 16 steps, one draw each.
+    constexpr int LEVELS = 16;
+    std::array<std::vector<float>, LEVELS> byShade;
+    const Vec3 EYE = m_camera.position;
+    const auto UVOF = [&w](int i, int j) {
+        return Vec2{w.u0 + (w.u1 - w.u0) * (static_cast<float>(i) / NX), w.v0 + (w.v1 - w.v0) * (static_cast<float>(j) / NY)};
+    };
+    const auto TRI = [&](int ia, int ja, int ib, int jb, int ic, int jc) {
+        const Vec3& A = P[static_cast<size_t>(ja * (NX + 1) + ia)];
+        const Vec3& B = P[static_cast<size_t>(jb * (NX + 1) + ib)];
+        const Vec3& C = P[static_cast<size_t>(jc * (NX + 1) + ic)];
+        const Vec3  N = cross(B - A, C - A);
+        const float LEN = std::sqrt(dot(N, N));
+        if (LEN < 1e-9f)
+            return;
+        const Vec3  MID = (A + B + C) * (1.0f / 3.0f);
+        const Vec3  TO  = normalize(EYE - MID);
+        const float LIT = std::fabs(dot(N * (1.0f / LEN), TO));
+        // Flat it reads as the window it is; crumpled, the facets turn away.
+        const float SHADE = 1.0f - K * (0.62f * (1.0f - LIT));
+        const int   LEVEL = std::clamp(static_cast<int>(std::lround(SHADE * (LEVELS - 1))), 0, LEVELS - 1);
+        const Vec2  UA = UVOF(ia, ja), UB = UVOF(ib, jb), UC = UVOF(ic, jc);
+        byShade[static_cast<size_t>(LEVEL)].insert(byShade[static_cast<size_t>(LEVEL)].end(),
+            {A.x, A.y, A.z, UA.x, UA.y, B.x, B.y, B.z, UB.x, UB.y, C.x, C.y, C.z, UC.x, UC.y});
+    };
+    for (int j = 0; j < NY; ++j)
+        for (int i = 0; i < NX; ++i) {
+            TRI(i, j, i + 1, j, i + 1, j + 1);
+            TRI(i, j, i + 1, j + 1, i, j + 1);
+        }
+
+    ensureCrumpleBuffers();
+
+    glUseProgram(m_sceneProgram);
+    glUniformMatrix4fv(m_sceneMVP, 1, GL_FALSE, vp.m.data());
+    glUniform4f(m_sceneUVRect, 0.f, 0.f, 1.f, 1.f);
+    glUniform1i(m_sceneTexture, 0);
+    glUniform1i(m_sceneTextured, 1);
+    glUniform1f(m_sceneLodBias, 0.0f);
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_TRUE);
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_BLEND);
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, w.texture);
+    glBindVertexArray(m_crumpleVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_crumpleVBO);
+    for (int l = 0; l < LEVELS; ++l) {
+        const auto& V = byShade[static_cast<size_t>(l)];
+        if (V.empty())
+            continue;
+        const float SH = static_cast<float>(l) / (LEVELS - 1);
+        glUniform4f(m_sceneColorUniform, SH, SH, SH, w.alpha);
+        glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(V.size() * sizeof(float)), V.data(), GL_DYNAMIC_DRAW);
+        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLint>(V.size() / 5));
+    }
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glDepthMask(GL_FALSE);
+}
+
+void GLScene::drawBinHalo(const Mat4& vp) {
+    if (m_binHaloI <= 0.0f || m_binHaloR <= 0.0f)
+        return;
+    // Concentric flat rings around the rim, fading outward, added to what
+    // is behind (light, not paint): a bright line on the rim and a soft
+    // falloff a hand wide. The draft's accent, --larch-ac #5fd3c4.
+    constexpr int   SEG   = 64;
+    constexpr int   RINGS = 6;
+    constexpr float PI    = 3.14159265f;
+    ensureCrumpleBuffers();
+    glUseProgram(m_sceneProgram);
+    glUniformMatrix4fv(m_sceneMVP, 1, GL_FALSE, vp.m.data());
+    glUniform4f(m_sceneUVRect, 0.f, 0.f, 1.f, 1.f);
+    glUniform1i(m_sceneTextured, 0);
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_BLEND);
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE, GL_ZERO, GL_ONE);
+    glBindVertexArray(m_crumpleVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_crumpleVBO);
+    std::vector<float> V;
+    for (int r = 0; r < RINGS; ++r) {
+        const float IN  = m_binHaloR - 0.012f + 0.016f * static_cast<float>(r);
+        const float OUT = IN + 0.016f;
+        V.clear();
+        for (int i = 0; i <= SEG; ++i) {
+            const float A = 2.0f * PI * static_cast<float>(i) / SEG;
+            const float C = std::cos(A), S = std::sin(A);
+            V.insert(V.end(), {m_binHaloAt.x + C * IN, m_binHaloAt.y, m_binHaloAt.z + S * IN, 0.f, 0.f,
+                               m_binHaloAt.x + C * OUT, m_binHaloAt.y, m_binHaloAt.z + S * OUT, 0.f, 0.f});
+        }
+        const float FALL = r == 0 ? 1.0f : 0.55f * std::pow(0.62f, static_cast<float>(r - 1));
+        glUniform4f(m_sceneColorUniform, 0x5f / 255.f, 0xd3 / 255.f, 0xc4 / 255.f, std::min(1.0f, 0.5f * m_binHaloI) * FALL);
+        glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(V.size() * sizeof(float)), V.data(), GL_DYNAMIC_DRAW);
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, static_cast<GLint>(V.size() / 5));
+    }
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+}
+
 void GLScene::drawCrosshair(int width, int height) {
     if (!m_crosshairVAO || !m_crosshairVBO || width <= 0 || height <= 0)
         return;
@@ -2327,6 +2521,7 @@ void GLScene::drawRoom(const Mat4& vp, const ViewWindow& view,
     }
 
     drawShadows(vp);
+    drawBinHalo(vp);
 
     // Windows last, back to front in the BSP's exact order: crossing quads
     // are split along each other, and translucency composites in order. A

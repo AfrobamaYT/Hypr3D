@@ -41,6 +41,7 @@
 #include <hyprland/src/managers/SessionLockManager.hpp>
 #include <hyprland/src/config/supplementary/executor/Executor.hpp>
 #include <hyprland/src/config/shared/actions/ConfigActions.hpp>
+#include <hyprland/src/managers/KeybindManager.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
 #include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
 #include <hyprland/src/config/values/ConfigValues.hpp>
@@ -2403,6 +2404,7 @@ static float configWindowScale() {
 struct SRead {
     std::uintptr_t id      = 0;
     bool           cinema  = false; // F4, not F2
+    bool           screen  = false; // Super+F: the screen in front, used like a monitor
     bool           back    = false; // on the way back to the room
     bool           arrived = false;
     float          legDim  = 0.f, dim = 0.f; // the room's dark, 0..1
@@ -2440,6 +2442,10 @@ static std::string    g_cfgMenuCommand, g_cfgMenuTitle;
 static std::uintptr_t g_menuId = 0; // the menu window last brought
 static constexpr float kReadSeconds = 0.35f;
 static constexpr float kCinemaFill  = 0.9f; // of the view's width or height
+// Super+F's screen: big in front of the player with the room still around
+// its corners, as Quest 3 shows a virtual screen -- the owner asked for that,
+// not the 2D fullscreen the rice's Super+F gave (2026-10-08). Not dimmed.
+static constexpr float kScreenFill  = 0.82f;
 static constexpr float kCinemaDim   = 0.8f; // the room at a fifth of its light
 
 // The reading pose for a window of BOX (logical px, decorations included):
@@ -2452,7 +2458,9 @@ static constexpr float kCinemaDim   = 0.8f; // the room at a fifth of its light
 // pixel off, every texel is smeared over two.
 static constexpr float kReadDistance = 1.0f;
 
-static void readingPose(const PHLMONITOR& mon, const CBox& BOX, bool cinema, Vec3& center,
+// fill: 0 for 1:1 (F2), else the share of the view's width or height the
+// window takes (F4's cinema, Super+F's screen).
+static void readingPose(const PHLMONITOR& mon, const CBox& BOX, float fill, Vec3& center,
                         float& yaw, float& pitch, float& scale) {
     const auto& CAM = g_scene.camera();
     const Vec3  FWD = CAM.forward();
@@ -2470,9 +2478,9 @@ static void readingPose(const PHLMONITOR& mon, const CBox& BOX, bool cinema, Vec
     };
     double DX = OFF(mon->m_pixelSize.x, BOX.w * S);
     double DY = OFF(mon->m_pixelSize.y, BOX.h * S);
-    if (cinema && BOX.w > 0 && BOX.h > 0) {
+    if (fill > 0.f && BOX.w > 0 && BOX.h > 0) {
         // Not 1:1 any more, so no pixel edges to meet.
-        scale *= std::min(kCinemaFill * mon->m_size.x / BOX.w, kCinemaFill * mon->m_size.y / BOX.h);
+        scale *= std::min(fill * mon->m_size.x / BOX.w, fill * mon->m_size.y / BOX.h);
         DX = DY = 0.0;
     }
 
@@ -2522,7 +2530,7 @@ static void followMenu(const PHLMONITOR& mon, const CBox& BOX) {
 
     Vec3  to{};
     float toYaw = 0.f, toPitch = 0.f, toScale = 1.f;
-    readingPose(mon, BOX, false, to, toYaw, toPitch, toScale);
+    readingPose(mon, BOX, 0.f, to, toYaw, toPitch, toScale);
     const float K = 1.0f - std::exp(-kMenuSpeed * DT);
     const float DYAW = std::remainder(toYaw - g_read.atYaw, 2.f * std::numbers::pi_v<float>);
     g_read.atCenter = g_read.atCenter + (to - g_read.atCenter) * K;
@@ -2558,8 +2566,9 @@ static void applyReading(const PHLMONITOR& mon, const CBox& BOX, World3D::SEntit
         to = g_read.atCenter, toYaw = g_read.atYaw, toPitch = g_read.atPitch;
         toScale = g_read.atScale;
     } else
-        readingPose(mon, BOX, g_read.cinema, to, toYaw, toPitch, toScale);
-    const float TO_DIM = g_read.cinema && !g_read.back ? kCinemaDim : 0.0f;
+        readingPose(mon, BOX, g_read.screen ? kScreenFill : g_read.cinema ? kCinemaFill : 0.f,
+                    to, toYaw, toPitch, toScale);
+    const float TO_DIM = g_read.cinema && !g_read.screen && !g_read.back ? kCinemaDim : 0.0f;
     g_read.dim = g_read.legDim + (TO_DIM - g_read.legDim) * P;
 
     const float TWO_PI = 2.f * std::numbers::pi_v<float>;
@@ -2586,27 +2595,31 @@ static void applyReading(const PHLMONITOR& mon, const CBox& BOX, World3D::SEntit
 // F2 or F4 on the aimed window (or on `only`, the menu); the same key again
 // sends it back, the other one turns reading into the cinema and back. The
 // next leg starts from wherever the window is now.
-static void toggleReading(bool cinema, std::uintptr_t only = 0) {
+static bool toggleReading(bool cinema, std::uintptr_t only = 0, bool screen = false) {
     const std::uintptr_t ID = only ? only : g_read.id ? g_read.id : g_lastAimedId;
     const auto* E = ID ? g_world.find(ID) : nullptr;
     if (!E) {
-        notify(cinema ? "[hypr3d] F4: aim at a window to show it big" :
+        notify(screen ? "[hypr3d] Super+F: aim at a window to put it on the screen in front" :
+               cinema ? "[hypr3d] F4: aim at a window to show it big" :
                         "[hypr3d] F2: aim at a window to read it",
                CHyprColor{0.2f, 0.8f, 0.4f, 1.0f});
-        return;
+        return false;
     }
     if (!g_read.id) {
         g_read            = {};
         g_read.id         = ID;
         g_read.cinema     = cinema;
+        g_read.screen     = screen;
         g_read.roomCenter = E->center;
         g_read.roomYaw = E->yaw, g_read.roomPitch = E->pitch, g_read.roomRoll = E->roll;
     } else if (g_read.back) {
         g_read.back   = false;
         g_read.cinema = cinema;
-    } else if (g_read.cinema != cinema)
+        g_read.screen = screen;
+    } else if (g_read.cinema != cinema || g_read.screen != screen) {
         g_read.cinema = cinema;
-    else
+        g_read.screen = screen;
+    } else
         g_read.back = true;
     g_read.legDim    = g_read.dim;
     g_read.arrived   = false;
@@ -2616,13 +2629,17 @@ static void toggleReading(bool cinema, std::uintptr_t only = 0) {
     g_read.legScale  = E->logicalWidth > 0.f ?
         E->width / World3D::toWorld(E->logicalWidth) : configWindowScale();
     damageCurrentMonitor();
+    return true;
 }
 
 // Leaving, a fullscreen or a grab ends reading at once: the room pose back
 // unless the window is being carried off.
+static void useEnd();
 static void endReading(bool putBack) {
     if (!g_read.id)
         return;
+    if (g_read.screen)
+        useEnd();
     if (auto* E = putBack ? g_world.find(g_read.id) : nullptr) {
         E->center = g_read.roomCenter;
         E->yaw = g_read.roomYaw, E->pitch = g_read.roomPitch, E->roll = g_read.roomRoll;
@@ -4149,6 +4166,19 @@ static void useEnd() {
     damageCurrentMonitor();
 }
 
+static void useWindow(const PHLWINDOW& window, Vector2D local) {
+    g_use.id         = Compat::windowId(window);
+    g_use.local      = local;
+    g_use.mode       = g_keyboardMode;
+    g_use.lockBefore = g_focusLockId;
+    if (Compat::focusedWindow() != window)
+        Compat::focusWindow(window);
+    g_focusLockId  = g_use.id;
+    g_keyboardMode = EKeyboardMode::Window;
+    resetMovementKeys();
+    damageCurrentMonitor();
+}
+
 static void useBegin() {
     const auto HIT    = aimHit();
     const auto TARGET = HIT.hit ? targetFromHit(HIT.id) : SHitTarget{};
@@ -4156,16 +4186,28 @@ static void useBegin() {
         notify("[hypr3d] F8: aim at a window to use it", CHyprColor{0.2f, 0.8f, 0.4f, 1.0f});
         return;
     }
-    g_use.id         = Compat::windowId(TARGET.window);
-    g_use.local      = localFromHit(HIT);
-    g_use.mode       = g_keyboardMode;
-    g_use.lockBefore = g_focusLockId;
-    if (Compat::focusedWindow() != TARGET.window)
-        Compat::focusWindow(TARGET.window);
-    g_focusLockId  = g_use.id;
-    g_keyboardMode = EKeyboardMode::Window;
-    resetMovementKeys();
-    damageCurrentMonitor();
+    useWindow(TARGET.window, localFromHit(HIT));
+}
+
+// Super+F in the room: the aimed window on a screen in front of the player --
+// most of the view, the room still around its corners -- and used like a
+// monitor from the start: the mouse is its pointer, every key its key (F8's
+// use). Super+F again sends it back and gives walking back. The rice's own
+// Super+F took the player out of the room into 2D.
+static void toggleScreen() {
+    if (g_read.id && g_read.screen && !g_read.back) {
+        useEnd();
+        toggleReading(false, 0, true); // the same mode again: back
+        return;
+    }
+    if (g_use.id)
+        useEnd();
+    if (!toggleReading(false, 0, true))
+        return;
+    const auto  W = Compat::findWindowById(g_read.id);
+    const auto* E = g_world.find(g_read.id);
+    if (W && E)
+        useWindow(W, Vector2D{E->surfaceWidth * 0.5, E->surfaceHeight * 0.5});
 }
 
 // Every frame: where the pointer is in the world, for the crosshair.
@@ -6104,6 +6146,19 @@ static void onMouseMove(Vector2D pos, Event::SCallbackInfo& info) {
     info.cancelled = true;
 }
 
+// Another key, button or wheel while Super is held: no bind on releasing
+// Super alone may fire. Hyprland shadows such binds itself when a Super
+// combination fires one of its own (shadowKeybinds after a suppressed key);
+// the room swallows some combinations first (Super+F, Super+drag,
+// Super+wheel), so Hyprland never did, and caelestia's launcher -- bound to
+// releasing Super_L -- opened over Super+F's screen and took every key typed
+// into it (measured 2026-10-08). Clearing releasePending did not stop it.
+static void superComboTaken() {
+    if (!g_superHeld || !g_pKeybindManager)
+        return;
+    g_pKeybindManager->shadowKeybinds();
+}
+
 static void onMouseAxis(
     IPointer::SAxisEvent event,
     Event::SCallbackInfo& info
@@ -6111,6 +6166,7 @@ static void onMouseAxis(
     if (!ownsInput())
         return;
     damageCurrentMonitor(); // a still room draws again (roomStill)
+    superComboTaken();
 
     if (event.axis != WL_POINTER_AXIS_VERTICAL_SCROLL)
         return;
@@ -6363,6 +6419,8 @@ static void onMouseButton(
 
     const bool PRESSED =
         event.state == WL_POINTER_BUTTON_STATE_PRESSED;
+    if (PRESSED)
+        superComboTaken();
 
     // A window in use takes the buttons where its pointer is.
     if (g_use.id) {
@@ -6733,7 +6791,7 @@ static void setMovementSym(xkb_keysym_t sym, bool down) {
     }
 }
 
-static void onKeyboardKey(
+static void onKeyboardKeyRoom(
     IKeyboard::SKeyEvent event,
     Event::SCallbackInfo& info
 ) {
@@ -6765,6 +6823,8 @@ static void onKeyboardKey(
         g_superHeld = PRESSED;
     else if (SYM == XKB_KEY_Alt_L)
         g_altHeld = PRESSED;
+    if (PRESSED && SYM != XKB_KEY_Super_L && SYM != XKB_KEY_Super_R)
+        superComboTaken();
 
     // A game holding the mouse has the keyboard too; keys held for walking
     // let go, so the player does not walk on behind it.
@@ -6808,6 +6868,14 @@ static void onKeyboardKey(
 
         info.cancelled = true;
         damageCurrentMonitor();
+        return;
+    }
+
+    // Super+F: the screen in front (toggleScreen), in both keyboard modes --
+    // the rice's fullscreen bind never sees it in the room.
+    if (PRESSED && g_superHeld && (SYM == XKB_KEY_f || SYM == XKB_KEY_F)) {
+        toggleScreen();
+        info.cancelled = true;
         return;
     }
 
@@ -6904,6 +6972,40 @@ static void onKeyboardKey(
     setMovementSym(SYM, PRESSED);
 
     info.cancelled = true;
+}
+
+// The keys whose press the room kept from Hyprland, by evdev code.
+static std::vector<uint32_t> g_keptKeys;
+
+// A key's release goes where its press went. Super's press is the room's
+// (its mouse gestures), but after Super+F the room is in use mode, where
+// every key reaches the window: Super's release reached Hyprland with no
+// press before it, Hyprland's fallback for that took it for a tap of Super,
+// and caelestia's launcher -- bound to releasing Super_L -- opened over the
+// screen and took the keys typed into it (measured 2026-10-08: Hyprland's
+// pressed keys were empty when F came). The other way round, a press let
+// through and its release kept left Hyprland holding the key. A mode change
+// or the room closing between the two changes nothing.
+static void onKeyboardKey(
+    IKeyboard::SKeyEvent event,
+    Event::SCallbackInfo& info
+) {
+    const bool PRESSED = event.state == WL_KEYBOARD_KEY_STATE_PRESSED;
+    const auto KEPT    = std::find(g_keptKeys.begin(), g_keptKeys.end(), event.keycode);
+    if (!PRESSED && KEPT != g_keptKeys.end()) {
+        g_keptKeys.erase(KEPT);
+        onKeyboardKeyRoom(event, info); // the room sees its own key let go
+        info.cancelled = true;
+        return;
+    }
+    onKeyboardKeyRoom(event, info);
+    if (!PRESSED)
+        info.cancelled = false; // its press went to Hyprland
+    else if (info.cancelled) {
+        if (KEPT == g_keptKeys.end())
+            g_keptKeys.push_back(event.keycode);
+    } else if (KEPT != g_keptKeys.end())
+        g_keptKeys.erase(KEPT); // a press let through: so is its release
 }
 
 // --- plugin entry -----------------------------------------------------------

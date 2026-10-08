@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Render/MapModel.hpp"
+#include "Render/Overlay.hpp"
 #include "Render/PlayerModel.hpp"
 #include "World/Camera.hpp"
 #include "World/Outline.hpp"
@@ -10,6 +11,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace H3D {
@@ -120,11 +122,17 @@ class GLScene {
         m_cursorAt = at, m_cursorOn = on;
     }
 
-    // The process gun's sight (main's g_gun): the crosshair red while it is
-    // out, and a ring around it filling with `charge` (0..1) while a kill is
-    // held -- red when the window aimed at hangs.
-    void setGunSight(bool on, float charge, bool hung) {
-        m_gunOn = on, m_gunCharge = charge, m_gunHung = hung;
+    // The crosshair overlay (main's, Overlay::): the mark, the label under
+    // it, the gun's pill, as screen sprites. While any is set it replaces
+    // the plain cross; a window in use keeps the arrow instead.
+    struct SOverlaySprite {
+        std::shared_ptr<const Overlay::SImage> image;
+        bool  top   = false; // anchored at the top middle, else at the centre
+        float dy    = 0.0f;  // px down from the anchor
+        float alpha = 1.0f;
+    };
+    void setOverlay(std::vector<SOverlaySprite> sprites) {
+        m_overlay = std::move(sprites);
     }
 
     // F3 debug HUD: collision wireframe + info text (coords/yaw/pitch/fps).
@@ -410,6 +418,7 @@ class GLScene {
     void drawDim(float dim);
     void drawFullscreen(float alpha);
     void drawCrosshair(int width, int height);
+    void drawOverlay(int width, int height);
 
   private:
     bool m_initialized = false;
@@ -461,12 +470,12 @@ class GLScene {
     unsigned int m_fullscreenVBO = 0;
 
     unsigned int m_crosshairVAO = 0;
-    bool         m_gunOn = false, m_gunHung = false;
     bool         m_cursorOn = false;
     Vec3         m_cursorAt{};
     Mat4         m_lastVP{}; // the primary view's, for the cursor
-    float        m_gunCharge = 0.0f;
-    unsigned int m_ringVAO = 0, m_ringVBO = 0;
+    std::vector<SOverlaySprite>                  m_overlay;
+    std::unordered_map<uint64_t, unsigned int>   m_overlayTex; // by SImage::serial
+    unsigned int                                 m_overlayVAO = 0, m_overlayVBO = 0;
     unsigned int m_crosshairVBO = 0;
 
     int m_sceneMVP = -1;

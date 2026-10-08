@@ -166,6 +166,18 @@ or the arc in front of the camera -- and leaves the player and the menu where
 they are; `reset()` also takes the player back to the spawn. The poses before
 are kept for one `undo`. Both fail with the reason when there is nothing to do.
 
+### The crosshair
+
+The crosshair's shape says what it points at: brackets on a window, a ring
+on an object -- blue when Super + drag carries it, white when it is fixed in
+place --, a diamond on a portal, a dot on anything else. Once the aim has
+rested on a window, an object with a `label` or a portal for 120 ms, a label
+under it names it and the keys that work there; after 2 s it folds to the
+name. Carrying a window over the waste bin, the ring turns red and the label
+says that letting go closes it. With the process gun (F7) the mark is a red
+cross, the label adds the process number, and a pill at the top says the gun
+is out.
+
 ### The room's state
 
 The plugin writes flying, gravity and the HUD as `key=value` lines to
@@ -320,6 +332,8 @@ Everything is optional -- only set what you want to change.
 | collision | bool          | true    | whether body collides with the world                 |
 | static    | bool          | true    | you can't pick it up and carry it; suitable for maps |
 | physics   | bool          | false   | enable jolt physics (only if static=false)           |
+| label     | string        | ""      | its name in the crosshair's label; a static object without one is scenery and gets none |
+| note      | string        | ""      | what it is for, after the name in the label          |
 
 Want only part of a model to be solid? Rename those nodes in Blender to
 start with `nocol` -- they'll still render, but you'll walk right through.

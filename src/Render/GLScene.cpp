@@ -909,9 +909,7 @@ bool GLScene::createMeshes() {
 
     glBindVertexArray(0);
 
-    // Dynamic screen-space crosshair. Four independent rectangular arms are
-    // used instead of GL_LINES so the shape stays visibly cross-like and its
-    // thickness remains stable across drivers.
+    // The pointer arrow of a window in use (drawCrosshair), screen space.
     glGenVertexArrays(1, &m_crosshairVAO);
     glGenBuffers(1, &m_crosshairVBO);
 
@@ -2128,6 +2126,70 @@ void GLScene::drawBinHalo(const Mat4& vp) {
     glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
 }
 
+void GLScene::drawOverlay(int width, int height) {
+    // Textures of images no longer shown go first.
+    std::erase_if(m_overlayTex, [&](const auto& T) {
+        const bool LIVE = std::ranges::any_of(m_overlay, [&](const SOverlaySprite& S) { return S.image && S.image->serial == T.first; });
+        if (!LIVE)
+            glDeleteTextures(1, &T.second);
+        return !LIVE;
+    });
+    if (m_overlay.empty() || width <= 0 || height <= 0)
+        return;
+    if (!m_overlayVAO) {
+        glGenVertexArrays(1, &m_overlayVAO);
+        glGenBuffers(1, &m_overlayVBO);
+        glBindVertexArray(m_overlayVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, m_overlayVBO);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), reinterpret_cast<void*>(0));
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), reinterpret_cast<void*>(3 * sizeof(float)));
+    }
+    glUseProgram(m_sceneProgram);
+    const Mat4 I = Mat4::identity();
+    glUniformMatrix4fv(m_sceneMVP, 1, GL_FALSE, I.m.data());
+    glUniform4f(m_sceneUVRect, 0.f, 0.f, 1.f, 1.f);
+    glUniform1i(m_sceneTexture, 0);
+    glUniform1i(m_sceneTextured, 1);
+    glActiveTexture(GL_TEXTURE0);
+    glBindVertexArray(m_overlayVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_overlayVBO);
+    // The images are premultiplied.
+    glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    for (const auto& S : m_overlay) {
+        if (!S.image || S.image->w <= 0 || S.image->h <= 0 || S.alpha <= 0.002f)
+            continue;
+        auto& tex = m_overlayTex[S.image->serial];
+        if (!tex) {
+            glGenTextures(1, &tex);
+            glBindTexture(GL_TEXTURE_2D, tex);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, S.image->w, S.image->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, S.image->rgba.data());
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        } else
+            glBindTexture(GL_TEXTURE_2D, tex);
+        // Whole pixels, so the painted 1 px lines stay sharp. The target's
+        // y = -1 is its top.
+        const float X0 = std::round(width / 2.0f - S.image->ax);
+        const float Y0 = std::round((S.top ? 0.0f : height / 2.0f) + S.dy - S.image->ay);
+        const float L = X0 / width * 2.f - 1.f, R = (X0 + S.image->w) / width * 2.f - 1.f;
+        const float T = Y0 / height * 2.f - 1.f, B = (Y0 + S.image->h) / height * 2.f - 1.f;
+        const float V[] = {L, T, 0.f, 0.f, 0.f, R, T, 0.f, 1.f, 0.f, R, B, 0.f, 1.f, 1.f,
+                           L, T, 0.f, 0.f, 0.f, R, B, 0.f, 1.f, 1.f, L, B, 0.f, 0.f, 1.f};
+        glBufferData(GL_ARRAY_BUFFER, sizeof(V), V, GL_DYNAMIC_DRAW);
+        glUniform4f(m_sceneColorUniform, S.alpha, S.alpha, S.alpha, S.alpha);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+    }
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+
 void GLScene::drawCrosshair(int width, int height) {
     if (!m_crosshairVAO || !m_crosshairVBO || width <= 0 || height <= 0)
         return;
@@ -2181,119 +2243,8 @@ void GLScene::drawCrosshair(int width, int height) {
         return;
     }
 
-    constexpr float OUTER_PX   = 10.0f;
-    constexpr float INNER_PX   = 3.5f;
-    constexpr float THICK_PX   = 1.4f;
-    constexpr float OUTLINE_PX = 1.0f;
-
-    const auto addRect = [&](std::vector<float>& v, float x0, float y0, float x1, float y1) {
-        const float z = 0.0f;
-        const float u = 0.0f;
-        const float t = 0.0f;
-        x0 += atX, x1 += atX, y0 += atY, y1 += atY;
-        const float verts[] = {
-            x0,y0,z,u,t, x1,y0,z,u,t, x1,y1,z,u,t,
-            x0,y0,z,u,t, x1,y1,z,u,t, x0,y1,z,u,t,
-        };
-        v.insert(v.end(), std::begin(verts), std::end(verts));
-    };
-
-    // One layer of the crosshair: four arms with the given pixel metrics and
-    // color, uploaded and drawn as screen-space geometry.
-    const auto drawLayer = [&](float outer, float inner, float thick,
-                               float r, float g, float b, float a) {
-        const float outerX = outer * pxX;
-        const float innerX = inner * pxX;
-        const float halfTX = (thick * pxX) * 0.5f;
-        const float outerY = outer * pxY;
-        const float innerY = inner * pxY;
-        const float halfTY = (thick * pxY) * 0.5f;
-
-        std::vector<float> verts;
-        verts.reserve(24 * 5);
-
-        // Horizontal arm.
-        addRect(verts, -outerX, -halfTY, -innerX, halfTY);
-        addRect(verts,  innerX, -halfTY,  outerX, halfTY);
-        // Vertical arm.
-        addRect(verts, -halfTX,  innerY, halfTX, outerY);
-        addRect(verts, -halfTX, -outerY, halfTX, -innerY);
-
-        glUseProgram(m_sceneProgram);
-
-        const Mat4 IDENTITY = Mat4::identity();
-        glUniformMatrix4fv(m_sceneMVP, 1, GL_FALSE, IDENTITY.m.data());
-        glUniform1i(m_sceneTextured, 0);
-        glUniform4f(m_sceneColorUniform, r, g, b, a);
-        glUniform4f(m_sceneUVRect, 0.0f, 0.0f, 1.0f, 1.0f);
-
-        glBindBuffer(GL_ARRAY_BUFFER, m_crosshairVBO);
-        glBufferSubData(
-            GL_ARRAY_BUFFER, 0,
-            static_cast<GLsizeiptr>(verts.size() * sizeof(float)),
-            verts.data()
-        );
-
-        glBindVertexArray(m_crosshairVAO);
-        glDrawArrays(GL_TRIANGLES, 0, 24);
-        glBindVertexArray(0);
-    };
-
-    // Black core with a white outline: the slightly larger white cross is
-    // drawn first, so the black one keeps full contrast on any background.
-    // Red while the process gun is out.
-    drawLayer(OUTER_PX + OUTLINE_PX, std::max(0.0f, INNER_PX - OUTLINE_PX),
-        THICK_PX + 2.0f * OUTLINE_PX, 1.0f, 1.0f, 1.0f, 1.0f);
-    if (m_gunOn)
-        drawLayer(OUTER_PX, INNER_PX, THICK_PX, 0.9f, 0.12f, 0.1f, 1.0f);
-    else
-        drawLayer(OUTER_PX, INNER_PX, THICK_PX, 0.0f, 0.0f, 0.0f, 1.0f);
-
-    // The kill being held: a ring filling clockwise from the top.
-    if (!m_gunOn || m_gunCharge <= 0.0f)
-        return;
-    if (!m_ringVAO) {
-        glGenVertexArrays(1, &m_ringVAO);
-        glGenBuffers(1, &m_ringVBO);
-        glBindVertexArray(m_ringVAO);
-        glBindBuffer(GL_ARRAY_BUFFER, m_ringVBO);
-        glEnableVertexAttribArray(0);
-        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), reinterpret_cast<void*>(0));
-        glEnableVertexAttribArray(1);
-        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float),
-                              reinterpret_cast<void*>(3 * sizeof(float)));
-    }
-    constexpr int   SEGMENTS = 48;
-    constexpr float RADIUS_PX = 18.0f, RING_PX = 3.0f;
-    const int       N = std::max(1, static_cast<int>(std::ceil(SEGMENTS * std::min(m_gunCharge, 1.0f))));
-    std::vector<float> ring;
-    ring.reserve(N * 30);
-    const auto AT = [&](float a, float r) {
-        return std::array<float, 2>{std::sin(a) * r * pxX, std::cos(a) * r * pxY};
-    };
-    for (int i = 0; i < N; ++i) {
-        const float A0 = 2.0f * 3.14159265f * std::min(m_gunCharge, 1.0f) * i / N;
-        const float A1 = 2.0f * 3.14159265f * std::min(m_gunCharge, 1.0f) * (i + 1) / N;
-        const auto  I0 = AT(A0, RADIUS_PX - RING_PX * 0.5f), O0 = AT(A0, RADIUS_PX + RING_PX * 0.5f);
-        const auto  I1 = AT(A1, RADIUS_PX - RING_PX * 0.5f), O1 = AT(A1, RADIUS_PX + RING_PX * 0.5f);
-        const float Q[] = {I0[0], I0[1], 0.f, 0.f, 0.f, O0[0], O0[1], 0.f, 0.f, 0.f, O1[0], O1[1], 0.f, 0.f, 0.f,
-                           I0[0], I0[1], 0.f, 0.f, 0.f, O1[0], O1[1], 0.f, 0.f, 0.f, I1[0], I1[1], 0.f, 0.f, 0.f};
-        ring.insert(ring.end(), std::begin(Q), std::end(Q));
-    }
-    glUseProgram(m_sceneProgram);
-    const Mat4 IDENTITY = Mat4::identity();
-    glUniformMatrix4fv(m_sceneMVP, 1, GL_FALSE, IDENTITY.m.data());
-    glUniform1i(m_sceneTextured, 0);
-    if (m_gunHung)
-        glUniform4f(m_sceneColorUniform, 0.95f, 0.15f, 0.1f, 1.0f);
-    else
-        glUniform4f(m_sceneColorUniform, 1.0f, 1.0f, 1.0f, 1.0f);
-    glUniform4f(m_sceneUVRect, 0.0f, 0.0f, 1.0f, 1.0f);
-    glBindVertexArray(m_ringVAO);
-    glBindBuffer(GL_ARRAY_BUFFER, m_ringVBO);
-    glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(ring.size() * sizeof(float)), ring.data(), GL_DYNAMIC_DRAW);
-    glDrawArrays(GL_TRIANGLES, 0, N * 6);
-    glBindVertexArray(0);
+    // Otherwise main's overlay: the mark for what the aim is on.
+    drawOverlay(width, height);
 }
 
 void GLScene::drawFullscreen(
@@ -3295,10 +3246,13 @@ void GLScene::destroyGLObjects() {
         glDeleteBuffers(1, &m_hudVBO);
         m_hudVAO = m_hudVBO = 0;
     }
-    if (m_ringVAO) {
-        glDeleteVertexArrays(1, &m_ringVAO);
-        glDeleteBuffers(1, &m_ringVBO);
-        m_ringVAO = m_ringVBO = 0;
+    for (const auto& [SERIAL, TEX] : m_overlayTex)
+        glDeleteTextures(1, &TEX);
+    m_overlayTex.clear();
+    if (m_overlayVAO) {
+        glDeleteVertexArrays(1, &m_overlayVAO);
+        glDeleteBuffers(1, &m_overlayVBO);
+        m_overlayVAO = m_overlayVBO = 0;
     }
     if (m_shadowVAO) {
         glDeleteVertexArrays(1, &m_shadowVAO);

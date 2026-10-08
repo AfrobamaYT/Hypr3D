@@ -441,6 +441,9 @@ static void writeRoomState() {
 struct SSceneObjectCfg {
     std::string name; // the lua table key ("scene.<name>")
     std::string path;
+    // What the crosshair's label calls it and says it is for. Without a
+    // label a static object is scenery: the crosshair shows nothing on it.
+    std::string label, note;
     Vec3        position{}, rotationDeg{}, scale{1.0f, 1.0f, 1.0f};
     float       emissiveScale = 1.0f;
     bool        flat = false; // false = headlight half-lambert shading
@@ -2772,6 +2775,25 @@ struct SGunHold {
 };
 static SGunHold        g_gunHold;
 static void            gunTick(); // with the trigger, by onMouseButton
+static void            overlayTick(); // the crosshair overlay, every frame
+
+// The crosshair overlay (Overlay::, the owner's approved draft "Room
+// Overlays", 2026-10-08): the mark's shape names what the aim is on --
+// brackets a window, a ring an object, a diamond a portal, a dot nothing --
+// and a label under it names it and the keys that work there. The images
+// are painted when what they show changes, not per frame.
+struct SAimOverlay {
+    std::string target;      // what the aim is on: a change restarts the label's clock
+    double      since = 0.0; // nowSeconds() of that change
+    std::string markKey, labelKey, compactKey, pillKey;
+    std::shared_ptr<const Overlay::SImage> mark, label, compact, pill;
+    // For the status file.
+    int         markKind = 0;
+    std::string labelName;
+    float       full = 0.0f, folded = 0.0f;
+};
+static SAimOverlay g_aimOverlay;
+
 static constexpr float kGunKillSeconds  = 1.0f;
 static constexpr float kGunJoltSeconds  = 0.3f;
 static constexpr float kGunJolt         = 0.25f; // m back at the hit
@@ -5656,6 +5678,7 @@ static void update3D(float dt) {
     gunTick();
     syncWorld(MON, dt);
     useTick();
+    overlayTick();
 
     applyFullscreenAnimation();
 
@@ -6030,6 +6053,8 @@ static void dumpStatus(bool force = false) {
             out << " surface=" << UE->surfaceWidth << "x" << UE->surfaceHeight << " box=" << UE->logicalWidth << "x"
                 << UE->logicalHeight;
         out << "\n";
+        out << "aim: target=" << g_aimOverlay.target << " mark=" << g_aimOverlay.markKind << " label=" << g_aimOverlay.labelName
+            << " full=" << g_aimOverlay.full << " folded=" << g_aimOverlay.folded << "\n";
         out << "gun: out=" << (g_gun ? 1 : 0) << " holding=" << g_gunHold.id << " shots=" << g_gunShots.size() << "\n";
         out << "read: id=" << g_read.id << " menu=" << g_menuId << " arrived=" << (g_read.arrived ? 1 : 0)
             << " following=" << (g_read.following ? 1 : 0) << " at=(" << g_read.atCenter.x << ","
@@ -6195,8 +6220,11 @@ static uint64_t frameFingerprint() {
 
 // What moves on its own, with no state yet to show it: an animation clock,
 // work done off the main thread, a request waiting for the next frame.
+static bool g_aimLabelBusy = false; // overlayTick: a label still to appear or fold
+
 static bool runsOnTime() {
     return g_debugHud                        // the HUD counts frames
+        || g_aimLabelBusy
         || g_viewMode != 0                   // F5: the player's own animation
         || g_scene.scenePending() || joltShapesPending()
         || g_sightPending
@@ -6578,19 +6606,14 @@ static void gunTick() {
     std::erase_if(g_gunShots, [&](const SGunShot& S) {
         return std::chrono::duration<float>(NOW - S.at).count() >= kGunJoltSeconds;
     });
-    float charge = 0.0f;
-    bool  hung   = false;
     if (g_gun && g_gunHold.active) {
         const auto WINDOW = gunTarget();
         if (!WINDOW || Compat::windowId(WINDOW) != g_gunHold.id)
             g_gunHold = {};
         else {
-            hung   = g_pANRManager && g_pANRManager->isNotResponding(WINDOW);
-            charge = std::chrono::duration<float>(NOW - g_gunHold.since).count() / kGunKillSeconds;
-            if (charge >= 1.0f) {
+            if (std::chrono::duration<float>(NOW - g_gunHold.since).count() >= kGunKillSeconds) {
                 const auto ID = g_gunHold.id;
                 g_gunHold = {};
-                charge    = 0.0f;
                 if (g_pEventLoopManager)
                     g_pEventLoopManager->doLater([ID] {
                         const auto W = Compat::findWindowById(ID);
@@ -6603,7 +6626,237 @@ static void gunTick() {
             }
         }
     }
-    g_scene.setGunSight(g_gun, charge, hung);
+}
+
+// The first thing along the crosshair's ray: a window or layer (aimHit's,
+// its see-through pixels skipped), a scene object, or a portal.
+struct SAimHit {
+    enum class EKind { None, Surface, Object, Portal } kind = EKind::None;
+    float          t     = 0.0f;
+    std::uintptr_t id    = 0; // Surface
+    size_t         index = 0; // Object, Portal
+};
+
+static SAimHit firstAlongAim() {
+    const auto& CAM = g_scene.camera();
+    const Vec3  O = CAM.position, D = CAM.centerRay();
+    SAimHit     best;
+    const auto  take = [&](SAimHit h) {
+        if (h.t > 0.0f && (best.kind == SAimHit::EKind::None || h.t < best.t))
+            best = h;
+    };
+    if (const auto HIT = aimHit(); HIT.hit)
+        take({SAimHit::EKind::Surface, HIT.distance, HIT.id, 0});
+    // Objects the way Super+drag measures them (a dynamic one by its model)
+    // and the collision does (a static one by its tree); scenery hides what
+    // is behind it, so every object counts.
+    for (size_t i = 0; i < g_sceneObjects.size(); ++i) {
+        if (i == g_mapGrabIndex)
+            continue;
+        const auto* MODEL = g_scene.sceneModel(i);
+        float       t     = -1.0f;
+        if (!g_sceneObjects[i].dynamic && i < g_objTrees.size() && !g_objTrees[i].empty())
+            t = g_objTrees[i].rayCast(O, D);
+        else if (MODEL && MODEL->loaded())
+            t = MODEL->rayCast(O, D);
+        take({SAimHit::EKind::Object, t, 0, i});
+    }
+    // A portal's picture: its plane, within its width and height.
+    for (size_t i = 0; i < g_portals.size(); ++i) {
+        const auto& P      = g_portals[i].spec;
+        const float ASPECT = g_scene.portalAspect(P.name);
+        if (ASPECT <= 0.0f)
+            continue;
+        const Vec3  FACE{std::sin(P.yaw), 0.f, -std::cos(P.yaw)};
+        const Vec3  RIGHT = normalize(cross(FACE * -1.0f, Vec3{0.f, 1.f, 0.f}));
+        const float DEN   = dot(D, FACE);
+        if (std::fabs(DEN) < 1e-6f)
+            continue;
+        const float T  = dot(P.base - O, FACE) / DEN;
+        const Vec3  AT = O + D * T - P.base;
+        if (T > 0.0f && std::fabs(dot(AT, RIGHT)) <= P.width * 0.5f && AT.y >= 0.0f && AT.y <= P.width * ASPECT)
+            take({SAimHit::EKind::Portal, T, 0, i});
+    }
+    return best;
+}
+
+static std::string windowName(const PHLWINDOW& w) {
+    return w->m_class.empty() ? w->m_title : w->m_class;
+}
+
+static std::string labelKeyOf(const Overlay::SLabel& l, float scale) {
+    std::string k = std::to_string(static_cast<int>(l.style)) + "\x1f" + l.name + "\x1f" + l.note + "\x1f" +
+        std::to_string(l.gap) + "\x1f" + std::to_string(scale);
+    for (const auto& K : l.keys) {
+        for (const auto& C : K.caps)
+            k += "\x1f" + C;
+        k += "\x1e" + K.label + "\x1e" + std::to_string(K.alpha);
+    }
+    return k;
+}
+
+// Every frame, after the aim and the drag moved: what the overlay shows.
+static void overlayTick() {
+    using Overlay::EMark;
+    using EStyle = Overlay::SLabel::EStyle;
+    const float SCALE = g_monitor ? static_cast<float>(g_monitor->m_scale) : 1.0f;
+
+    EMark                          mark   = EMark::Nothing;
+    std::string                    target = "none";
+    std::optional<Overlay::SLabel> label;
+    bool  wait = true, fold = true; // waits for the aim to rest 120 ms, folds after 2 s
+    float labelDy = 26.0f, charge = 0.0f;
+
+    const auto objectLabel = [](size_t i) -> std::string {
+        const auto& OBJ = g_sceneObjects[i];
+        if (!OBJ.label.empty() || !OBJ.dynamic)
+            return OBJ.label;
+        std::string n = OBJ.name;
+        if (!n.empty())
+            n[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(n[0])));
+        return n;
+    };
+    const Overlay::SKey CARRY{{"Super"}, "+ drag Carry"};
+
+    if (g_gun) {
+        // The process gun: a red cross on every target it can shoot.
+        fold = false;
+        if (g_gunHold.active)
+            charge = std::chrono::duration<float>(std::chrono::steady_clock::now() - g_gunHold.since).count() / kGunKillSeconds;
+        if (const auto WINDOW = gunTarget()) {
+            const auto ID = Compat::windowId(WINDOW);
+            if (g_gunHold.active && g_gunHold.id == ID && charge > 0.0f) {
+                mark    = EMark::GunHold;
+                target  = "gunhold:" + std::to_string(ID);
+                label   = Overlay::SLabel{EStyle::Alert, "Killing " + windowName(WINDOW), "Let go now to only close it", {}, 6.0f};
+                labelDy = 32.0f, wait = false;
+            } else {
+                mark   = EMark::Gun;
+                target = "gun:" + std::to_string(ID);
+                label  = Overlay::SLabel{EStyle::Full, windowName(WINDOW), "process " + std::to_string(WINDOW->getPID()),
+                                         {{{"Click"}, "Close"}, {{"Hold 1 s"}, "Kill"}}};
+            }
+        } else {
+            mark      = EMark::GunIdle;
+            const auto HIT = firstAlongAim();
+            target    = "gunidle:" + std::to_string(static_cast<int>(HIT.kind)) + ":" + std::to_string(HIT.index);
+            if (HIT.kind == SAimHit::EKind::Object && !objectLabel(HIT.index).empty())
+                label = Overlay::SLabel{EStyle::Quiet, objectLabel(HIT.index) + " · nothing to close"};
+        }
+    } else if (g_world.dragActive()) {
+        // Carrying a window: over the bin, what letting go will do -- the
+        // same test the let-go makes (dropInBin).
+        const auto ID     = g_world.draggedId();
+        const auto WINDOW = Compat::findWindowById(ID);
+        if (WINDOW && aimAtBin()) {
+            mark   = EMark::Bin;
+            target = "bin:" + std::to_string(ID);
+            label  = Overlay::SLabel{EStyle::Alert, "Let go to close " + windowName(WINDOW), "Carry it on to keep it open"};
+            wait = false, fold = false;
+        } else {
+            mark   = EMark::Window;
+            target = "carry:" + std::to_string(ID);
+        }
+    } else if (g_mapGrabIndex != SIZE_MAX) {
+        mark   = EMark::Carry;
+        target = "carryobj:" + std::to_string(g_mapGrabIndex);
+    } else {
+        const auto HIT = firstAlongAim();
+        switch (HIT.kind) {
+            case SAimHit::EKind::Surface: {
+                const auto T = targetFromHit(HIT.id);
+                mark   = EMark::Window;
+                target = "surface:" + std::to_string(HIT.id);
+                if (T.window) {
+                    const auto NAME = windowName(T.window);
+                    label = Overlay::SLabel{EStyle::Full, NAME, T.window->m_title == NAME ? "" : T.window->m_title,
+                                            {CARRY, {{"F2"}, "Read 1:1"}, {{"Super", "F"}, "Big screen"}}};
+                }
+                break;
+            }
+            case SAimHit::EKind::Object: {
+                const auto& OBJ  = g_sceneObjects[HIT.index];
+                const auto  NAME = objectLabel(HIT.index);
+                if (NAME.empty())
+                    break; // scenery: the floor, the walls
+                target = "object:" + OBJ.name;
+                if (OBJ.dynamic) {
+                    mark  = EMark::Carry;
+                    label = Overlay::SLabel{EStyle::Full, NAME, OBJ.note, {CARRY}};
+                } else {
+                    // Fixed: Carry stays in the label, faint, so it is clear
+                    // why Super+drag does nothing.
+                    mark  = EMark::Fixed;
+                    auto K = CARRY;
+                    K.alpha = 0.45f;
+                    label = Overlay::SLabel{EStyle::Full, NAME, OBJ.note.empty() ? "fixed in place" : OBJ.note, {K}};
+                }
+                break;
+            }
+            case SAimHit::EKind::Portal:
+                mark   = EMark::Portal;
+                target = "portal:" + g_portals[HIT.index].spec.name;
+                label  = Overlay::SLabel{EStyle::Full, g_portals[HIT.index].spec.name, "portal", {{{}, "Walk in to play"}}};
+                break;
+            case SAimHit::EKind::None: break;
+        }
+    }
+
+    // The images, painted when what they show changed.
+    const auto MARK_KEY = std::to_string(static_cast<int>(mark)) + ":" +
+        std::to_string(mark == EMark::GunHold ? std::lround(std::clamp(charge, 0.0f, 1.0f) * 100.0f) : 0) + ":" + std::to_string(SCALE);
+    if (MARK_KEY != g_aimOverlay.markKey) {
+        g_aimOverlay.markKey = MARK_KEY;
+        g_aimOverlay.mark    = std::make_shared<const Overlay::SImage>(Overlay::paintMark(mark, SCALE, std::clamp(charge, 0.0f, 1.0f)));
+    }
+    if (label) {
+        if (const auto K = labelKeyOf(*label, SCALE); K != g_aimOverlay.labelKey) {
+            g_aimOverlay.labelKey = K;
+            g_aimOverlay.label    = std::make_shared<const Overlay::SImage>(Overlay::paintLabel(*label, SCALE));
+        }
+        if (fold && label->style == EStyle::Full) {
+            const Overlay::SLabel COMPACT{EStyle::Compact, label->name};
+            if (const auto K = labelKeyOf(COMPACT, SCALE); K != g_aimOverlay.compactKey) {
+                g_aimOverlay.compactKey = K;
+                g_aimOverlay.compact    = std::make_shared<const Overlay::SImage>(Overlay::paintLabel(COMPACT, SCALE));
+            }
+        }
+    }
+    if (g_gun && g_aimOverlay.pillKey != std::to_string(SCALE)) {
+        g_aimOverlay.pillKey = std::to_string(SCALE);
+        g_aimOverlay.pill    = std::make_shared<const Overlay::SImage>(Overlay::paintGunPill(SCALE));
+    }
+
+    // The label's clock: it fades in over 220 ms once the aim rested 120 ms
+    // on its target, and after 2 s folds to the name alone.
+    const double NOW = nowSeconds();
+    if (target != g_aimOverlay.target)
+        g_aimOverlay.target = target, g_aimOverlay.since = NOW;
+    const float T   = static_cast<float>(NOW - g_aimOverlay.since);
+    const auto  FADE = [](float x) { return larchEase(ELarchEase::Fade, std::clamp(x, 0.0f, 1.0f)); };
+    float       full = 0.0f, folded = 0.0f;
+    if (label) {
+        full = FADE((T - (wait ? 0.12f : 0.0f)) / 0.22f);
+        if (fold && label->style == EStyle::Full) {
+            folded = FADE((T - 2.0f) / 0.22f);
+            full *= 1.0f - folded;
+        }
+    }
+    g_aimLabelBusy = label && T < (fold ? 2.25f : wait ? 0.37f : 0.25f);
+
+    std::vector<GLScene::SOverlaySprite> sprites;
+    sprites.push_back({g_aimOverlay.mark, false, 0.0f, 1.0f});
+    if (full > 0.0f)
+        sprites.push_back({g_aimOverlay.label, false, labelDy * SCALE, full});
+    if (folded > 0.0f)
+        sprites.push_back({g_aimOverlay.compact, false, 26.0f * SCALE, folded});
+    if (g_gun)
+        sprites.push_back({g_aimOverlay.pill, true, 48.0f * SCALE, 1.0f});
+    g_scene.setOverlay(std::move(sprites));
+
+    g_aimOverlay.markKind  = static_cast<int>(mark);
+    g_aimOverlay.labelName = label ? label->name : "";
+    g_aimOverlay.full = full, g_aimOverlay.folded = folded;
 }
 
 static void onMouseButton(
@@ -7745,6 +7998,11 @@ static int luaConfig(lua_State* L) {
                 lua_pop(L, 1);
             }
 
+            if (!SET_STRING(OIDX, "label", OBJ.label, "scene.<name>.label") ||
+                !SET_STRING(OIDX, "note", OBJ.note, "scene.<name>.note")) {
+                lua_pop(L, 1);
+                return luaL_error(L, "hypr3d.config: scene.<name>.label and .note must be strings");
+            }
             if (!SET_NUM(OIDX, "emissive_scale", OBJ.emissiveScale,
                          "scene.<name>.emissive_scale")) {
                 lua_pop(L, 1);

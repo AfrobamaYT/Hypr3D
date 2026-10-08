@@ -103,10 +103,12 @@ pkg_check_modules(LIBDRM REQUIRED IMPORTED_TARGET libdrm)
 pkg_check_modules(XKBCOMMON REQUIRED IMPORTED_TARGET xkbcommon)
 pkg_check_modules(HYPRGRAPHICS REQUIRED IMPORTED_TARGET hyprgraphics)
 pkg_check_modules(TURBOJPEG REQUIRED IMPORTED_TARGET libturbojpeg)
+pkg_check_modules(PANGOCAIRO REQUIRED IMPORTED_TARGET pangocairo cairo)
 
 add_library(hypr3d SHARED
     src/main.cpp
     src/Render/GLScene.cpp
+    src/Render/Overlay.cpp
     src/Render/MapModel.cpp
     src/Render/PlayerModel.cpp
     src/World/MapCollision.cpp
@@ -133,6 +135,7 @@ target_include_directories(hypr3d
 target_link_libraries(hypr3d PRIVATE
     PkgConfig::HYPRGRAPHICS
     PkgConfig::TURBOJPEG
+    PkgConfig::PANGOCAIRO
     PkgConfig::PIXMAN
     PkgConfig::LIBDRM
     PkgConfig::XKBCOMMON

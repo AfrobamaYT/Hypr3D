@@ -166,6 +166,14 @@ or the arc in front of the camera -- and leaves the player and the menu where
 they are; `reset()` also takes the player back to the spawn. The poses before
 are kept for one `undo`. Both fail with the reason when there is nothing to do.
 
+### Into the room and out
+
+Opening the room, the windows lift off their 2D tiles one after another and
+fly to where they hang in the room while the room fades up behind them over
+the desktop's wallpaper; the crosshair comes last. Leaving runs it backwards,
+the last panel first, and the desktop is back as the last one lands. Without
+a wallpaper on the background layer the room fades in and out as a whole.
+
 ### The crosshair
 
 The crosshair's shape says what it points at: brackets on a window, a ring

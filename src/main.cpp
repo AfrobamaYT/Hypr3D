@@ -137,6 +137,49 @@ static bool g_active = false;
 static float g_transition = 0.0f;
 static float g_transitionTarget = 0.0f;
 
+// The way into the room and out (the owner's approved "Room Motion" draft,
+// 2026-10-08): the windows lift off their 2D tiles one after another, 70 ms
+// apart, and dive to where they hang in the room (820 ms each), while the
+// room fades up behind them over the desktop's wallpaper; leaving runs it
+// backwards, the last panel first (700 ms each). Only with the wallpaper
+// captured -- it is what the windows lift off from -- else the plain fade.
+struct SFlight {
+    bool   active = false, leaving = false;
+    double requested = 0.0; // when the way in was asked for
+    double start = -1.0;    // when it began; < 0: waiting for the captures
+    std::unordered_map<std::uintptr_t, int>  order; // the order they lift off
+    std::unordered_map<std::uintptr_t, CBox> tiles; // their 2D tiles, monitor-local
+    // Their room pose, and the pose the flight wrote last frame: the entity
+    // keeps its pose from frame to frame, so the flight lerps from the room
+    // pose, never from its own last frame -- and when the room moved the
+    // window since (a fresh panel finding its place on the wall takes a few
+    // frames), that is the room pose from then on.
+    struct SPose {
+        Vec3  center{};
+        float yaw = 0.f, pitch = 0.f, roll = 0.f;
+        bool  operator==(const SPose& o) const {
+            return center.x == o.center.x && center.y == o.center.y && center.z == o.center.z && yaw == o.yaw &&
+                pitch == o.pitch && roll == o.roll;
+        }
+    };
+    std::unordered_map<std::uintptr_t, SPose> room, wrote;
+    int    count = 0;
+};
+static SFlight g_flight;
+static constexpr double kFlightGap = 0.07, kFlightFirst = 0.12, kFlightIn = 0.82, kFlightOut = 0.70;
+static constexpr double kRoomFadeAt = 0.2, kRoomFade = 0.54, kCrossAt = 1.0;
+
+// The desktop's wallpaper: the first visible surface on the monitor's
+// background layer, which the room otherwise leaves out.
+static PHLLS backdropLayer(const PHLMONITOR& mon) {
+    if (!mon)
+        return nullptr;
+    for (const auto& LSREF : mon->m_layerSurfaceLayers[0])
+        if (const auto LS = LSREF.lock(); LS && LS->visible())
+            return LS;
+    return nullptr;
+}
+
 static PHLMONITOR g_monitor = nullptr;
 
 static const auto g_inputClockStart = std::chrono::steady_clock::now();
@@ -2242,8 +2285,14 @@ static void refreshCaptures(
 
     for (const auto& info : infos)
         keep.push_back(info.id);
+    // The wallpaper too, for the flight in and out (g_flight).
+    const auto BACKDROP = backdropLayer(g_monitor);
+    if (BACKDROP)
+        keep.push_back(reinterpret_cast<std::uintptr_t>(BACKDROP.get()));
 
     g_capture.retainOnly(keep);
+    if (BACKDROP)
+        g_capture.makeSnapshotLayer(BACKDROP, g_monitor, false);
 
     const auto FOCUSED = Compat::focusedWindow();
     const std::uintptr_t FOCUSED_ID = FOCUSED ? Compat::windowId(FOCUSED) : 0;
@@ -2339,7 +2388,10 @@ static void serviceCapture() {
 
     g_capturing = true;
 
-    ghostWindows(eligibleWindowsSpanned());
+    // On the way out the 2D layout is back already (flightLeave): the
+    // windows must not be taken out of it again.
+    if (!(g_flight.active && g_flight.leaving))
+        ghostWindows(eligibleWindowsSpanned());
     refreshCaptures(eligibleWindowsSpanned(), MON);
 
     g_capturing = false;
@@ -3072,6 +3124,188 @@ static bool applyTrash(STrashed& T, const CBox& BOX, World3D::SEntity& E) {
     return false;
 }
 
+// The flight's clock (g_flight): seconds since it began, < 0 before.
+static double flightTime() {
+    return g_flight.active && g_flight.start >= 0.0 ? nowSeconds() - g_flight.start : -1.0;
+}
+
+static double flightLength() {
+    const double N = std::max(0, g_flight.count - 1);
+    return g_flight.leaving ? kFlightGap * N + kFlightOut : kFlightFirst + kFlightGap * N + kFlightIn;
+}
+
+// The wallpaper's snapshot as a quad over the whole monitor; texture 0 when
+// there is none yet.
+static GLScene::SHudQuad backdropQuad(const PHLMONITOR& mon) {
+    GLScene::SHudQuad Q;
+    const auto        LS = backdropLayer(mon);
+    const auto*       SNAP = LS ? g_capture.get(reinterpret_cast<std::uintptr_t>(LS.get())) : nullptr;
+    if (!SNAP || (SNAP->texID == 0 && !SNAP->bigTex) || SNAP->texSpan.x <= 0 || SNAP->texSpan.y <= 0 ||
+        mon->m_size.x <= 0 || mon->m_size.y <= 0)
+        return Q;
+    const auto BOX = LS->surfaceLogicalBox();
+    if (!BOX)
+        return Q;
+    const double X = BOX->x - mon->m_position.x, Y = BOX->y - mon->m_position.y;
+    const double W = mon->m_size.x, H = mon->m_size.y, SW = SNAP->texSpan.x, SH = SNAP->texSpan.y;
+    Q.texture = SNAP->bigTex ? SNAP->bigTex : SNAP->texID;
+    Q.x0 = static_cast<float>(X / W * 2.0 - 1.0), Q.x1 = static_cast<float>((X + BOX->w) / W * 2.0 - 1.0);
+    Q.y0 = static_cast<float>(Y / H * 2.0 - 1.0), Q.y1 = static_cast<float>((Y + BOX->h) / H * 2.0 - 1.0);
+    Q.u0 = static_cast<float>(X / SW), Q.u1 = static_cast<float>((X + BOX->w) / SW);
+    Q.v0 = static_cast<float>(Y / SH), Q.v1 = static_cast<float>((Y + BOX->h) / SH);
+    return Q;
+}
+
+// The way in, once the windows on the eye's monitor and the wallpaper are
+// captured: their order, left to right, and their tiles. Waited for 0.3 s at
+// most, then the plain fade.
+static void flightBegin(const std::vector<Compat::SWindowInfo>& infos) {
+    if (!g_flight.active || g_flight.leaving || g_flight.start >= 0.0)
+        return;
+    std::vector<const Compat::SWindowInfo*> mine;
+    bool ready = backdropQuad(g_monitor).texture != 0;
+    for (const auto& I : infos) {
+        if (I.monitor != g_monitor || (I.isLayer && g_cfgHud && I.layer && I.layer->m_layer >= 2))
+            continue;
+        const auto* SNAP = g_capture.get(I.id);
+        ready = ready && SNAP && (SNAP->texID || SNAP->bigTex);
+        mine.push_back(&I);
+    }
+    if (!ready) {
+        if (nowSeconds() - g_flight.requested > 0.3)
+            g_flight = {};
+        return;
+    }
+    std::ranges::stable_sort(mine, [](const auto* a, const auto* b) {
+        return a->monitorLocalBox.x != b->monitorLocalBox.x ? a->monitorLocalBox.x < b->monitorLocalBox.x
+                                                            : a->monitorLocalBox.y < b->monitorLocalBox.y;
+    });
+    // The tile each stood in in 2D: its layout save. Its box now is the one
+    // the room took it out with -- a floating window's own size.
+    for (const auto* I : mine) {
+        g_flight.order[I->id] = static_cast<int>(g_flight.order.size());
+        CBox tile = I->monitorLocalBox;
+        for (const auto& S : g_layoutSaves)
+            if (S.id == I->id && !S.window.expired())
+                tile = CBox{S.box.x - g_monitor->m_position.x, S.box.y - g_monitor->m_position.y, S.box.w, S.box.h};
+        g_flight.tiles[I->id] = tile;
+    }
+    g_flight.count = static_cast<int>(mine.size());
+    g_flight.start = nowSeconds();
+}
+
+// Leaving: each window back to the tile it will take in 2D -- the saved
+// tile, or where a floating one stands -- the last one in first. Without the
+// wallpaper, or with nothing to fly, the plain fade.
+static void flightLeave() {
+    if (!g_monitor || backdropQuad(g_monitor).texture == 0) {
+        g_flight = {};
+        return;
+    }
+    std::vector<std::pair<int, std::uintptr_t>> byEntry;
+    std::unordered_map<std::uintptr_t, CBox>    tiles;
+    for (const auto& E : g_world.entities()) {
+        CBox tile{};
+        bool has = false;
+        for (const auto& S : g_layoutSaves)
+            if (S.id == E.id && !S.window.expired()) {
+                tile = S.wasFloating ? Compat::currentWindowBox(S.window.lock()) : S.box;
+                tile.x -= g_monitor->m_position.x, tile.y -= g_monitor->m_position.y;
+                has  = true;
+            }
+        if (!has)
+            if (const auto IT = g_flight.tiles.find(E.id); IT != g_flight.tiles.end())
+                tile = IT->second, has = true; // a panel on the wall: where it stood
+        if (!has || tile.w <= 0 || tile.h <= 0)
+            continue;
+        const auto IT = g_flight.order.find(E.id);
+        byEntry.push_back({IT != g_flight.order.end() ? IT->second : -1, E.id});
+        tiles[E.id] = tile;
+    }
+    // Last in, first back; windows new to the room before them.
+    std::ranges::stable_sort(byEntry, [](const auto& a, const auto& b) { return a.first > b.first; });
+    g_flight         = {};
+    g_flight.active  = !byEntry.empty();
+    g_flight.leaving = true;
+    g_flight.start   = nowSeconds();
+    for (const auto& [_, ID] : byEntry)
+        g_flight.order[ID] = static_cast<int>(g_flight.order.size());
+    g_flight.tiles = std::move(tiles);
+    g_flight.count = static_cast<int>(byEntry.size());
+    // The 2D layout back now, under the room: Hyprland's own move into the
+    // tiles runs hidden, and when the room goes the desktop is as the last
+    // panel landed (restored at the end, a window jumped from its room size
+    // to its tile in front of the eye -- measured).
+    if (g_flight.active)
+        unghostWindows();
+}
+
+// One window of syncWorld's loop on its way: between its tile -- in front of
+// the live camera at the distance where the monitor fills the view, at 1:1 --
+// and its place in the room, on Larch's dive curve.
+static void applyFlight(const Compat::SWindowInfo& info, World3D::SEntity& E) {
+    const double T = flightTime();
+    if (T < 0.0 || info.monitor != g_monitor || !g_monitor || g_read.id == info.id)
+        return;
+    const auto IT = g_flight.order.find(info.id);
+    const auto TI = g_flight.tiles.find(info.id);
+    if (IT == g_flight.order.end() || TI == g_flight.tiles.end())
+        return;
+    const double OWN = T - (g_flight.leaving ? 0.0 : kFlightFirst) - kFlightGap * IT->second;
+    const float  P   = larchEase(ELarchEase::Dive, static_cast<float>(OWN / (g_flight.leaving ? kFlightOut : kFlightIn)));
+    const float  K   = g_flight.leaving ? P : 1.0f - P; // 1 = on the tile
+    const auto& CAM = g_scene.camera();
+    const Vec3  FWD = CAM.forward(), RIGHT = CAM.right(), UP = normalize(cross(RIGHT, FWD));
+    const float MW = g_monitor->m_size.x, MH = g_monitor->m_size.y;
+    // At 1:1 the monitor fills the view at D -- 8.5 m on a 1080 px monitor,
+    // behind the Moon station's deck edge, which cut the tiles' lower half
+    // (measured). So, as F2's reading pose: kReadDistance off, scaled down by
+    // the same ratio -- the same angle, the same pixels.
+    const float D  = World3D::toWorld(MH * 0.5f) / std::tan(kFovDeg * std::numbers::pi_v<float> / 360.0f);
+    const float S  = kReadDistance / D;
+    const CBox& TILE = TI->second;
+    const Vec3  AT = CAM.position + FWD * kReadDistance +
+        RIGHT * (World3D::toWorld(static_cast<float>(TILE.x + TILE.w * 0.5) - MW * 0.5f) * S) +
+        UP * (World3D::toWorld(MH * 0.5f - static_cast<float>(TILE.y + TILE.h * 0.5)) * S);
+    const SFlight::SPose NOW{E.center, E.yaw, E.pitch, E.roll};
+    if (const auto W = g_flight.wrote.find(info.id); W == g_flight.wrote.end() || !(W->second == NOW))
+        g_flight.room[info.id] = NOW;
+    const auto& R = g_flight.room[info.id];
+    const float TWO_PI = 2.0f * std::numbers::pi_v<float>;
+    E.center = R.center + (AT - R.center) * K;
+    E.yaw    = R.yaw + std::remainder(-CAM.yaw - R.yaw, TWO_PI) * K;
+    E.pitch  = R.pitch + (CAM.pitch - R.pitch) * K;
+    E.roll   = R.roll * (1.0f - K);
+    g_flight.wrote[info.id] = {E.center, E.yaw, E.pitch, E.roll};
+    E.width  = E.width + (World3D::toWorld(static_cast<float>(TILE.w)) * S - E.width) * K;
+    E.height = E.height + (World3D::toWorld(static_cast<float>(TILE.h)) * S - E.height) * K;
+}
+
+// Every frame: the wallpaper's share of the picture, and the way in ending.
+static void flightTick() {
+    const double T = flightTime();
+    float        backdrop = 0.0f;
+    if (T >= 0.0) {
+        const double L = flightLength();
+        backdrop = g_flight.leaving ?
+            larchEase(ELarchEase::Fade, static_cast<float>((T - (L - kRoomFade)) / kRoomFade)) :
+            1.0f - larchEase(ELarchEase::Fade, static_cast<float>((T - kRoomFadeAt) / kRoomFade));
+        if (!g_flight.leaving && T > std::max(L, kCrossAt + 0.22))
+            g_flight = {}; // in: the room's own poses from here
+    }
+    g_scene.setBackdrop(backdrop > 0.0f ? backdropQuad(g_monitor) : GLScene::SHudQuad{}, backdrop);
+}
+
+// The crosshair comes last on the way in, 1000 ms in, over 220 ms; leaving,
+// it goes at once.
+static float flightCross() {
+    if (!g_flight.active)
+        return 1.0f;
+    if (g_flight.leaving || g_flight.start < 0.0)
+        return 0.0f;
+    return larchEase(ELarchEase::Fade, static_cast<float>((flightTime() - kCrossAt) / 0.22));
+}
+
 static void syncWorld(const PHLMONITOR& mon, float dt) {
     g_binGlow = 1.0f; // applyTrash raises it this frame
     // Deliberately free of side effects on the layout and the renderer. This
@@ -3083,6 +3317,7 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
     // CMonitor::useFP16(). Capture and ghosting therefore happen outside the
     // frame -- see serviceCapture().
     const auto INFOS = eligibleWindowsSpanned();
+    flightBegin(INFOS);
 
     // A grab takes the window being read where the hand goes; a fullscreen
     // takes it to the screen. Either way it is not read any more.
@@ -3381,6 +3616,7 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
             g_trashed.erase(T);
         applyGunJolt(info.id, entity);
         applyTV(info.id, BOX, entity);
+        applyFlight(info, entity);
 
         // Fullscreen transition: the animation owns this quad's size, and it
         // MUST be applied here -- the draw list below is built from these
@@ -4656,6 +4892,7 @@ static void rememberRoom() {
 }
 
 static void deactivate3D() {
+    g_flight = {};
     endReading(true);
     // Windows still in the bin, their applications not gone yet: back where
     // they were let go, not remembered tiny.
@@ -4771,6 +5008,14 @@ static void enter3D() {
         g_fsHomeWorkspace  = {};
     }
 
+    // The way in (g_flight), unless the room is open already or still on
+    // its way out.
+    g_flight = {};
+    if (!g_active) {
+        g_flight.active    = true;
+        g_flight.requested = nowSeconds();
+    }
+
     // Without this the render stage bails out immediately and the toggle does
     // nothing at all.
     g_active = true;
@@ -4865,6 +5110,8 @@ static void toggle3D() {
 
     if (g_transitionTarget > 0.5f)
         enter3D();
+    else
+        flightLeave();
 
     damageCurrentMonitor();
 
@@ -4889,8 +5136,11 @@ static void open3D() {
 
 static void useEnd();
 
+static void flightLeave();
 static void close3D() {
     useEnd();
+    if (g_transitionTarget > 0.5f)
+        flightLeave();
     g_transitionTarget = 0.0f;
     damageCurrentMonitor();
 
@@ -4909,12 +5159,19 @@ static float updateTransition() {
     g_lastTick = now;
 
     constexpr float duration = 0.55f;
-    constexpr float speed = 1.0f / duration;
+    // Leaving with the flight: the room stays until the last panel is back
+    // on its tile.
+    const float speed = 1.0f / (g_flight.active && g_flight.leaving ?
+        std::max(duration, static_cast<float>(flightLength())) : duration);
 
+    // A still room draws no frames: the first frame after a pause must not
+    // take the whole pause as one step, or the way out ends in that frame
+    // (measured: closed after 1.5 s still, the room was gone at once).
+    const float STEP = std::min(dt, 0.05f);
     if (g_transition < g_transitionTarget)
-        g_transition = std::min(g_transition + dt * speed, 1.0f);
+        g_transition = std::min(g_transition + STEP * speed, 1.0f);
     else if (g_transition > g_transitionTarget)
-        g_transition = std::max(g_transition - dt * speed, 0.0f);
+        g_transition = std::max(g_transition - STEP * speed, 0.0f);
 
     return std::clamp(dt, 0.0f, 0.1f);
 }
@@ -6134,6 +6391,9 @@ static void dumpStatus(bool force = false) {
         out << "\n";
         out << "aim: target=" << g_aimOverlay.target << " mark=" << g_aimOverlay.markKind << " label=" << g_aimOverlay.labelName
             << " full=" << g_aimOverlay.full << " folded=" << g_aimOverlay.folded << "\n";
+        out << "flight: active=" << (g_flight.active ? 1 : 0) << " leaving=" << (g_flight.leaving ? 1 : 0)
+            << " t=" << flightTime() << " count=" << g_flight.count << " backdrop=" << backdropQuad(g_monitor).texture
+            << " transition=" << g_transition << "\n";
         out << "gun: out=" << (g_gun ? 1 : 0) << " holding=" << g_gunHold.id << " shots=" << g_gunShots.size() << "\n";
         out << "read: id=" << g_read.id << " menu=" << g_menuId << " arrived=" << (g_read.arrived ? 1 : 0)
             << " dim=" << g_read.dim << " screen=" << (g_read.screen ? 1 : 0) << " back=" << (g_read.back ? 1 : 0)
@@ -6304,7 +6564,7 @@ static uint64_t frameFingerprint() {
 
 static bool runsOnTime() {
     return g_debugHud                        // the HUD counts frames
-        || g_aimLabelBusy || g_featureFading
+        || g_aimLabelBusy || g_featureFading || g_flight.active
         || g_viewMode != 0                   // F5: the player's own animation
         || g_scene.scenePending() || joltShapesPending()
         || g_sightPending
@@ -6396,9 +6656,14 @@ static void onRenderStage(eRenderStage stage) {
     if (g_fsPhase == EFullscreenPhase::To2D || g_fsPhase == EFullscreenPhase::To3D)
         g_diagAlpha = g_fsAlpha;
 
+    // The flight covers the desktop at once: the windows lift off their
+    // tiles over its wallpaper. Waiting for the captures, the desktop shows.
+    flightTick();
+    const float PRIMARY_ALPHA = !g_flight.active || g_fsPhase != EFullscreenPhase::None ? g_diagAlpha :
+        g_flight.start < 0.0 ? 0.0f : 1.0f;
     g_pHyprRenderer->addPassElement(
         makeUnique<CHypr3DPassElement>(
-            g_diagAlpha,
+            PRIMARY_ALPHA,
             dt
         )
     );
@@ -7081,6 +7346,8 @@ static void overlayTick() {
         g_aimOverlay.useId = 0;
         sprites = aimTick(SCALE);
     }
+    for (auto& S : sprites)
+        S.alpha *= flightCross();
     if (g_debugHud)
         sprites.push_back(roomCheckSprite(SCALE));
 

@@ -230,6 +230,14 @@ class GLScene {
     };
     void setHud(std::vector<SHudQuad>&& quads) { m_hud = std::move(quads); }
 
+    // The desktop's wallpaper over the room and under the windows, on the
+    // way in and out (main's flight): the 2D desktop the windows lift off
+    // from, fading as the room comes up. In the HUD's coordinates.
+    void setBackdrop(const SHudQuad& quad, float alpha) {
+        m_backdrop      = quad;
+        m_backdropAlpha = alpha;
+    }
+
     // Shadows on the floor under the windows: a soft blob each, as games
     // ground a floating object (a blob shadow) and visionOS a window. main
     // finds the floor and sizes them; centre on the floor, `right` the
@@ -432,6 +440,9 @@ class GLScene {
     bool           m_windowsOnTop = false; // drawWindows without the depth test
     unsigned int   m_dimVAO = 0, m_dimVBO = 0;
     void drawDim(float dim);
+    SHudQuad       m_backdrop{};
+    float          m_backdropAlpha = 0.0f;
+    void           drawBackdrop();
     // The room blurred behind a featured window (dual Kawase: three halving
     // passes down, three back up), mixed over the sharp room by `amount`.
     struct SBlurLevel {

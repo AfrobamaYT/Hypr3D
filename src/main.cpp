@@ -207,6 +207,9 @@ static bool g_reportedPointerHookError = false;
 // Layout snapshot taken on entry; empty once the windows are back under the
 // layout's control.
 static std::vector<Compat::SWindowLayoutSave> g_layoutSaves;
+// The fullscreen window of the room's monitor as it was before enter3D made
+// it a floating panel: ghostWindows saves this instead of the panel.
+static Compat::SWindowLayoutSave g_fsSavedAtEnter;
 static bool g_ghosted = false;
 
 // What to draw this frame, rebuilt once per frame from the world.
@@ -2246,9 +2249,12 @@ static void ghostWindows(const std::vector<Compat::SWindowInfo>& INFOS) {
         for (const auto& info : INFOS) {
             auto SAVE = Compat::saveWindowLayout(info.window);
 
+            if (SAVE.window && SAVE.id == g_fsSavedAtEnter.id && !g_fsSavedAtEnter.window.expired())
+                SAVE = g_fsSavedAtEnter; // a tile in fullscreen, not the panel enter3D made of it
             if (SAVE.window)
                 g_layoutSaves.push_back(std::move(SAVE));
         }
+        g_fsSavedAtEnter = {};
 
         for (auto& save : g_layoutSaves)
             Compat::applyWindowGhost(save);
@@ -2533,6 +2539,12 @@ static void serviceCapture() {
 // window typed into.
 static void updateAimFocus(float dt) {
     if (g_pointerDown || g_clientButtonDown)
+        return;
+    // Leaving, the 2D layout and its fullscreen windows are back
+    // (flightLeave): a focus from the crosshair now lands on a tile under a
+    // fullscreen game, and Hyprland's on_focus_under_fullscreen = 2 takes
+    // the game out of fullscreen (measured 2026-10-08).
+    if (g_flight.active && g_flight.leaving)
         return;
 
     const auto& cam = g_scene.camera();
@@ -4332,6 +4344,12 @@ static void pollFullscreen() {
 
     g_fsCurrentId = FSW ? Compat::windowId(FSW) : 0;
 
+    // Leaving, the 2D layout is back already (flightLeave) and a window that
+    // was fullscreen is fullscreen again: that is no request to the room.
+    // Taken for one, the room's passthrough set its box every frame and left
+    // it a floating monitor-sized window over the tiles (measured 2026-10-08).
+    const bool LEAVING = g_flight.active && g_flight.leaving;
+
     // Our own room fade: while a fullscreen exists (or a transition runs)
     // the other windows glide to invisible; when it is gone they glide
     // back. Deterministic wall-clock ticks -- never dependent on Hyprland's
@@ -4376,7 +4394,7 @@ static void pollFullscreen() {
     }
     g_fsElsewhere      = elsewhere;
     g_fsElsewhereKnown = true;
-    if (bring && !FSW && g_fsPhase == EFullscreenPhase::None && ownsInput() &&
+    if (bring && !FSW && !LEAVING && g_fsPhase == EFullscreenPhase::None && ownsInput() &&
         MON->m_activeWorkspace) {
         g_fsHomeWindow    = bring;
         g_fsHomeWorkspace = bring->m_workspace;
@@ -4385,7 +4403,7 @@ static void pollFullscreen() {
     }
 
     if (g_fsPhase == EFullscreenPhase::None) {
-        if (FSW && !g_fsWasOn && ownsInput())
+        if (FSW && !g_fsWasOn && !LEAVING && ownsInput())
             startTo2D(FSW);
         else {
             g_fsWasOn = FSW != nullptr;
@@ -4397,7 +4415,7 @@ static void pollFullscreen() {
             // floating layout re-applies ITS remembered size (possibly
             // monitor-sized from an old cycle), and a one-shot set loses to
             // it.
-            if (!FSW && g_fsWasOn) {
+            if (!FSW && g_fsWasOn && !LEAVING) {
                 if (auto OLDW = g_fsLastFSWindow.lock()) {
                     const auto CUR = Compat::currentWindowBox(OLDW);
 
@@ -5505,6 +5523,8 @@ static void enter3D() {
     if (const auto MON = targetMonitor()) {
         if (const auto FSW =
                 Fullscreen::controller()->getFullscreenWindow(MON)) {
+            if (!g_ghosted)
+                g_fsSavedAtEnter = Compat::saveWindowLayout(FSW);
             Compat::setWindowBox(
                 FSW,
                 CBox{MON->m_position.x + MON->m_size.x * 0.5 -
@@ -6920,6 +6940,15 @@ static void dumpStatus(bool force = false) {
                 << "\n";
         }
     }
+    // What leaving the room will put back (unghostWindows): a window's
+    // tile or float and its fullscreen modes as they were.
+    for (const auto& SV : g_layoutSaves)
+        out << "  save=" << SV.id << " wasFloat=" << (SV.wasFloating ? 1 : 0) << " fs=" << static_cast<int>(SV.fs.internal)
+            << "/" << static_cast<int>(SV.fs.client) << " box=" << SV.box.x << "," << SV.box.y << "," << SV.box.w << "," << SV.box.h
+            << "\n";
+    if (g_fsSavedAtEnter.id)
+        out << "  fsAtEnter=" << g_fsSavedAtEnter.id << " fs=" << static_cast<int>(g_fsSavedAtEnter.fs.internal) << "/"
+            << static_cast<int>(g_fsSavedAtEnter.fs.client) << "\n";
 
     out << "captureFrames=" << g_captureFrames << " still=" << g_stillFrames
         << " onTime=" << (runsOnTime() ? 1 : 0) << "\n";

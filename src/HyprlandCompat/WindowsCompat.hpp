@@ -3,6 +3,7 @@
 #include <hyprland/src/plugins/PluginAPI.hpp>
 #include <hyprland/src/desktop/DesktopTypes.hpp>
 #include <hyprland/src/layout/space/Space.hpp>
+#include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
 
 #include <cstdint>
 #include <vector>
@@ -62,6 +63,9 @@ struct SWindowLayoutSave {
     CBox           box;   // global logical box at save time
     SP<Layout::CSpace> space;
     bool            wasFloating = false;
+    // Fullscreen as it was (Hyprland's internal and client modes): put back
+    // once the window is in its layout again.
+    Fullscreen::SFullscreenMode fs{};
 };
 
 SWindowLayoutSave saveWindowLayout(const PHLWINDOW& window);

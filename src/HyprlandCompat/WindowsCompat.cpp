@@ -172,6 +172,7 @@ SWindowLayoutSave saveWindowLayout(const PHLWINDOW& window) {
     save.box         = window->m_target->position();
     save.space       = window->m_target->space();
     save.wasFloating = window->m_target->floating();
+    save.fs          = Fullscreen::controller()->getFullscreenModes(window);
 
     return save;
 }
@@ -222,6 +223,19 @@ void restoreWindowLayout(SWindowLayoutSave& save) {
     // on top of each other on DP-3 (2026-10-08).
     if (!save.wasFloating)
         Config::Actions::floatWindow(Config::Actions::TOGGLE_ACTION_DISABLE, WINDOW);
+
+    // Fullscreen again, the way Hyprland's own fullscreen dispatcher sets
+    // it. Left out, a game that was fullscreen came back a floating
+    // monitor-sized window over its workspace's tiles: they could not be
+    // clicked and new windows tiled under it (the owner's CS2 over Steam,
+    // 2026-10-08). The room took the window out of its fullscreen box
+    // without telling Hyprland, which still holds it fullscreen: asked for
+    // fullscreen again it changed nothing (measured: 2/2 before and after,
+    // the box a 458 px tile). So out first, then in.
+    if (save.fs.internal != Fullscreen::FSMODE_NONE || save.fs.client != Fullscreen::FSMODE_NONE) {
+        Fullscreen::controller()->setFullscreenMode(WINDOW, Fullscreen::FSMODE_NONE, Fullscreen::FSMODE_NONE);
+        Fullscreen::controller()->setFullscreenMode(WINDOW, save.fs.internal, save.fs.client);
+    }
 
     g_pHyprRenderer->damageWindow(WINDOW);
 }

@@ -71,6 +71,10 @@ namespace Overlay {
     };
     SImage paintRoomCheck(const SRoomCheck& check, float scale);
 
+    // A small mono tag, as F2's "1 : 1" over the window's corner. The
+    // anchor is its top left.
+    SImage paintTag(const std::string& text, float scale);
+
     // A pill of key hints, as at the bottom of Super+F's screen.
     SImage paintHintPill(const std::vector<SKey>& keys, float scale);
 

@@ -2153,15 +2153,17 @@ void GLScene::drawOverlay(int width, int height) {
             atX = atY = 0.0f;
         else if (S.anchor == EAnchor::Bottom)
             atY = static_cast<float>(height);
-        else if (S.anchor == EAnchor::Cursor) {
-            // The world point of setCursorPoint through the primary view;
-            // the scene's NDC has y up, the target's y down.
+        else if (S.anchor == EAnchor::Cursor || S.anchor == EAnchor::World) {
+            // A world point through the primary view; the scene's NDC has y
+            // up, the target's y down.
+            if (S.anchor == EAnchor::Cursor && !m_cursorOn)
+                continue;
             const auto& M = m_lastVP.m;
-            const Vec3& P = m_cursorAt;
+            const Vec3& P = S.anchor == EAnchor::Cursor ? m_cursorAt : S.at;
             const float X = M[0] * P.x + M[4] * P.y + M[8] * P.z + M[12];
             const float Y = M[1] * P.x + M[5] * P.y + M[9] * P.z + M[13];
             const float W = M[3] * P.x + M[7] * P.y + M[11] * P.z + M[15];
-            if (!m_cursorOn || W <= 1e-4f)
+            if (W <= 1e-4f)
                 continue;
             atX = (X / W + 1.0f) * 0.5f * width, atY = (1.0f - Y / W) * 0.5f * height;
         }

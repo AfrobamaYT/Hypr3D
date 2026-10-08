@@ -2474,13 +2474,41 @@ static std::vector<SHudItem> g_hudItems;
 // and the window with this title comes to the eye when it opens.
 static std::string    g_cfgMenuCommand, g_cfgMenuTitle;
 static std::uintptr_t g_menuId = 0; // the menu window last brought
-static constexpr float kReadSeconds = 0.35f;
+// Larch's motion curves (the design system's --larch-ease-move, -dive and
+// -fade), through Hyprland's own bezier.
+enum class ELarchEase { Move, Dive, Fade };
+static float larchEase(ELarchEase which, float x) {
+    static Hyprutils::Animation::CBezierCurve s_move, s_dive, s_fade;
+    static bool s_ready = false;
+    if (!s_ready) {
+        s_move.setup({Vector2D{0.2, 0.8}, Vector2D{0.2, 1.0}});
+        s_dive.setup({Vector2D{0.65, 0.0}, Vector2D{0.25, 1.0}});
+        s_fade.setup({Vector2D{0.25, 0.1}, Vector2D{0.25, 1.0}});
+        s_ready = true;
+    }
+    x = std::clamp(x, 0.0f, 1.0f);
+    return (which == ELarchEase::Move ? s_move : which == ELarchEase::Dive ? s_dive : s_fade).getYForPoint(x);
+}
+
+static constexpr float kReadSeconds = 0.35f; // F4's cinema
 static constexpr float kCinemaFill  = 0.9f; // of the view's width or height
 // Super+F's screen: big in front of the player with the room still around
 // its corners, as Quest 3 shows a virtual screen -- the owner asked for that,
-// not the 2D fullscreen the rice's Super+F gave (2026-10-08). Not dimmed.
+// not the 2D fullscreen the rice's Super+F gave (2026-10-08).
 static constexpr float kScreenFill  = 0.82f;
 static constexpr float kCinemaDim   = 0.8f; // the room at a fifth of its light
+// The owner's approved "Room Motion" draft (2026-10-08): F2 lands at 1:1 in
+// 460 ms and the room dims to 55 % over 320 ms; Super+F's screen dives in
+// over 1000 ms, swelling 3.5 % early as it lifts off, with the room dimming
+// to 60 % over the same second, and goes back in 480 ms.
+static constexpr float kReadLegSeconds   = 0.46f;
+static constexpr float kReadDim          = 0.45f;
+static constexpr float kReadDimSeconds   = 0.32f;
+static constexpr float kScreenSeconds    = 1.0f;
+static constexpr float kScreenBackSeconds = 0.48f;
+static constexpr float kScreenDim        = 0.4f;
+static constexpr float kScreenBackDimSeconds = 0.4f;
+static constexpr float kScreenSwell      = 0.035f;
 
 // The reading pose for a window of BOX (logical px, decorations included):
 // at the distance where the monitor's logical height fills the view, a
@@ -2582,11 +2610,12 @@ static void followMenu(const PHLMONITOR& mon, const CBox& BOX) {
 // size. Applied in the loop, not after it: the draw list is built from these
 // values, and a later override reaches the screen a frame late.
 static void applyReading(const PHLMONITOR& mon, const CBox& BOX, World3D::SEntity& E) {
-    const float RAW = std::clamp(
-        std::chrono::duration<float>(std::chrono::steady_clock::now() - g_read.start).count() /
-            kReadSeconds,
-        0.0f, 1.0f);
-    const float P = RAW * RAW * (3.0f - 2.0f * RAW); // smoothstep
+    const bool  CINEMA = g_read.cinema && !g_read.screen;
+    const float T = std::chrono::duration<float>(std::chrono::steady_clock::now() - g_read.start).count();
+    const float LEG = CINEMA ? kReadSeconds : g_read.screen ? (g_read.back ? kScreenBackSeconds : kScreenSeconds) : kReadLegSeconds;
+    const float RAW = std::clamp(T / LEG, 0.0f, 1.0f);
+    const float P = CINEMA ? RAW * RAW * (3.0f - 2.0f * RAW) // smoothstep
+        : larchEase(g_read.screen && !g_read.back ? ELarchEase::Dive : ELarchEase::Move, RAW);
 
     Vec3  to{};
     float toYaw = 0.f, toPitch = 0.f, toRoll = 0.f, toScale = 1.f;
@@ -2602,15 +2631,21 @@ static void applyReading(const PHLMONITOR& mon, const CBox& BOX, World3D::SEntit
     } else
         readingPose(mon, BOX, g_read.screen ? kScreenFill : g_read.cinema ? kCinemaFill : 0.f,
                     to, toYaw, toPitch, toScale);
-    const float TO_DIM = g_read.cinema && !g_read.screen && !g_read.back ? kCinemaDim : 0.0f;
-    g_read.dim = g_read.legDim + (TO_DIM - g_read.legDim) * P;
+    const float TO_DIM = g_read.back ? 0.0f : CINEMA ? kCinemaDim : g_read.screen ? kScreenDim : kReadDim;
+    const float DIM_S  = g_read.screen ? (g_read.back ? kScreenBackDimSeconds : kScreenSeconds) : kReadDimSeconds;
+    g_read.dim = g_read.legDim + (TO_DIM - g_read.legDim) *
+        (CINEMA ? P : larchEase(ELarchEase::Fade, std::clamp(T / DIM_S, 0.0f, 1.0f)));
+    // The screen swells as it lifts off: up 3.5 % by a fifth of the way,
+    // back by two fifths.
+    const float SWELL = g_read.screen && !g_read.back ?
+        1.0f + kScreenSwell * std::sin(std::numbers::pi_v<float> * std::clamp(RAW / 0.4f, 0.0f, 1.0f)) : 1.0f;
 
     const float TWO_PI = 2.f * std::numbers::pi_v<float>;
     E.center = g_read.legCenter + (to - g_read.legCenter) * P;
     E.yaw    = g_read.legYaw + std::remainder(toYaw - g_read.legYaw, TWO_PI) * P;
     E.pitch  = g_read.legPitch + (toPitch - g_read.legPitch) * P;
     E.roll   = g_read.legRoll + std::remainder(toRoll - g_read.legRoll, TWO_PI) * P;
-    const float SCALE = g_read.legScale + (toScale - g_read.legScale) * P;
+    const float SCALE = (g_read.legScale + (toScale - g_read.legScale) * P) * SWELL;
     E.width  = World3D::toWorld(BOX.w) * SCALE;
     E.height = World3D::toWorld(BOX.h) * SCALE;
 
@@ -2723,22 +2758,6 @@ static SCarriedFrom g_carriedFrom;
 static constexpr float kBinArc = 0.52f, kBinDrop = 0.16f, kBinFlash = 0.22f;
 static constexpr float kBinHop = 0.42f, kBinUnfold = 0.64f;
 
-// Larch's motion curves (the design system's --larch-ease-move, -dive and
-// -fade), through Hyprland's own bezier.
-enum class ELarchEase { Move, Dive, Fade };
-static float larchEase(ELarchEase which, float x) {
-    static Hyprutils::Animation::CBezierCurve s_move, s_dive, s_fade;
-    static bool s_ready = false;
-    if (!s_ready) {
-        s_move.setup({Vector2D{0.2, 0.8}, Vector2D{0.2, 1.0}});
-        s_dive.setup({Vector2D{0.65, 0.0}, Vector2D{0.25, 1.0}});
-        s_fade.setup({Vector2D{0.25, 0.1}, Vector2D{0.25, 1.0}});
-        s_ready = true;
-    }
-    x = std::clamp(x, 0.0f, 1.0f);
-    return (which == ELarchEase::Move ? s_move : which == ELarchEase::Dive ? s_dive : s_fade).getYForPoint(x);
-}
-
 // How crumpled each window is (0 flat .. 1 a paper ball), and its turn: a
 // window carried toward the bin crumples with its distance to the bin's
 // opening -- flat until 1.6 m, a ball by 0.5 m -- and opens again when it is
@@ -2794,6 +2813,9 @@ struct SAimOverlay {
     bool           waitArrive = false; // Super+F's screen: ring once it is in front
     double         ringAt = -10.0, pillAt = -10.0, movedAt = 0.0;
     Vector2D       usedAt{};
+    // F2's "1 : 1" tag over the read window's corner.
+    std::shared_ptr<const Overlay::SImage> tag;
+    float          tagScale = 0.0f;
     // The bin's note when an app refused to close (applyTrash).
     double         toastAt = -10.0;
     std::shared_ptr<const Overlay::SImage> toast;
@@ -6069,6 +6091,7 @@ static void dumpStatus(bool force = false) {
             << " full=" << g_aimOverlay.full << " folded=" << g_aimOverlay.folded << "\n";
         out << "gun: out=" << (g_gun ? 1 : 0) << " holding=" << g_gunHold.id << " shots=" << g_gunShots.size() << "\n";
         out << "read: id=" << g_read.id << " menu=" << g_menuId << " arrived=" << (g_read.arrived ? 1 : 0)
+            << " dim=" << g_read.dim << " screen=" << (g_read.screen ? 1 : 0) << " back=" << (g_read.back ? 1 : 0)
             << " following=" << (g_read.following ? 1 : 0) << " at=(" << g_read.atCenter.x << ","
             << g_read.atCenter.y << "," << g_read.atCenter.z << ") yaw=" << g_read.atYaw
             << " pitch=" << g_read.atPitch << "\n";
@@ -6739,10 +6762,22 @@ static std::vector<GLScene::SOverlaySprite> pointerTick(float scale) {
     const float PILL = SCREEN && !A.waitArrive ? FADE((NOW - A.pillAt) / 0.22) * (1.0f - FADE((NOW - A.pillAt - 3.0) / 0.22)) : 0.0f;
     g_aimLabelBusy = A.waitArrive || NOW - A.ringAt < 0.46 || (SCREEN && NOW - A.pillAt < 3.22);
 
+    // Super+F's way in: the crosshair gives way to the pointer as the
+    // screen lands, 700..920 ms and 800..1020 ms into the dive.
+    float CROSS = 0.0f, ARROW = 1.0f;
+    if (SCREEN && !g_read.back) {
+        const double T = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_read.start).count();
+        CROSS = 1.0f - FADE((T - 0.7) / 0.22);
+        ARROW = FADE((T - 0.8) / 0.22);
+        g_aimLabelBusy = g_aimLabelBusy || T < 1.02;
+    }
     std::vector<GLScene::SOverlaySprite> sprites;
+    if (CROSS > 0.0f && A.mark)
+        sprites.push_back({A.mark, GLScene::EAnchor::Center, 0.0f, CROSS});
     if (RING > 0.0f)
         sprites.push_back({A.ring, GLScene::EAnchor::Cursor, 0.0f, RING});
-    sprites.push_back({A.arrow, GLScene::EAnchor::Cursor, 0.0f, 1.0f});
+    if (ARROW > 0.0f)
+        sprites.push_back({A.arrow, GLScene::EAnchor::Cursor, 0.0f, ARROW});
     if (PILL > 0.0f)
         sprites.push_back({A.hints, GLScene::EAnchor::Bottom, -(44.0f + 52.0f) * scale, PILL});
     A.target    = "pointer:" + std::to_string(g_use.id);
@@ -6903,8 +6938,30 @@ static std::vector<GLScene::SOverlaySprite> aimTick(float SCALE) {
     }
     g_aimLabelBusy = label && T < (fold ? 2.25f : wait ? 0.37f : 0.25f);
 
+    // Super+F's way back: the crosshair returns 300..520 ms into it, its
+    // label after.
+    float      markAlpha = 1.0f;
+    const auto SINCE     = std::chrono::duration<float>(std::chrono::steady_clock::now() - g_read.start).count();
+    if (g_read.id && g_read.screen && g_read.back) {
+        markAlpha = larchEase(ELarchEase::Fade, (SINCE - 0.3f) / 0.22f);
+        full = folded = 0.0f;
+    }
     std::vector<GLScene::SOverlaySprite> sprites;
-    sprites.push_back({g_aimOverlay.mark, GLScene::EAnchor::Center, 0.0f, 1.0f});
+    sprites.push_back({g_aimOverlay.mark, GLScene::EAnchor::Center, 0.0f, markAlpha});
+    // F2: "1 : 1" over the read window's top right corner once it landed.
+    if (const auto* E = g_read.id && !g_read.cinema && !g_read.screen && g_read.id != g_menuId ? g_world.find(g_read.id) : nullptr) {
+        const float ALPHA = g_read.back ? 1.0f - std::clamp(SINCE / 0.1f, 0.0f, 1.0f)
+                                        : larchEase(ELarchEase::Fade, (SINCE - kReadLegSeconds) / 0.22f);
+        if (ALPHA > 0.0f) {
+            if (!g_aimOverlay.tag || g_aimOverlay.tagScale != SCALE) {
+                g_aimOverlay.tagScale = SCALE;
+                g_aimOverlay.tag      = std::make_shared<const Overlay::SImage>(Overlay::paintTag("1 : 1", SCALE));
+            }
+            const Vec3 CORNER = E->center + g_world.rightOf(g_read.id) * (E->width * 0.5f) + g_world.upOf(g_read.id) * (E->height * 0.5f);
+            sprites.push_back({g_aimOverlay.tag, GLScene::EAnchor::World, -44.0f * SCALE, ALPHA, -64.0f * SCALE, CORNER});
+        }
+        g_aimLabelBusy = g_aimLabelBusy || (!g_read.back && SINCE < kReadLegSeconds + 0.22f);
+    }
     if (full > 0.0f)
         sprites.push_back({g_aimOverlay.label, GLScene::EAnchor::Center, labelDy * SCALE, full});
     if (folded > 0.0f)

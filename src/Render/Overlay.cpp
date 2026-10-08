@@ -796,4 +796,21 @@ namespace Overlay {
         I.ay = static_cast<float>(Y0);
         return I;
     }
+    SImage paintTag(const std::string& str, float scale) {
+        // 30 high, 10 either side, radius 9, a panel with its line; the
+        // text 400 13 mono in Larch's blue.
+        const double s  = std::max(0.5f, scale);
+        SText        t  = text(str, 400, 13, UI, s, MONO);
+        const double PW = std::ceil(t.w + 20 * s), PH = 30 * s;
+        const int    W = static_cast<int>(PW + 4), H = static_cast<int>(std::ceil(PH) + 4);
+        auto*        S  = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, W, H);
+        auto*        CR = cairo_create(S);
+        drawPanel(CR, 2, 2, PW, PH, 9 * s, s);
+        draw(CR, t, 2 + 10 * s, 2 + (PH - t.h) / 2);
+        cairo_destroy(CR);
+        auto I = finish(S, nullptr, {}, 1.0);
+        cairo_surface_destroy(S);
+        I.ax = I.ay = 2.0f;
+        return I;
+    }
 }

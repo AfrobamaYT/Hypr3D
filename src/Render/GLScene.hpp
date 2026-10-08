@@ -130,6 +130,7 @@ class GLScene {
         TopLeft,
         Bottom, // the bottom middle
         Cursor, // the pointer of a window in use (setCursorPoint)
+        World,  // the world point `at`, through the primary view
     };
     struct SOverlaySprite {
         std::shared_ptr<const Overlay::SImage> image;
@@ -137,6 +138,7 @@ class GLScene {
         float   dy     = 0.0f; // px down from the anchor
         float   alpha  = 1.0f;
         float   dx     = 0.0f; // px right of the anchor
+        Vec3    at{};          // EAnchor::World
     };
     void setOverlay(std::vector<SOverlaySprite> sprites) {
         m_overlay = std::move(sprites);

@@ -2635,6 +2635,7 @@ static bool toggleReading(bool cinema, std::uintptr_t only = 0, bool screen = fa
 // Leaving, a fullscreen or a grab ends reading at once: the room pose back
 // unless the window is being carried off.
 static void useEnd();
+static void useMenu(std::uintptr_t id);
 static void endReading(bool putBack) {
     if (!g_read.id)
         return;
@@ -3237,6 +3238,11 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
             endReading(true);
         if (!g_read.id)
             toggleReading(false, menu);
+        // Used from the start, like Super+F's screen: the camera still, the
+        // mouse its pointer. Aimed at with the crosshair, it followed every
+        // turn and nothing in it could be picked unless the player stood
+        // completely still (the owner, 2026-10-08).
+        useMenu(menu);
     }
     g_scene.setFeatured(g_read.id, g_read.dim);
 
@@ -4153,6 +4159,7 @@ struct SUse {
     Vector2D       local{};     // the pointer, surface-local px
     EKeyboardMode  mode{};      // to restore
     std::uintptr_t lockBefore = 0;
+    bool           centre     = false; // to the middle once the surface has its size
 };
 static SUse g_use;
 
@@ -4192,6 +4199,19 @@ static void useBegin() {
     useWindow(TARGET.window, localFromHit(HIT));
 }
 
+static void useMenu(std::uintptr_t id) {
+    if (g_use.id)
+        useEnd();
+    const auto  W = Compat::findWindowById(id);
+    const auto* E = g_world.find(id);
+    if (W && E) {
+        useWindow(W, Vector2D{E->surfaceWidth * 0.5, E->surfaceHeight * 0.5});
+        // A menu just mapped is a few pixels big yet: the pointer went to its
+        // corner and the first click missed (measured). Centred on its size.
+        g_use.centre = true;
+    }
+}
+
 // Super+F in the room: the aimed window on a screen in front of the player --
 // most of the view, the room still around its corners -- and used like a
 // monitor from the start: the mouse is its pointer, every key its key (F8's
@@ -4222,6 +4242,16 @@ static void useTick() {
         useEnd(); // it closed
         return;
     }
+    // It grows to its size over a few frames: the pointer keeps its middle
+    // until the hand moves it.
+    if (g_use.centre) {
+        const Vector2D MID{E->surfaceWidth * 0.5, E->surfaceHeight * 0.5};
+        if (MID != g_use.local) {
+            g_use.local = MID;
+            if (const auto W = Compat::findWindowById(g_use.id))
+                Compat::deliverMotion(W, g_use.local, inputTimeMs());
+        }
+    }
     const float U = (static_cast<float>(g_use.local.x) + E->surfaceOffsetX) / E->logicalWidth;
     const float V = (static_cast<float>(g_use.local.y) + E->surfaceOffsetY) / E->logicalHeight;
     g_scene.setCursorPoint(E->center + g_world.rightOf(g_use.id) * ((U - 0.5f) * E->width) +
@@ -4237,6 +4267,7 @@ static void useMove(double dx, double dy) {
         useEnd();
         return;
     }
+    g_use.centre  = false; // moved by hand: it stays where the hand put it
     g_use.local.x = std::clamp(g_use.local.x + dx, 0.0, static_cast<double>(E->surfaceWidth));
     g_use.local.y = std::clamp(g_use.local.y + dy, 0.0, static_cast<double>(E->surfaceHeight));
     Compat::deliverMotion(W, g_use.local, inputTimeMs());
@@ -6871,6 +6902,15 @@ static void onKeyboardKeyRoom(
 
         info.cancelled = true;
         damageCurrentMonitor();
+        return;
+    }
+
+    // F1 while the menu is in use: it closes, as F1 opened it (the menu's
+    // own command toggles). In use mode every other key is the menu's.
+    if (PRESSED && SYM == XKB_KEY_F1 && g_use.id && g_use.id == g_menuId) {
+        if (!g_cfgMenuCommand.empty())
+            Config::Supplementary::executor()->spawn(g_cfgMenuCommand);
+        info.cancelled = true;
         return;
     }
 

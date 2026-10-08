@@ -144,6 +144,41 @@ class GLScene {
         m_overlay = std::move(sprites);
     }
 
+    // Marks on a window's plane (the owner's approved "Room Interactions"
+    // draft, 2026-10-08): a resize's frame -- the new area hatched, its edge
+    // solid or dashed -- the corner brackets, the dashed card over the bin,
+    // dashed lines in the plane. Lines, dashes, brackets and the hatch keep
+    // their size on screen at any distance.
+    struct SFrameMark {
+        Vec3  center{}, right{1.f, 0.f, 0.f}, up{0.f, 1.f, 0.f}; // unit axes of the plane
+        float halfW = 0.f, halfH = 0.f;                          // world units
+        // Where the window's content is, in the mark's local world units (x
+        // right, y up from the centre): the fill leaves it out.
+        float contentL = 0.f, contentT = 0.f, contentR = 0.f, contentB = 0.f;
+        enum class EFill : uint8_t {
+            None,
+            Hatch, // the new area of a resize
+            Tint,  // the edge's colour, faint: the bin's card
+        };
+        EFill fill      = EFill::None;
+        float fillAlpha = 0.f;
+        Vec3  color{0.36f, 0.72f, 0.90f}; // the edge's
+        float edge   = 0.f;               // the edge's alpha
+        bool  dashed = false;
+        float brackets = 0.f; // the corner brackets' alpha
+        int   hot      = -1;  // the grown, lit bracket: 0 top left, 1 top right, 2 bottom left, 3 bottom right
+        Vec3  hotColor{0.36f, 0.72f, 0.90f};
+        struct SLine {
+            float x0 = 0.f, y0 = 0.f, x1 = 0.f, y1 = 0.f; // local world units
+            Vec3  color{};
+            float alpha = 1.f;
+        };
+        std::vector<SLine> lines; // dashed, at most two
+    };
+    void setFrameMarks(std::vector<SFrameMark> marks) {
+        m_frameMarks = std::move(marks);
+    }
+
     // F3's room check (main's overlay): how many map objects are loaded,
     // of how many, with how many triangles.
     struct SMapStats {
@@ -496,6 +531,9 @@ class GLScene {
     float          m_featuredBlur = 0.0f;
     void           drawBlur(float amount);
     void           releaseBlur();
+    std::vector<SFrameMark> m_frameMarks;
+    unsigned int            m_frameProgram = 0, m_frameVAO = 0, m_frameVBO = 0;
+    void                    drawFrameMarks(const Mat4& vp);
     void drawFullscreen(float alpha);
     void drawOverlay(int width, int height);
 

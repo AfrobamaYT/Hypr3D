@@ -259,25 +259,73 @@ static uint32_t         g_clientButton = 0;
 static bool              g_clientButtonDown = false;
 
 struct SResizeGesture {
-    bool          active = false;
+    bool           active = false;
     std::uintptr_t id = 0;
-    PHLWINDOW     window;
-    CBox          startBox{};
-    Vec3          startCenter{};
-    float         startWorldWidth = 0.0f;
-    float         startWorldHeight = 0.0f;
-    Vec3          planePoint{};
-    Vec3          planeNormal{0.0f, 0.0f, 1.0f};
-    // Crosshair position on the real window at grab time, in surface px. The
-    // resize is driven by the aim's DELTA from this point, so the grabbed
-    // corner never snaps to the crosshair when the gesture starts.
-    Vector2D      grabPx{};
-    int           edgeX = 0; // -1 left, +1 right
-    int           edgeY = 0; // +1 top, -1 bottom
+    PHLWINDOW      window;
 };
-
-// Player spawn point in the room, set via hl.plugin.hypr3d.config().
 static SResizeGesture g_resize{};
+static bool           g_shiftHeld = false; // Shift during a resize keeps the aspect
+
+// A resize from a corner (the owner's approved "Room Interactions" draft,
+// 2026-10-08), after Meta's and visionOS's window resize: the grabbed corner
+// rides the crosshair where its ray meets the window's plane as it was at
+// the grab, and the window grows from its centre. The size is worked out
+// afresh every frame from that fixed plane, never as the last size plus a
+// step -- the step from the live window fed back into itself and grew the
+// window faster with every frame, and on by itself (measured 2026-10-08:
+// 960 -> 2883 px in eight equal mouse steps). Nothing goes to the app while
+// dragging: the room draws the frame, the new area hatched and the window's
+// frame at its own size top left, where the app will draw from. On release
+// the app is asked once; its old frame stays until it drew the new size.
+struct SResizeView {
+    enum class EPhase : uint8_t {
+        None,
+        Drag,    // the button held
+        Pending, // asked, the app has not drawn the new size yet
+        Settle,  // it drew: the readout says so, then fades
+        Cancel,  // Esc: the frame springs back, nothing was sent
+    };
+    enum class ELimit : uint8_t { None, Min, Max, Room };
+    EPhase         phase = EPhase::None;
+    std::uintptr_t id = 0;
+    PHLWINDOWREF   window;
+    double         at = 0.0; // nowSeconds() the phase began
+    // The plane, its scale and the sizes at the grab.
+    Vec3     center{}, right{1.f, 0.f, 0.f}, up{0.f, 1.f, 0.f}, normal{0.f, 0.f, 1.f};
+    float    yaw0 = 0.f, pitch0 = 0.f; // the view at the grab
+    double   pxPerUnit = 1.0; // decorated logical px per world unit
+    CBox     box0{};          // the real window's box
+    Vector2D deco0{}, client0{}, grabAbs{};
+    int      corner = 3; // 0 top left, 1 top right, 2 bottom left, 3 bottom right
+    // The frame: what the drag asks for (client px) and what is shown
+    // (decorated px), springing from `from` to `target` when it jumps.
+    Vector2D asked{}, shown{}, target{}, from{};
+    double   springAt = -10.0, springFor = 0.2;
+    ELimit   limit  = ELimit::None;
+    bool     aspect = false;
+    Vec3     hit{}; // the crosshair on the plane: the tether's end
+    // After the release.
+    Vector2D surface0{}; // the client's surface when asked
+    Vector2D actual{};   // the app's size once it drew
+    bool     chose = false; // ... another than asked
+    std::string name;
+    // The old frame, cross-fading out over the new one (120 ms).
+    std::optional<Compat::CWindowCapture::SSnapshot> held;
+};
+static SResizeView g_resizeView;
+// A held frame whose fade ended, released inside the capture pass where the
+// GL context is current.
+static std::vector<Compat::CWindowCapture::SSnapshot> g_resizeHeldGone;
+
+// Super held on a window: the brackets at its corners, the one under the
+// crosshair grown (resizeTick).
+struct SResizeHover {
+    std::uintptr_t id = 0;
+    float          alpha = 0.0f;
+    int            hot = -1;
+    bool           fixed = false;
+};
+static SResizeHover g_resizeHover;
 
 
 // Guards against a snapshot triggering another copy of the plugin inside
@@ -329,6 +377,9 @@ static double         s_zoomTarget = 0.0;
 // captured, cursor hidden. The real window is forced to the monitor box
 // during 2D so the compositor shows it truly fullscreened.
 static void resetPointerGesture();
+static void cancelResize();
+static void applyResizeView(const Compat::CWindowCapture::SSnapshot* SNAP, World3D::SEntity& E);
+static std::string windowName(const PHLWINDOW& w);
 
 enum class EFullscreenPhase : uint8_t { None, To2D, In2D, To3D };
 static EFullscreenPhase g_fsPhase = EFullscreenPhase::None;
@@ -2130,7 +2181,7 @@ static Vector2D crosshairLogical() {
 static void resetMovementKeys() {
     g_keyFwd = g_keyBack = g_keyLeft = g_keyRight = false;
     g_keyUp = g_keyDown = g_keySprint = false;
-    g_superHeld = false;
+    g_superHeld = g_shiftHeld = false;
 }
 
 // Clears only the camera keys, keeping the gesture modifiers honest -- used
@@ -2366,7 +2417,20 @@ static void refreshCaptures(
 
     bool consumedSkirt = false;
 
+    // Held frames of a resize whose cross-fade ended (g_resizeHeldGone):
+    // their framebuffers go here, with the GL context current.
+    if (!g_resizeHeldGone.empty()) {
+        if (Render::GL::g_pHyprOpenGL)
+            Render::GL::g_pHyprOpenGL->makeEGLCurrent();
+        g_resizeHeldGone.clear();
+    }
+
     for (const auto& info : infos) {
+        // A resize waiting for its app: the window keeps its old frame, not
+        // the old buffer stretched over the new box.
+        if (g_resizeView.phase == SResizeView::EPhase::Pending && info.id == g_resizeView.id)
+            continue;
+
         // Focus-change feedback (the active/inactive opacity fade and the
         // border color tween) is compositor-side -- no client commit happens,
         // so the buffer-change check would freeze both animations mid-way
@@ -2871,9 +2935,11 @@ static Vec3  g_trashAt{};
 static float g_trashRadius = 0.0f, g_trashHeight = 0.0f; // radius 0: no bin
 struct STrashed {
     std::uintptr_t id = 0;
+    std::string name; // for "Closed" once it is gone
     std::chrono::steady_clock::time_point start;
     Vec3  fromCenter{};   // where it hung, for the way back
     float fromYaw = 0.f, fromPitch = 0.f, fromRoll = 0.f, fromScale = 1.f;
+    float letScale = 1.f; // as let go: the bin's card (g_binCatch)
     Vec3  letGo{};        // where it was let go
     float fromCrumple = 0.f, fromSpin = 0.f;
     bool  asked = false; // the close request went out
@@ -2913,6 +2979,30 @@ static std::unordered_map<std::uintptr_t, SCrumple> g_crumple;
 // The bin's glow this frame, 1 = none: its halo (GLScene::setBinHalo)
 // flashes as a ball goes in and breathes while the bin waits for the app.
 static float g_binGlow = 1.0f;
+
+// The bin as a snap zone (the owner's approved "Room Interactions" draft,
+// 2026-10-08, after Meta's SnapInteractor and Unity's XR socket): the
+// carried window is caught by where the crosshair points, not by where the
+// window hangs -- it hangs at the distance it was taken, metres past the
+// bin, and the old test wanted the crosshair exactly on the bin AND the
+// window near it. Near within 14 degrees of the bin a dashed card shows over
+// it; within 7 the window leaves the crosshair and becomes that card; it is
+// let go past 11, so a wobble does not drop it; all only with the bin
+// within 6 m. Let go while caught, it goes in.
+static constexpr float kBinNearDeg = 14.0f, kBinCatchDeg = 7.0f, kBinLetDeg = 11.0f, kBinReach = 6.0f;
+static constexpr float kBinCard = 0.4f, kBinCardAbove = 0.3f; // m: its width, its gap over the rim
+struct SBinCatch {
+    std::uintptr_t id = 0; // the carried window
+    bool   caught = false;
+    float  near = 0.0f;  // the card's fade, 0..1
+    float  shown = 0.0f; // 0 on the crosshair .. 1 in the card
+    float  from = 0.0f, dur = 0.22f;
+    double at = -10.0;
+};
+static SBinCatch g_binCatch;
+// The window the bin closed, for the label and the rim's pulse.
+static std::string g_binClosedName;
+static double      g_binClosedAt = -10.0;
 
 // The process gun (F7) -- "360 noscope discord when it freezes", four people
 // in the Reddit finds. Aim at a window and shoot: a left click asks it to
@@ -2963,6 +3053,9 @@ struct SAimOverlay {
     double         toastAt = -10.0;
     std::shared_ptr<const Overlay::SImage> toast;
     float          toastScale = 0.0f;
+    // A resize's size readout at its corner; the bin's "Closed" note.
+    std::string readoutKey, closedKey;
+    std::shared_ptr<const Overlay::SImage> readout, closed;
     // F3's room check, repainted 4 x a second.
     std::shared_ptr<const Overlay::SImage> check;
     double         checkAt = -10.0;
@@ -3058,40 +3151,76 @@ static void applyTV(std::uintptr_t id, const CBox& BOX, World3D::SEntity& E) {
     E.height = BH * FIT;
 }
 
-// The crosshair's ray on the bin: its side within its height, or its opening.
-static bool aimAtBin() {
+// How far the crosshair points from the bin, in degrees: from its ray to
+// the bin's body, a vertical axis of its radius from its foot to its rim --
+// 0 when the ray meets it. Negative: no bin, or farther than kBinReach.
+static float aimAngleToBin() {
     if (g_trashRadius <= 0.0f)
-        return false;
+        return -1.0f;
     const auto& CAM = g_scene.camera();
     const Vec3  O = CAM.position, D = CAM.centerRay();
-    const float TOP = g_trashAt.y + g_trashHeight;
-    const auto  IN_HEIGHT = [&](float t) {
-        const float Y = O.y + t * D.y;
-        return t > 0.0f && t < 12.0f && Y >= g_trashAt.y && Y <= TOP;
-    };
-    const float FX = O.x - g_trashAt.x, FZ = O.z - g_trashAt.z;
-    const float A = D.x * D.x + D.z * D.z;
-    const float B = 2.0f * (FX * D.x + FZ * D.z);
-    const float C = FX * FX + FZ * FZ - g_trashRadius * g_trashRadius;
-    const float DISC = B * B - 4.0f * A * C;
-    if (A > 1e-6f && DISC >= 0.0f) {
-        const float SQ = std::sqrt(DISC);
-        if (IN_HEIGHT((-B - SQ) / (2.0f * A)) || IN_HEIGHT((-B + SQ) / (2.0f * A)))
-            return true;
+    const Vec3  RIM = g_trashAt + Vec3{0.f, g_trashHeight, 0.f};
+    if (dot(RIM - O, RIM - O) > kBinReach * kBinReach)
+        return -1.0f;
+    // The axis point nearest the ray's line (the axis is vertical).
+    const Vec3  W0 = O - g_trashAt;
+    const float B = D.y, DD = dot(D, W0), DEN = 1.0f - B * B;
+    const float S = std::clamp(DEN > 1e-6f ? (W0.y - B * DD) / DEN : W0.y, 0.0f, g_trashHeight);
+    const Vec3  TO = g_trashAt + Vec3{0.f, S, 0.f} - O;
+    const float LEN = std::max(1e-4f, std::sqrt(dot(TO, TO)));
+    const float ANG = std::acos(std::clamp(dot(TO, D) / LEN, -1.0f, 1.0f));
+    return std::max(0.0f, ANG - std::atan(g_trashRadius / LEN)) * 180.0f / std::numbers::pi_v<float>;
+}
+
+// Every frame: whether the carried window is near the bin, caught, and
+// where between the crosshair and the card it is.
+static void binCatchTick(float dt) {
+    auto&                B  = g_binCatch;
+    const std::uintptr_t ID = g_world.dragActive() ? g_world.draggedId() : 0;
+    if (!ID || !Compat::findWindowById(ID)) {
+        B = {};
+        return;
     }
-    if (std::fabs(D.y) > 1e-6f) {
-        const float T = (TOP - O.y) / D.y;
-        const float X = O.x + T * D.x - g_trashAt.x, Z = O.z + T * D.z - g_trashAt.z;
-        if (T > 0.0f && T < 12.0f && X * X + Z * Z <= g_trashRadius * g_trashRadius)
-            return true;
+    if (B.id != ID)
+        B = {}, B.id = ID;
+    const float  A   = aimAngleToBin();
+    const double NOW = nowSeconds();
+    const bool   NEAR = A >= 0.0f && A < kBinNearDeg;
+    B.near = std::clamp(B.near + (NEAR ? 1.0f : -1.0f) * dt / 0.15f, 0.0f, 1.0f);
+    const bool CAUGHT = A >= 0.0f && (B.caught ? A <= kBinLetDeg : A < kBinCatchDeg);
+    if (CAUGHT != B.caught) {
+        const auto* E = g_world.find(ID);
+        B.caught = CAUGHT;
+        B.from   = B.shown;
+        B.at     = NOW;
+        B.dur    = E && E->width > 2.0f ? 0.26f : 0.22f; // a big window has farther to go
     }
-    return false;
+    const float T = std::clamp(static_cast<float>((NOW - B.at) / B.dur), 0.0f, 1.0f);
+    B.shown = B.from + ((B.caught ? 1.0f : 0.0f) - B.from) * (1.0f - (1.0f - T) * (1.0f - T) * (1.0f - T));
+}
+
+// The card over the bin: 0.4 m wide in the window's aspect, its foot 0.3 m
+// over the rim.
+static Vec3 binSlot(float cardH) {
+    return g_trashAt + Vec3{0.f, g_trashHeight + kBinCardAbove + cardH * 0.5f, 0.f};
+}
+
+// syncWorld's part for the carried window: from the crosshair to the card
+// and back, shrinking to it -- however big the window, it fits.
+static void applyBinCatch(World3D::SEntity& E) {
+    const float S = g_binCatch.shown;
+    const float K = kBinCard / std::max(E.width, 1e-3f);
+    const Vec3  SLOT = binSlot(E.height * K);
+    E.center = E.center + (SLOT - E.center) * S;
+    const float F = 1.0f + (K - 1.0f) * S;
+    E.width *= F;
+    E.height *= F;
 }
 
 // Let go of a carried window on the bin: it starts falling in.
 static bool dropInBin(std::uintptr_t id) {
     const auto* E = id ? g_world.find(id) : nullptr;
-    if (!E || !Compat::findWindowById(id) || !aimAtBin())
+    if (!E || !Compat::findWindowById(id) || !g_binCatch.caught || g_binCatch.id != id)
         return false;
     if (std::ranges::any_of(g_trashed, [&](const STrashed& t) { return t.id == id; }))
         return true;
@@ -3099,10 +3228,13 @@ static bool dropInBin(std::uintptr_t id) {
         endReading(false);
     STrashed T;
     T.id = id;
+    T.name = windowName(Compat::findWindowById(id));
     T.start = std::chrono::steady_clock::now();
     T.fromCenter = E->center;
     T.fromYaw = E->yaw, T.fromPitch = E->pitch, T.fromRoll = E->roll;
-    T.fromScale = E->logicalWidth > 0.f ? E->width / World3D::toWorld(E->logicalWidth) : configWindowScale();
+    // Its own scale for the way home; the card's for the way in.
+    T.fromScale = E->spawnScale > 0.f ? E->spawnScale : configWindowScale();
+    T.letScale  = E->logicalWidth > 0.f ? E->width / World3D::toWorld(E->logicalWidth) : T.fromScale;
     T.letGo = E->center;
     if (g_carriedFrom.id == id) {
         T.fromCenter = g_carriedFrom.center;
@@ -3123,8 +3255,11 @@ static bool applyTrash(STrashed& T, const CBox& BOX, World3D::SEntity& E) {
     const Vec3  RIM  = g_trashAt + Vec3{0.f, g_trashHeight, 0.f};
     const Vec3  DEEP = g_trashAt + Vec3{0.f, g_trashHeight * 0.45f, 0.f};
     auto& C = g_crumple[T.id];
-    E.width  = World3D::toWorld(BOX.w) * T.fromScale;
-    E.height = World3D::toWorld(BOX.h) * T.fromScale;
+    const auto SIZE = [&](float scale) {
+        E.width  = World3D::toWorld(BOX.w) * scale;
+        E.height = World3D::toWorld(BOX.h) * scale;
+    };
+    SIZE(T.letScale);
     E.yaw = T.fromYaw, E.pitch = T.fromPitch, E.roll = T.fromRoll;
 
     if (!T.refused) {
@@ -3182,11 +3317,13 @@ static bool applyTrash(STrashed& T, const CBox& BOX, World3D::SEntity& E) {
     }
     const float P = larchEase(ELarchEase::Move, (BACK - kBinHop) / kBinUnfold);
     E.center = HOP + (T.fromCenter - HOP) * P;
+    SIZE(T.letScale + (T.fromScale - T.letScale) * P);
     C.e    = 1.0f - P;
     C.spin = (T.fromSpin + 2.0f * 3.14159265f * 1.55f) * (1.0f - P);
     if (BACK < kBinHop + kBinUnfold)
         return true;
     E.center = T.fromCenter;
+    SIZE(T.fromScale);
     C = {};
     return false;
 }
@@ -3375,6 +3512,12 @@ static float flightCross() {
 
 static void syncWorld(const PHLMONITOR& mon, float dt) {
     g_binGlow = 1.0f; // applyTrash raises it this frame
+    binCatchTick(dt);
+    // The rim: brighter as the card shows, lit while a window waits in it,
+    // one pulse when the app closed (200 ms).
+    g_binGlow = std::max(g_binGlow, 1.0f + 0.6f * g_binCatch.near + 0.8f * g_binCatch.shown);
+    if (const double T = nowSeconds() - g_binClosedAt; T >= 0.0 && T < 0.2)
+        g_binGlow = std::max(g_binGlow, 1.0f + 1.3f * static_cast<float>(1.0 - T / 0.2));
     // Deliberately free of side effects on the layout and the renderer. This
     // runs from render.stage, i.e. between the frame's startRenderPass() and
     // endRender(). Ghosting would trigger a relayout while the pass is half
@@ -3540,7 +3683,7 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
             continue;
 
         // Everything below uses the geometry captured WITH the snapshot, not
-        // the live box: updateRealResize writes the real window after
+        // the live box: a resize writes the real window after
         // render.pre, so the live box can be a frame ahead of the captured
         // pixels. Quad, UV subrect and picking all follow the snapshot box,
         // which keeps the drawn content and the crosshair mapping aligned
@@ -3709,16 +3852,10 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
             }
         }
 
-        if (g_resize.active && g_resize.id == info.id) {
-            const float DW = entity.width - g_resize.startWorldWidth;
-            const float DH = entity.height - g_resize.startWorldHeight;
-
-            entity.center = g_resize.startCenter;
-            entity.center += g_world.rightOf(info.id) *
-                (static_cast<float>(g_resize.edgeX) * DW * 0.5f);
-            entity.center += g_world.upOf(info.id) *
-                (static_cast<float>(g_resize.edgeY) * DH * 0.5f);
-        }
+        if (g_resizeView.phase != SResizeView::EPhase::None && g_resizeView.id == info.id)
+            applyResizeView(SNAPSHOT, entity);
+        if (g_binCatch.id == info.id && g_binCatch.shown > 0.0f)
+            applyBinCatch(entity);
 
         ENTITIES.push_back(entity);
     }
@@ -3728,7 +3865,10 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
     if (g_tvWindowId && std::ranges::none_of(ENTITIES, [](const auto& E) { return E.id == g_tvWindowId; }))
         g_tvWindowId = 0; // it closed: its address can come back for a new window
     std::erase_if(g_trashed, [&](const STrashed& t) {
-        return std::ranges::none_of(ENTITIES, [&](const auto& E) { return E.id == t.id; });
+        const bool GONE = std::ranges::none_of(ENTITIES, [&](const auto& E) { return E.id == t.id; });
+        if (GONE && t.asked && !t.refused)
+            g_binClosedName = t.name, g_binClosedAt = nowSeconds();
+        return GONE;
     }); // closed: in the bin for good
     std::erase_if(g_crumple, [&](const auto& KV) {
         return std::ranges::none_of(ENTITIES, [&](const auto& E) { return E.id == KV.first; });
@@ -3831,16 +3971,12 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         if (entity.id == g_read.id)
             render.alpha *= g_read.alpha; // the menu fading in
 
-        // Crumpling (see g_crumple): a carried window by its distance to the
-        // bin's opening, one in the bin by applyTrash; any other opens again.
+        // Crumpling (see g_crumple): a window in the bin by applyTrash; any
+        // other opens again. A carried one stays flat -- caught, it shows as
+        // a card over the bin (g_binCatch) and crumples once let go.
         if (std::ranges::none_of(g_trashed, [&](const STrashed& t) { return t.id == entity.id; })) {
-            float target = 0.0f;
-            if (g_trashRadius > 0.0f && g_world.dragActive() && g_world.draggedId() == entity.id) {
-                const Vec3  D = entity.center - (g_trashAt + Vec3{0.f, g_trashHeight, 0.f});
-                const float X = std::clamp((1.6f - std::sqrt(dot(D, D))) / 1.1f, 0.0f, 1.0f);
-                target = X * X * (3.0f - 2.0f * X);
-            }
-            if (target > 0.0f || g_crumple.contains(entity.id)) {
+            const float target = 0.0f;
+            if (g_crumple.contains(entity.id)) {
                 auto& C = g_crumple[entity.id];
                 C.e += (target - C.e) * (1.0f - std::exp(-dt / 0.08f));
                 C.spin = C.e * (160.0f * 3.14159265f / 180.0f);
@@ -3883,7 +4019,42 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
             (entity.logicalTop + entity.logicalHeight) / SPANH, 0.0f, 1.0f);
         render.v1 = std::clamp(entity.logicalTop / SPANH, 0.0f, 1.0f);
 
+        // A resize showing the window's frame cut to the frame being asked
+        // for: the traced silhouette is the whole window's, so a plain slab.
+        const auto& RV = g_resizeView;
+        if (RV.phase != SResizeView::EPhase::None && RV.id == entity.id &&
+            (entity.logicalWidth < SNAPSHOT->sampledBox.w - 0.5 || entity.logicalHeight < SNAPSHOT->sampledBox.h - 0.5))
+            render.outlines = nullptr;
+
         g_renderWindows.push_back(render);
+
+        // The app drew the new size: its old frame fades out over the new
+        // one in 120 ms, still in the frame's top left, a hair in front.
+        if (RV.held && RV.id == entity.id && SNAPSHOT->fb != RV.held->fb) {
+            const auto& H = *RV.held;
+            const float A = 1.0f - std::clamp(static_cast<float>((nowSeconds() - RV.at) / 0.12), 0.0f, 1.0f);
+            if (A > 0.0f && H.texSpan.x > 0.0 && H.texSpan.y > 0.0) {
+                const double PPU = RV.pxPerUnit;
+                const double CW = std::min<double>(H.sampledBox.w, RV.shown.x), CH = std::min<double>(H.sampledBox.h, RV.shown.y);
+                const Vec3   C  = RV.center + RV.right * static_cast<float>((CW - RV.shown.x) * 0.5 / PPU) +
+                    RV.up * static_cast<float>((RV.shown.y - CH) * 0.5 / PPU) + RV.normal * 0.002f;
+                GLScene::WindowRender old = render;
+                old.id       = 0;
+                old.texture  = H.texID;
+                old.x = C.x, old.y = C.y, old.z = C.z;
+                old.width    = static_cast<float>(CW / PPU);
+                old.height   = static_cast<float>(CH / PPU);
+                old.u0       = static_cast<float>(H.sampledBox.x / H.texSpan.x);
+                old.u1       = static_cast<float>((H.sampledBox.x + CW) / H.texSpan.x);
+                old.v0       = static_cast<float>((H.sampledBox.y + CH) / H.texSpan.y);
+                old.v1       = static_cast<float>(H.sampledBox.y / H.texSpan.y);
+                old.alpha    = render.alpha * A;
+                old.depth    = 0.0f;
+                old.outlines = nullptr;
+                old.crumple  = 0.0f;
+                g_renderWindows.push_back(old);
+            }
+        }
     }
 
     // The bin's halo (see g_binGlow): above 1 it shows.
@@ -3988,82 +4159,6 @@ static bool rayPlanePoint(
 
     out = origin + dir * t;
     return std::isfinite(out.x) && std::isfinite(out.y) && std::isfinite(out.z);
-}
-
-static Vector2D worldPointToGlobalPx(
-    const PHLMONITOR& mon,
-    const Vec3& point
-) {
-    (void)mon;
-
-    const Vec3 LOCAL = g_world.localPoint(g_resize.id, point);
-    const CBox CURRENT = Compat::currentWindowBox(g_resize.window);
-
-    // The quad spans toWorld(box) * spawnScale world units while carrying
-    // box pixels of content, so the px density on the quad is the room's
-    // base density divided by the scale.
-    const auto* RESIZE_ENTITY = g_world.find(g_resize.id);
-    const double scale =
-        RESIZE_ENTITY ? RESIZE_ENTITY->spawnScale : 1.0f;
-
-    const double currentCenterX = CURRENT.x + CURRENT.w * 0.5;
-    const double currentCenterY = CURRENT.y + CURRENT.h * 0.5;
-
-    return {
-        currentCenterX + static_cast<double>(LOCAL.x) *
-            World3D::LOGICAL_PX_PER_UNIT / scale,
-        currentCenterY - static_cast<double>(LOCAL.y) *
-            World3D::LOGICAL_PX_PER_UNIT / scale,
-    };
-}
-
-static CBox resizeBoxFromAim(const Vec3& point, const PHLMONITOR& mon) {
-    // The grabbed edge moves by the crosshair's travel since the grab, not
-    // to its absolute position: the box starts identical to the window, so
-    // starting a resize never snaps the nearest corner under the crosshair.
-    const Vector2D PX = worldPointToGlobalPx(mon, point);
-    const double DX = PX.x - g_resize.grabPx.x;
-    const double DY = PX.y - g_resize.grabPx.y;
-
-    const CBox& start = g_resize.startBox;
-    const double RIGHT = start.x + start.w;
-    const double BOTTOM = start.y + start.h;
-
-    CBox out = start;
-
-    if (g_resize.edgeX > 0) {
-        out.x = start.x;
-        out.w = start.w + DX;
-    } else {
-        out.x = start.x + DX;
-        out.w = start.w - DX;
-    }
-
-    if (g_resize.edgeY > 0) {
-        out.y = start.y + DY;
-        out.h = start.h - DY;
-    } else {
-        out.y = start.y;
-        out.h = start.h + DY;
-    }
-
-    const auto MIN = g_resize.window->minSize().value_or(Vector2D{1.0, 1.0});
-    const auto MAX = g_resize.window->maxSize().value_or(Vector2D{INFINITY, INFINITY});
-
-    out.w = std::clamp(out.w, MIN.x, MAX.x);
-    out.h = std::clamp(out.h, MIN.y, MAX.y);
-
-    if (g_resize.edgeX > 0)
-        out.x = start.x;
-    else
-        out.x = RIGHT - out.w;
-
-    if (g_resize.edgeY > 0)
-        out.y = BOTTOM - out.h;
-    else
-        out.y = start.y;
-
-    return out;
 }
 
 // --- fullscreen passthrough -------------------------------------------------
@@ -4621,37 +4716,301 @@ static void updateWheelRoll() {
     ENTITY->roll = wrapPi(s_wheelRot.startRoll + ANGLE);
 }
 
-static void updateRealResize() {
-    if (!g_resize.active || !g_resize.window)
+// --- resize (g_resizeView) --------------------------------------------------
+
+// Without an app maximum the room caps a window at 3840 x 2160, or at 100
+// degrees of the view from where the player stands, whichever comes first.
+static constexpr double kResizeRoomW = 3840.0, kResizeRoomH = 2160.0;
+static constexpr float  kResizeRoomDeg = 100.0f;
+// A corner takes the grab within 12 % of the window's shorter side, and
+// never less than 24 px on screen.
+static constexpr float kResizeHotShare = 0.12f, kResizeHotPx = 24.0f;
+// The app answering a size it was not asked for by up to this much per side
+// is snapping to its cells, not refusing: Wayland apps tell no increments.
+static constexpr double kResizeSnapPx = 32.0;
+
+// World units one logical screen pixel spans at distance `d`.
+static float worldPerScreenPx(float d) {
+    const float H = g_monitor ? static_cast<float>(g_monitor->m_size.y) : 1080.0f;
+    return 2.0f * d * std::tan(kFovDeg * std::numbers::pi_v<float> / 360.0f) / std::max(1.0f, H);
+}
+
+// An app that allows one size only.
+static bool fixedSize(const PHLWINDOW& W) {
+    const auto MIN = W->minSize(), MAX = W->maxSize();
+    return MIN && MAX && MAX->x > 0.0 && MAX->y > 0.0 && std::fabs(MIN->x - MAX->x) < 0.5 &&
+        std::fabs(MIN->y - MAX->y) < 0.5;
+}
+
+// The crosshair where its ray meets entity `id`'s plane.
+static bool aimOnPlane(std::uintptr_t id, Vec3& out) {
+    const auto* E = g_world.find(id);
+    const auto& CAM = g_scene.camera();
+    return E && rayPlanePoint(CAM.position, CAM.centerRay(), E->center, g_world.normalOf(id), out);
+}
+
+// The corner of entity `id` near `P`, a point in its plane: 0 top left,
+// 1 top right, 2 bottom left, 3 bottom right, -1 none -- inside the window or
+// just outside it.
+static int cornerNear(std::uintptr_t id, const Vec3& P) {
+    const auto* E = g_world.find(id);
+    if (!E || E->width <= 0.0f || E->height <= 0.0f)
+        return -1;
+    const Vec3  D  = P - E->center;
+    const float X  = dot(D, g_world.rightOf(id)), Y = dot(D, g_world.upOf(id));
+    const Vec3  TO = P - g_scene.camera().position;
+    const float R  = std::max(kResizeHotShare * std::min(E->width, E->height),
+                              kResizeHotPx * worldPerScreenPx(std::sqrt(dot(TO, TO))));
+    const float CX = (X < 0.0f ? -0.5f : 0.5f) * E->width, CY = (Y < 0.0f ? -0.5f : 0.5f) * E->height;
+    if ((X - CX) * (X - CX) + (Y - CY) * (Y - CY) > R * R)
+        return -1;
+    return (Y > 0.0f ? 0 : 2) + (X > 0.0f ? 1 : 0);
+}
+
+// The view's end: the capture takes the window again, a held frame goes.
+static void endResizeView() {
+    auto& R = g_resizeView;
+    if (R.held)
+        g_resizeHeldGone.push_back(std::move(*R.held));
+    R = {};
+}
+
+// Super + right press on a window: the drag begins where the crosshair is.
+static bool startResize(const World3D::SHit& HIT, const PHLWINDOW& W) {
+    const auto* E    = g_world.find(HIT.id);
+    const auto* SNAP = g_capture.get(HIT.id);
+    if (!E || !SNAP || E->width <= 0.0f || E->logicalWidth <= 0.0f || fixedSize(W))
+        return false;
+    auto& R = g_resizeView;
+    // Grabbed again before the app drew: the frame's centre, not the old
+    // frame's, which sits in its corner.
+    const Vec3 CENTER = R.phase != SResizeView::EPhase::None && R.id == HIT.id ? R.center : E->center;
+    endResizeView();
+    R.phase     = SResizeView::EPhase::Drag;
+    R.id        = HIT.id;
+    R.window    = W;
+    R.at        = nowSeconds();
+    R.name      = windowName(W);
+    R.center    = CENTER;
+    R.right     = g_world.rightOf(HIT.id);
+    R.up        = g_world.upOf(HIT.id);
+    R.normal    = g_world.normalOf(HIT.id);
+    R.yaw0      = g_scene.camera().yaw;
+    R.pitch0    = g_scene.camera().pitch;
+    R.pxPerUnit = E->logicalWidth / E->width;
+    R.box0      = Compat::currentWindowBox(W);
+    R.client0   = {R.box0.w, R.box0.h};
+    R.deco0     = R.client0 + Vector2D{SNAP->fullBox.w - SNAP->surfaceSize.x, SNAP->fullBox.h - SNAP->surfaceSize.y};
+    const Vec3   D = HIT.point - CENTER;
+    const double X = dot(D, R.right) * R.pxPerUnit, Y = dot(D, R.up) * R.pxPerUnit;
+    R.grabAbs   = {std::fabs(X), std::fabs(Y)};
+    R.corner    = (Y > 0.0 ? 0 : 2) + (X > 0.0 ? 1 : 0);
+    R.asked     = R.client0;
+    R.shown = R.target = R.deco0;
+    R.hit       = HIT.point;
+    return true;
+}
+
+// The frame springs from what is shown to `to` over `seconds`.
+static void springResize(const Vector2D& to, double seconds) {
+    auto& R     = g_resizeView;
+    R.from      = R.shown;
+    R.target    = to;
+    R.springAt  = nowSeconds();
+    R.springFor = seconds;
+}
+
+// Esc while dragging: back to the size it had when grabbed, nothing sent.
+static void cancelResize() {
+    auto& R = g_resizeView;
+    if (R.phase != SResizeView::EPhase::Drag)
         return;
+    R.phase = SResizeView::EPhase::Cancel;
+    R.at    = nowSeconds();
+    springResize(R.deco0, 0.18);
+}
 
-    const auto MON = targetMonitor();
-    if (!MON)
+// The button up: the app is asked once, for the size the frame shows, the
+// window keeping its centre.
+static void releaseResize() {
+    auto& R = g_resizeView;
+    if (R.phase != SResizeView::EPhase::Drag)
         return;
-
-    const auto* ENTITY = g_world.find(g_resize.id);
-    if (!ENTITY)
+    const auto W = R.window.lock();
+    const Vector2D A{std::round(R.asked.x), std::round(R.asked.y)};
+    if (!W || (std::fabs(A.x - R.client0.x) < 0.5 && std::fabs(A.y - R.client0.y) < 0.5)) {
+        endResizeView();
         return;
+    }
+    const CBox BOX{std::round(R.box0.x + (R.box0.w - A.x) * 0.5), std::round(R.box0.y + (R.box0.h - A.y) * 0.5), A.x, A.y};
+    Compat::setWindowBox(W, BOX);
+    R.asked    = A;
+    R.surface0 = W->resource() ? W->resource()->m_current.size : Vector2D{};
+    R.phase    = SResizeView::EPhase::Pending;
+    R.at       = nowSeconds();
+}
 
-    // The edge being dragged is part of the real, resized window, so the
-    // interaction plane follows the window's current centre every frame.
-    g_resize.planePoint = ENTITY->center;
-    g_resize.planeNormal = g_world.normalOf(g_resize.id);
+// The app drew the new size, or 5 s passed: whatever size it has now.
+static void settleResize(const PHLWINDOW& W) {
+    auto& R = g_resizeView;
+    const auto* SNAP = g_capture.get(R.id);
+    if (SNAP && SNAP->texID && !SNAP->bigTex)
+        R.held = *SNAP; // the old frame, until it has faded (120 ms)
+    const Vector2D SURF = W->resource() ? W->resource()->m_current.size : R.asked;
+    R.actual = SURF.x > 0.0 && SURF.y > 0.0 ? SURF : R.asked;
+    R.chose  = std::fabs(R.actual.x - R.asked.x) > kResizeSnapPx || std::fabs(R.actual.y - R.asked.y) > kResizeSnapPx;
+    // The window's box follows what the app drew, still about its centre.
+    if (std::fabs(R.actual.x - R.asked.x) >= 0.5 || std::fabs(R.actual.y - R.asked.y) >= 0.5) {
+        const CBox NOW = Compat::currentWindowBox(W);
+        Compat::setWindowBox(W, CBox{std::round(NOW.x + (NOW.w - R.actual.x) * 0.5), std::round(NOW.y + (NOW.h - R.actual.y) * 0.5),
+                                     R.actual.x, R.actual.y});
+    }
+    springResize(R.actual + (R.deco0 - R.client0), 0.2);
+    R.phase = SResizeView::EPhase::Settle;
+    R.at    = nowSeconds();
+}
 
-    Vec3 point;
-    if (!rayPlanePoint(
-            g_scene.camera().position,
-            g_scene.camera().centerRay(),
-            g_resize.planePoint,
-            g_resize.planeNormal,
-            point))
+// Every frame: the drag's size from the crosshair, the app's answer, the
+// frame's spring.
+static void updateResize() {
+    auto& R = g_resizeView;
+    if (R.phase == SResizeView::EPhase::None)
         return;
+    using EPhase = SResizeView::EPhase;
+    const auto W = R.window.lock();
+    if (!W || !g_world.find(R.id)) {
+        endResizeView();
+        return;
+    }
+    const double NOW   = nowSeconds();
+    const Vector2D DEC = R.deco0 - R.client0; // the border round the client
+    switch (R.phase) {
+        case EPhase::Drag: {
+            // Per axis, as the mouse moves: turning sideways moves the
+            // corner along the width only, nodding along the height only.
+            // The crosshair's own hit slides down the plane as a lowered
+            // view turns (measured 2026-10-08: 540 -> 682 px of height from
+            // turning alone), so each axis takes the ray with the other
+            // angle as it was at the grab.
+            const auto& CAM = g_scene.camera();
+            const auto  RAY = [&](float yaw, float pitch) {
+                const Vec3 F{std::sin(yaw) * std::cos(pitch), std::sin(pitch), -std::cos(yaw) * std::cos(pitch)};
+                return CAM.mirrorView ? F * -1.0f : F;
+            };
+            Vec3 PX, PY;
+            if (!rayPlanePoint(CAM.position, RAY(CAM.yaw, R.pitch0), R.center, R.normal, PX) ||
+                !rayPlanePoint(CAM.position, RAY(R.yaw0, CAM.pitch), R.center, R.normal, PY))
+                break; // looking away from the plane: the frame stays
+            const float  LX = dot(PX - R.center, R.right), LY = dot(PY - R.center, R.up);
+            R.hit = R.center + R.right * LX + R.up * LY;
+            const double X = std::fabs(LX) * R.pxPerUnit, Y = std::fabs(LY) * R.pxPerUnit;
+            const bool   ASPECT = g_shiftHeld;
+            // Per axis from the centre, so turning sideways changes the
+            // width only; the offset at the grab keeps the frame from
+            // jumping to the crosshair. With the aspect kept the corner
+            // rides the diagonal: the crosshair's distance along it.
+            double K = 1.0;
+            Vector2D client;
+            if (ASPECT) {
+                const double HX = R.deco0.x * 0.5, HY = R.deco0.y * 0.5, L2 = HX * HX + HY * HY;
+                K      = 1.0 + ((X * HX + Y * HY) - (R.grabAbs.x * HX + R.grabAbs.y * HY)) / std::max(1.0, L2);
+                client = R.deco0 * K - DEC;
+            } else
+                client = Vector2D{R.deco0.x + 2.0 * (X - R.grabAbs.x), R.deco0.y + 2.0 * (Y - R.grabAbs.y)} - DEC;
+            Vector2D MIN = W->minSize().value_or(Vector2D{1.0, 1.0});
+            MIN = {std::max(MIN.x, 1.0), std::max(MIN.y, 1.0)};
+            Vector2D MAX = W->maxSize().value_or(Vector2D{0.0, 0.0});
+            const bool HASMAX = MAX.x > 0.0 && MAX.y > 0.0;
+            const Vec3   TOC  = R.center - CAM.position;
+            const double VIEW = 2.0 * std::sqrt(dot(TOC, TOC)) * std::tan(kResizeRoomDeg * std::numbers::pi / 360.0) * R.pxPerUnit;
+            const Vector2D ROOM{std::min(kResizeRoomW, VIEW - DEC.x), std::min(kResizeRoomH, VIEW - DEC.y)};
+            const Vector2D TOP = HASMAX ? Vector2D{std::min(MAX.x, ROOM.x), std::min(MAX.y, ROOM.y)} : ROOM;
+            Vector2D       C   = client;
+            if (ASPECT) {
+                // One factor for both sides, so the aspect holds at a limit.
+                double k = 1.0;
+                for (int i = 0; i < 2; ++i) {
+                    const double V = i ? client.y : client.x, LO = i ? MIN.y : MIN.x, HI = i ? TOP.y : TOP.x;
+                    if (V < LO)
+                        k = std::max(k, LO / std::max(V, 1e-6));
+                    else if (V > HI)
+                        k = std::min(k, HI / V);
+                }
+                C = (client + DEC) * k - DEC;
+            }
+            C = {std::clamp(C.x, MIN.x, std::max(MIN.x, TOP.x)), std::clamp(C.y, MIN.y, std::max(MIN.y, TOP.y))};
+            R.limit = SResizeView::ELimit::None;
+            if (client.x < MIN.x - 0.5 || client.y < MIN.y - 0.5)
+                R.limit = SResizeView::ELimit::Min;
+            else if (HASMAX && (client.x > MAX.x + 0.5 || client.y > MAX.y + 0.5))
+                R.limit = SResizeView::ELimit::Max;
+            else if (client.x > TOP.x + 0.5 || client.y > TOP.y + 0.5)
+                R.limit = SResizeView::ELimit::Room;
+            R.asked = {std::round(C.x), std::round(C.y)};
+            // Shift pressed or let go mid-drag: the frame eases to the new
+            // rule over 120 ms instead of jumping.
+            if (ASPECT != R.aspect) {
+                R.aspect = ASPECT;
+                springResize(R.asked + DEC, 0.12);
+            } else
+                R.target = R.asked + DEC;
+            break;
+        }
+        case EPhase::Pending: {
+            const Vector2D SURF = W->resource() ? W->resource()->m_current.size : Vector2D{};
+            if (std::fabs(SURF.x - R.surface0.x) > 0.5 || std::fabs(SURF.y - R.surface0.y) > 0.5 || NOW - R.at > 5.0)
+                settleResize(W);
+            break;
+        }
+        case EPhase::Settle:
+            if (NOW - R.at > (R.chose ? 1.4 : 0.52))
+                endResizeView();
+            break;
+        case EPhase::Cancel:
+            if (NOW - R.at > 0.18)
+                endResizeView();
+            break;
+        case EPhase::None: break;
+    }
+    if (R.phase == EPhase::None)
+        return;
+    if (R.springAt >= 0.0) {
+        const double T = std::clamp((NOW - R.springAt) / std::max(0.01, R.springFor), 0.0, 1.0);
+        const double E = 1.0 - std::pow(1.0 - T, 3.0); // ease out
+        R.shown = R.from + (R.target - R.from) * E;
+        if (T >= 1.0)
+            R.springAt = -10.0;
+    } else
+        R.shown = R.target;
+}
 
-    const CBox BOX = resizeBoxFromAim(point, MON);
-    Compat::setWindowBox(g_resize.window, BOX);
+// syncWorld's part: during the drag and until the app drew, the window's
+// frame at its own size in the top left of the frame being asked for --
+// where the app will draw from -- cut where the frame is smaller.
+static void applyResizeView(const Compat::CWindowCapture::SSnapshot* SNAP, World3D::SEntity& E) {
+    using EPhase  = SResizeView::EPhase;
+    const auto& R = g_resizeView;
+    const bool OLD = R.phase == EPhase::Drag || R.phase == EPhase::Pending || R.phase == EPhase::Cancel ||
+        (R.held && SNAP && SNAP->fb == R.held->fb);
+    if (!OLD) {
+        E.center = R.center;
+        return;
+    }
+    const double CW = std::min<double>(E.logicalWidth, R.shown.x), CH = std::min<double>(E.logicalHeight, R.shown.y);
+    E.logicalWidth  = static_cast<float>(CW);
+    E.logicalHeight = static_cast<float>(CH);
+    E.width         = static_cast<float>(CW / R.pxPerUnit);
+    E.height        = static_cast<float>(CH / R.pxPerUnit);
+    E.center        = R.center + R.right * static_cast<float>((CW - R.shown.x) * 0.5 / R.pxPerUnit) +
+        R.up * static_cast<float>((R.shown.y - CH) * 0.5 / R.pxPerUnit);
 }
 
 static void resetPointerGesture() {
+    // A carried window let go: the world's drag ends with the gesture.
+    // Left on, dragActive() stayed true after every carry -- the bin went on
+    // catching a window already let go.
+    if (g_pointerGesture == EPointerGesture::Move3D)
+        g_world.stopDrag();
     g_pointerDown = false;
     g_pointerGesture = EPointerGesture::None;
     g_pointerButton = 0;
@@ -4661,6 +5020,8 @@ static void resetPointerGesture() {
     // settled full-resolution refresh (see CWindowCapture::refreshSkirtMask).
     if (g_resize.active)
         g_skirtFinalRefreshId = g_resize.id;
+    // A drag ended any other way than its button: nothing is sent.
+    cancelResize();
 
     g_resize = {};
     // A finished roll gesture restores the object's gravity.
@@ -6074,11 +6435,10 @@ static void update3D(float dt) {
             g_scene.camera().centerRay(),
             dt
         );
-    } else if (g_pointerGesture == EPointerGesture::ResizeReal && g_pointerDown) {
-        updateRealResize();
     } else if (g_pointerGesture == EPointerGesture::WheelRoll && g_pointerDown) {
         updateWheelRoll();
     }
+    updateResize();
 
     gunTick();
     syncWorld(MON, dt);
@@ -6451,7 +6811,17 @@ static void dumpStatus(bool force = false) {
             const Vec3 D = DE->center - (g_trashAt + Vec3{0.f, g_trashHeight, 0.f});
             out << " toBin=" << std::sqrt(dot(D, D));
         }
-        out << "\n";
+        out << " binAngle=" << aimAngleToBin() << " near=" << g_binCatch.near << " caught=" << (g_binCatch.caught ? 1 : 0)
+            << " card=" << g_binCatch.shown << "\n";
+        {
+            const auto& R = g_resizeView;
+            out << "resize: phase=" << static_cast<int>(R.phase) << " id=" << R.id << " asked=" << R.asked.x << "x" << R.asked.y
+                << " shown=" << R.shown.x << "x" << R.shown.y << " deco0=" << R.deco0.x << "x" << R.deco0.y
+                << " limit=" << static_cast<int>(R.limit) << " aspect=" << (R.aspect ? 1 : 0) << " corner=" << R.corner
+                << " actual=" << R.actual.x << "x" << R.actual.y << " chose=" << (R.chose ? 1 : 0)
+                << " held=" << (R.held ? 1 : 0) << " hover=" << g_resizeHover.id << ":" << g_resizeHover.hot << ":"
+                << g_resizeHover.alpha << (g_resizeHover.fixed ? ":fixed" : "") << "\n";
+        }
         out << "tv: w=" << g_tvW << " window=" << g_tvWindowId << " use=" << g_use.id << " at=" << g_use.local.x
             << "," << g_use.local.y;
         if (const auto* UE = g_use.id ? g_world.find(g_use.id) : nullptr)
@@ -6642,6 +7012,8 @@ static bool runsOnTime() {
         || !g_trashed.empty() || !g_crumple.empty() // a ball unfolding
         || (g_read.id && (!g_read.arrived || g_read.following || g_read.back))
         || g_world.dragActive()
+        || g_resizeView.phase != SResizeView::EPhase::None
+        || (g_resizeHover.id && g_resizeHover.alpha > 0.0f && g_resizeHover.alpha < 1.0f)
         || !g_gunShots.empty() || g_gunHold.active
         || headBusy()
         || g_transition != g_transitionTarget
@@ -7179,6 +7551,204 @@ static std::string objectLabel(size_t i) {
     return n;
 }
 
+// Super held on a window, no gesture: its corner brackets fade in (120 ms)
+// and the one under the crosshair grows; Super up, they fade (150 ms). A
+// window just outside whose corner the crosshair is keeps them.
+static void resizeHoverTick(float dt) {
+    auto&          H  = g_resizeHover;
+    std::uintptr_t id = 0;
+    int            hot = -1;
+    bool           fixed = false;
+    if (g_superHeld && !g_pointerDown && !g_gun && !g_use.id && g_fsPhase == EFullscreenPhase::None &&
+        !g_world.dragActive() && g_mapGrabIndex == SIZE_MAX) {
+        const auto     AH   = firstAlongAim();
+        std::uintptr_t cand = AH.kind == SAimHit::EKind::Surface && targetFromHit(AH.id).window ? AH.id : 0;
+        const bool     ON   = cand != 0;
+        if (!cand && H.alpha > 0.0f && H.id && Compat::findWindowById(H.id))
+            cand = H.id;
+        if (cand) {
+            Vec3 P;
+            hot   = aimOnPlane(cand, P) ? cornerNear(cand, P) : -1;
+            fixed = fixedSize(Compat::findWindowById(cand));
+            if (ON || hot >= 0)
+                id = cand;
+        }
+    }
+    if (id && id != H.id)
+        H.id = id, H.alpha = 0.0f;
+    if (id)
+        H.hot = hot, H.fixed = fixed;
+    const bool SHOW = id && !fixed;
+    H.alpha = std::clamp(H.alpha + (SHOW ? dt / 0.12f : -dt / 0.15f), 0.0f, 1.0f);
+    if (!id && H.alpha <= 0.0f)
+        H = {};
+}
+
+// The marks drawn on planes in the room: a resize's frame, the size it had
+// when grabbed, a size the app did not take; the hovered window's corner
+// brackets; the bin's dashed card.
+static std::vector<GLScene::SFrameMark> frameMarks() {
+    using EPhase = SResizeView::EPhase;
+    using EFill  = GLScene::SFrameMark::EFill;
+    const Vec3 UI{0x5c / 255.f, 0xb8 / 255.f, 0xe6 / 255.f}, AMBER{0xf5 / 255.f, 0xbe / 255.f, 0x5a / 255.f},
+        MUTED{0.80f, 0.82f, 0.84f};
+    std::vector<GLScene::SFrameMark> out;
+    const auto&  R   = g_resizeView;
+    const double NOW = nowSeconds();
+    const auto   FADE = [](double x) { return 1.0f - std::clamp(static_cast<float>(x), 0.0f, 1.0f); };
+    if (const auto* E = R.phase != EPhase::None ? g_world.find(R.id) : nullptr) {
+        const double PPU   = R.pxPerUnit;
+        const bool   LIMIT = R.phase == EPhase::Drag && R.limit != SResizeView::ELimit::None;
+        const auto   outline = [&](const Vector2D& deco, const Vec3& color, float alpha) {
+            GLScene::SFrameMark M;
+            M.center = R.center, M.right = R.right, M.up = R.up;
+            M.halfW = static_cast<float>(deco.x * 0.5 / PPU), M.halfH = static_cast<float>(deco.y * 0.5 / PPU);
+            M.color = color, M.edge = alpha, M.dashed = true;
+            return M;
+        };
+        GLScene::SFrameMark M;
+        M.center = R.center, M.right = R.right, M.up = R.up;
+        M.halfW = static_cast<float>(R.shown.x * 0.5 / PPU), M.halfH = static_cast<float>(R.shown.y * 0.5 / PPU);
+        // No hatch where the window's frame is (applyResizeView put it).
+        const Vec3  OFF = E->center - R.center;
+        const float CX = dot(OFF, R.right), CY = dot(OFF, R.up);
+        M.contentL = CX - E->width * 0.5f, M.contentR = CX + E->width * 0.5f;
+        M.contentT = CY + E->height * 0.5f, M.contentB = CY - E->height * 0.5f;
+        M.fill      = EFill::Hatch;
+        M.fillAlpha = 0.95f; // as a window's own inactive opacity
+        M.color     = LIMIT ? AMBER : UI;
+        M.hotColor  = M.color;
+        M.hot       = R.corner;
+        switch (R.phase) {
+            case EPhase::Drag: M.edge = 1.0f, M.brackets = 1.0f; break;
+            case EPhase::Pending:
+                M.edge = 0.5f, M.dashed = true, M.brackets = 0.5f;
+                break;
+            case EPhase::Settle:
+                M.edge     = 0.5f * FADE((NOW - R.at) / 0.2);
+                M.brackets = 0.5f * FADE((NOW - R.at) / 0.15);
+                M.color    = R.chose ? AMBER : UI;
+                break;
+            case EPhase::Cancel:
+                M.edge = FADE((NOW - R.at) / 0.18), M.brackets = M.edge;
+                break;
+            case EPhase::None: break;
+        }
+        // The corner on the crosshair; at a limit an amber tether to it.
+        const float SX = R.corner & 1 ? 1.0f : -1.0f, SY = R.corner < 2 ? 1.0f : -1.0f;
+        const Vec3  HIT = R.hit - R.center;
+        const float HX = dot(HIT, R.right), HY = dot(HIT, R.up);
+        if (LIMIT)
+            M.lines.push_back({SX * M.halfW, SY * M.halfH, HX, HY, AMBER, 1.0f});
+        // Aspect kept: the diagonal the corner rides.
+        if (R.phase == EPhase::Drag && R.aspect)
+            M.lines.push_back({-SX * M.halfW * 0.2f, -SY * M.halfH * 0.2f, SX * M.halfW * 1.35f, SY * M.halfH * 1.35f, UI, 0.5f});
+        out.push_back(std::move(M));
+        // Over the frame: the size at the grab, dashed, as long as the drag
+        // goes (with the aspect kept the diagonal shows the track instead);
+        // a size the app did not take, fading over 400 ms.
+        if (R.phase == EPhase::Drag && !R.aspect)
+            out.push_back(outline(R.deco0, MUTED, 0.55f));
+        if (R.phase == EPhase::Settle && R.chose)
+            out.push_back(outline(R.asked + (R.deco0 - R.client0), AMBER, 0.8f * FADE((NOW - R.at) / 0.4)));
+    }
+    // The hovered window's brackets.
+    const auto& H = g_resizeHover;
+    if (H.alpha > 0.0f && !(R.phase != EPhase::None && R.id == H.id))
+        if (const auto* E = g_world.find(H.id)) {
+            GLScene::SFrameMark M;
+            M.center = E->center, M.right = g_world.rightOf(H.id), M.up = g_world.upOf(H.id);
+            M.halfW = E->width * 0.5f, M.halfH = E->height * 0.5f;
+            M.brackets = H.alpha, M.hot = H.hot, M.hotColor = UI;
+            out.push_back(std::move(M));
+        }
+    // The bin's card: where the carried window will go.
+    const auto& B = g_binCatch;
+    if (const auto* E = B.id && (B.near > 0.0f || B.shown > 0.0f) ? g_world.find(B.id) : nullptr; E && E->width > 0.0f) {
+        const float OP = B.caught ? 0.35f : 0.8f * B.near;
+        if (OP > 0.0f) {
+            GLScene::SFrameMark M;
+            const float CH = kBinCard * E->height / E->width;
+            M.center = binSlot(CH), M.right = g_world.rightOf(B.id), M.up = g_world.upOf(B.id);
+            M.halfW = kBinCard * 0.5f, M.halfH = CH * 0.5f;
+            M.fill = EFill::Tint, M.fillAlpha = 0.07f * OP;
+            M.color = UI, M.edge = 0.85f * OP, M.dashed = true;
+            out.push_back(std::move(M));
+        }
+    }
+    return out;
+}
+
+// The size readout at the corner being dragged: the size, and what is
+// happening to it.
+static std::optional<GLScene::SOverlaySprite> resizeReadout(float SCALE) {
+    using EPhase = SResizeView::EPhase;
+    using ETone  = Overlay::ETone;
+    const auto& R = g_resizeView;
+    if (R.phase == EPhase::None)
+        return std::nullopt;
+    const double NOW = nowSeconds(), T = NOW - R.at;
+    const auto   SIZE = [](const Vector2D& v) { return std::to_string(std::lround(v.x)) + " × " + std::to_string(std::lround(v.y)); };
+    std::string  text = SIZE(R.asked) + " px", sub;
+    ETone        tone  = ETone::Accent;
+    float        alpha = 1.0f;
+    switch (R.phase) {
+        case EPhase::Drag:
+            alpha = std::clamp(static_cast<float>(T / 0.1), 0.0f, 1.0f);
+            switch (R.limit) {
+                case SResizeView::ELimit::Min: tone = ETone::Amber, sub = "minimum · " + R.name + " won't go smaller"; break;
+                case SResizeView::ELimit::Max: tone = ETone::Amber, sub = "maximum · " + R.name; break;
+                case SResizeView::ELimit::Room: tone = ETone::Amber, sub = "room limit"; break;
+                case SResizeView::ELimit::None: sub = R.aspect ? "aspect kept · " + R.name : "free · from centre"; break;
+            }
+            break;
+        case EPhase::Pending:
+            if (T < 1.0)
+                sub = "sent · " + R.name + " is redrawing…";
+            else {
+                char secs[16];
+                std::snprintf(secs, sizeof(secs), "%.1f s", T);
+                text = "Waiting for " + R.name + " · " + secs;
+                sub  = "frame kept at " + SIZE(R.asked);
+                tone = ETone::Muted;
+            }
+            break;
+        case EPhase::Settle:
+            if (R.chose) {
+                text  = R.name + " chose " + SIZE(R.actual);
+                sub   = "asked " + SIZE(R.asked);
+                tone  = ETone::Amber;
+                alpha = 1.0f - std::clamp(static_cast<float>((T - 1.2) / 0.2), 0.0f, 1.0f);
+            } else {
+                text  = SIZE(R.actual) + " px";
+                sub   = R.name + " redrew";
+                alpha = 1.0f - std::clamp(static_cast<float>((T - 0.32) / 0.2), 0.0f, 1.0f);
+            }
+            break;
+        case EPhase::Cancel:
+            text  = SIZE(R.client0) + " px";
+            sub   = "cancelled";
+            alpha = 1.0f - std::clamp(static_cast<float>(T / 0.18), 0.0f, 1.0f);
+            break;
+        case EPhase::None: break;
+    }
+    if (alpha <= 0.0f)
+        return std::nullopt;
+    auto&      A   = g_aimOverlay;
+    const auto KEY = text + "\x1f" + sub + "\x1f" + std::to_string(static_cast<int>(tone)) + "\x1f" + std::to_string(SCALE);
+    if (KEY != A.readoutKey) {
+        A.readoutKey = KEY;
+        A.readout    = std::make_shared<const Overlay::SImage>(Overlay::paintReadout(text, sub, tone, SCALE));
+    }
+    // Outside the corner, 8 px off it.
+    const float SX = R.corner & 1 ? 1.0f : -1.0f, SY = R.corner < 2 ? 1.0f : -1.0f;
+    const Vec3  AT = R.center + R.right * static_cast<float>(SX * R.shown.x * 0.5 / R.pxPerUnit) +
+        R.up * static_cast<float>(SY * R.shown.y * 0.5 / R.pxPerUnit);
+    const float W = static_cast<float>(A.readout->w) - 4.0f, H = static_cast<float>(A.readout->h) - 4.0f;
+    const float DX = SX > 0.0f ? 8.0f * SCALE : -8.0f * SCALE - W, DY = SY < 0.0f ? 8.0f * SCALE : -8.0f * SCALE - H;
+    return GLScene::SOverlaySprite{A.readout, GLScene::EAnchor::World, DY, alpha, DX, AT};
+}
+
 // The crosshair's mark and label for what the aim is on.
 static std::vector<GLScene::SOverlaySprite> aimTick(float SCALE) {
     using Overlay::EMark;
@@ -7217,15 +7787,19 @@ static std::vector<GLScene::SOverlaySprite> aimTick(float SCALE) {
             if (HIT.kind == SAimHit::EKind::Object && !objectLabel(HIT.index).empty())
                 label = Overlay::SLabel{EStyle::Quiet, objectLabel(HIT.index) + " · nothing to close"};
         }
+    } else if (g_resize.active) {
+        // Resizing: the corner's mark; the readout at the corner says the rest.
+        mark   = EMark::Resize;
+        target = "resize:" + std::to_string(g_resize.id);
     } else if (g_world.dragActive()) {
-        // Carrying a window: over the bin, what letting go will do -- the
-        // same test the let-go makes (dropInBin).
+        // Carrying a window: caught by the bin, what letting go will do --
+        // the same test the let-go makes (dropInBin).
         const auto ID     = g_world.draggedId();
         const auto WINDOW = Compat::findWindowById(ID);
-        if (WINDOW && aimAtBin()) {
+        if (WINDOW && g_binCatch.caught && g_binCatch.id == ID) {
             mark   = EMark::Bin;
             target = "bin:" + std::to_string(ID);
-            label  = Overlay::SLabel{EStyle::Alert, "Let go to close " + windowName(WINDOW), "Carry it on to keep it open"};
+            label  = Overlay::SLabel{EStyle::Alert, "Let go to close " + windowName(WINDOW), "Aim away to keep it"};
             wait = false, fold = false;
         } else {
             mark   = EMark::Window;
@@ -7275,6 +7849,20 @@ static std::vector<GLScene::SOverlaySprite> aimTick(float SCALE) {
                 break;
             case SAimHit::EKind::None: break;
         }
+    }
+
+    // Super on a window's corner: it resizes from there -- or, for an app
+    // that allows one size only, it says so and what works instead.
+    if (const auto& H = g_resizeHover; !g_gun && !g_resize.active && !g_world.dragActive() && g_superHeld && H.id && H.hot >= 0) {
+        if (H.fixed) {
+            const auto W = Compat::findWindowById(H.id);
+            mark   = EMark::Lock;
+            target = "fixed:" + std::to_string(H.id);
+            label  = Overlay::SLabel{EStyle::Full, (W ? windowName(W) : std::string("This window")) + " has a fixed size", "",
+                                    {{{"Super", "wheel"}, "Scale it instead"}}};
+            fold   = false;
+        } else
+            mark = EMark::Resize;
     }
 
     // The images, painted when what they show changed.
@@ -7329,6 +7917,8 @@ static std::vector<GLScene::SOverlaySprite> aimTick(float SCALE) {
     }
     std::vector<GLScene::SOverlaySprite> sprites;
     sprites.push_back({g_aimOverlay.mark, GLScene::EAnchor::Center, 0.0f, markAlpha});
+    if (auto RO = resizeReadout(SCALE))
+        sprites.push_back(*RO);
     // F2: "1 : 1" over the read window's top right corner once it landed.
     if (const auto* E = g_read.id && !g_read.cinema && !g_read.screen && g_read.id != g_menuId ? g_world.find(g_read.id) : nullptr) {
         const float ALPHA = g_read.back ? 1.0f - std::clamp(SINCE / 0.1f, 0.0f, 1.0f)
@@ -7665,6 +8255,13 @@ static std::vector<GLScene::SOverlaySprite> portalPlates(float scale) {
 // Every frame, after the aim and the drag moved: what the overlay shows.
 static void overlayTick() {
     const float SCALE = g_monitor ? static_cast<float>(g_monitor->m_scale) : 1.0f;
+    {
+        static double s_last = nowSeconds();
+        const double  NOW    = nowSeconds();
+        resizeHoverTick(static_cast<float>(std::clamp(NOW - s_last, 0.0, 0.1)));
+        s_last = NOW;
+    }
+    g_scene.setFrameMarks(frameMarks());
     std::vector<GLScene::SOverlaySprite> sprites = portalPlates(SCALE);
     if (g_use.id)
         std::ranges::move(pointerTick(SCALE), std::back_inserter(sprites));
@@ -7701,6 +8298,18 @@ static void overlayTick() {
         const float ALPHA = larchEase(ELarchEase::Fade, CL(T / 0.22)) * (1.0f - larchEase(ELarchEase::Fade, CL((T - 2.42) / 0.22)));
         const float SLIDE = -12.0f * (1.0f - larchEase(ELarchEase::Move, CL(T / 0.46)));
         sprites.push_back({A.toast, GLScene::EAnchor::Top, (48.0f + SLIDE) * SCALE, ALPHA});
+        g_aimLabelBusy = true;
+    }
+    // The bin closed a window: its name for 800 ms, under the crosshair.
+    if (const double TC = nowSeconds() - g_binClosedAt; TC >= 0.0 && TC < 1.0) {
+        const std::string KEY = g_binClosedName + "\x1f" + std::to_string(SCALE);
+        if (A.closedKey != KEY) {
+            A.closedKey = KEY;
+            A.closed    = std::make_shared<const Overlay::SImage>(
+                Overlay::paintLabel({Overlay::SLabel::EStyle::Quiet, "Closed " + g_binClosedName}, SCALE));
+        }
+        sprites.push_back({A.closed, GLScene::EAnchor::Center, 26.0f * SCALE,
+                           1.0f - static_cast<float>(std::clamp((TC - 0.8) / 0.2, 0.0, 1.0))});
         g_aimLabelBusy = true;
     }
     g_scene.setOverlay(std::move(sprites));
@@ -7741,6 +8350,8 @@ static void onMouseButton(
     if (!PRESSED && g_pointerDown && event.button == g_pointerButton) {
         if (g_pointerGesture == EPointerGesture::Move3D && !dropInBin(g_world.draggedId()))
             dropOnTV(g_world.draggedId());
+        else if (g_pointerGesture == EPointerGesture::ResizeReal)
+            releaseResize();
         resetPointerGesture();
         info.cancelled = true;
         damageCurrentMonitor();
@@ -7839,7 +8450,20 @@ static void onMouseButton(
     // by the shell that anchored them.
     if (PRESSED && g_superHeld && g_fsPhase == EFullscreenPhase::None &&
         (event.button == BTN_LEFT || event.button == BTN_RIGHT)) {
-        const World3D::SHit HIT = aimHit();
+        World3D::SHit HIT = aimHit();
+        // Super + right on a corner just past its window's edge: that
+        // corner (its zone reaches outside, resizeHoverTick).
+        if (const auto& H = g_resizeHover; event.button == BTN_RIGHT && H.id && H.hot >= 0 && H.alpha > 0.0f &&
+            (!HIT.hit || HIT.id != H.id) && Compat::findWindowById(H.id)) {
+            if (Vec3 P; aimOnPlane(H.id, P)) {
+                const Vec3 TO = P - g_scene.camera().position;
+                HIT          = {};
+                HIT.hit      = true;
+                HIT.id       = H.id;
+                HIT.point    = P;
+                HIT.distance = std::sqrt(dot(TO, TO));
+            }
+        }
         const auto TARGET = HIT.hit ? targetFromHit(HIT.id) : SHitTarget{};
 
         // A DYNAMIC scene object closer than any window is grabbed with the
@@ -7948,35 +8572,14 @@ static void onMouseButton(
             g_resize = {};
         }
         else {
-            const auto ENTITY = g_world.find(HIT.id);
-            if (!ENTITY) {
+            if (!startResize(HIT, TARGET.window)) {
                 info.cancelled = true;
                 return;
             }
-
-            g_resize = {};
+            g_resize        = {};
             g_resize.active = true;
-            g_resize.id = HIT.id;
+            g_resize.id     = HIT.id;
             g_resize.window = TARGET.window;
-            g_resize.startBox = Compat::currentWindowBox(TARGET.window);
-            g_resize.startCenter = ENTITY->center;
-            g_resize.startWorldWidth = ENTITY->width;
-            g_resize.startWorldHeight = ENTITY->height;
-            g_resize.planePoint = ENTITY->center;
-            g_resize.planeNormal = g_world.normalOf(HIT.id);
-
-            // The grab point only seeds which edge follows the crosshair;
-            // updateRealResize re-evaluates that every frame from the aim's
-            // side relative to the window centre, so the grab lands anywhere
-            // on the window and the pull direction decides the rest. As the
-            // camera turns, the current centre ray is intersected with this
-            // same window plane, so the real window stretches exactly toward
-            // the point being aimed at.
-            // RayHit::v is already top-to-bottom. Top half follows +1,
-            // bottom half follows -1 in the CBox edge convention below.
-            g_resize.edgeX = HIT.u < 0.5f ? -1 : 1;
-            g_resize.edgeY = HIT.v < 0.5f ? 1 : -1;
-            g_resize.grabPx = worldPointToGlobalPx(targetMonitor(), HIT.point);
 
             g_pointerGesture = EPointerGesture::ResizeReal;
             g_pointerButton = BTN_RIGHT;
@@ -8122,6 +8725,15 @@ static void onKeyboardKeyRoom(
         g_superHeld = PRESSED;
     else if (SYM == XKB_KEY_Alt_L)
         g_altHeld = PRESSED;
+    else if (SYM == XKB_KEY_Shift_L || SYM == XKB_KEY_Shift_R)
+        g_shiftHeld = PRESSED;
+    // Esc during a resize: the frame springs back, nothing is sent.
+    if (PRESSED && SYM == XKB_KEY_Escape && g_resizeView.phase == SResizeView::EPhase::Drag) {
+        cancelResize();
+        resetPointerGesture();
+        info.cancelled = true;
+        return;
+    }
     if (PRESSED && SYM != XKB_KEY_Super_L && SYM != XKB_KEY_Super_R)
         superComboTaken();
 

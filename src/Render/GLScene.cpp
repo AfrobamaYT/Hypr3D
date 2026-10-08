@@ -2298,6 +2298,9 @@ void GLScene::drawRoom(const Mat4& vp, const ViewWindow& view,
         m_windowsOnTop = false;
     }
 
+    if (!sight)
+        drawFrameMarks(vp);
+
     glDepthMask(GL_TRUE);
 }
 
@@ -2846,11 +2849,190 @@ void GLScene::releaseBlur() {
             glDeleteTextures(1, &L.tex);
         L = {};
     }
-    for (auto* P : {&m_blurDownProgram, &m_blurUpProgram})
+    for (auto* P : {&m_blurDownProgram, &m_blurUpProgram, &m_frameProgram})
         if (*P) {
             glDeleteProgram(*P);
             *P = 0;
         }
+    if (m_frameVAO)
+        glDeleteVertexArrays(1, &m_frameVAO);
+    if (m_frameVBO)
+        glDeleteBuffers(1, &m_frameVBO);
+    m_frameVAO = m_frameVBO = 0;
+}
+
+void GLScene::drawFrameMarks(const Mat4& vp) {
+    if (m_frameMarks.empty() || m_sceneHeight <= 0)
+        return;
+    if (!m_frameProgram) {
+        static constexpr const char* VS = R"GLSL(#version 300 es
+precision highp float;
+layout(location = 0) in vec2 aP;
+uniform mat4 uMVP;
+uniform vec3 uC, uR, uU;
+out vec2 vP;
+void main() {
+    vP = aP;
+    gl_Position = uMVP * vec4(uC + uR * aP.x + uU * aP.y, 1.0);
+}
+)GLSL";
+        // Everything in the plane's local world units; uWpp turns screen
+        // pixels into them (at the mark's centre). Layers composite back to front: fill, edge, brackets,
+        // lines.
+        static constexpr const char* FS = R"GLSL(#version 300 es
+precision highp float;
+in vec2 vP;
+uniform vec2  uHalf;
+uniform vec4  uContent; // left, top, right, bottom
+uniform float uWpp;
+uniform int   uFill;
+uniform float uFillA;
+uniform vec4  uColor; // the edge: rgb, alpha
+uniform int   uDashed;
+uniform float uBrackets;
+uniform int   uHot;
+uniform vec3  uHotColor;
+uniform int   uLines;
+uniform vec4  uLineP[2];
+uniform vec4  uLineC[2];
+out vec4 fragColor;
+vec4 acc = vec4(0.0);
+void over(vec3 c, float a) {
+    a = clamp(a, 0.0, 1.0);
+    acc.rgb = c * a + acc.rgb * (1.0 - a);
+    acc.a   = a + acc.a * (1.0 - a);
+}
+float sdBox(vec2 p, vec2 c, vec2 h) {
+    vec2 d = abs(p - c) - h;
+    return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
+}
+// Coverage of a shape at signed distance d (world), antialiased over a pixel.
+float cover(float d) {
+    float aa = max(length(fwidth(vP)), 1e-6) * 0.7;
+    return 1.0 - smoothstep(-aa, aa, d);
+}
+void main() {
+    vec2 q = abs(vP);
+    if (uFill != 0 && q.x <= uHalf.x && q.y <= uHalf.y) {
+        bool inContent = vP.x >= uContent.x && vP.x <= uContent.z && vP.y <= uContent.y && vP.y >= uContent.w;
+        if (!inContent) {
+            if (uFill == 1) {
+                // 135 degree stripes, 5 px of 12 on screen, over the window's
+                // grey.
+                vec2  w = vP / uWpp;
+                float s = mod(w.x + w.y, 12.0 * 1.41421);
+                over(mix(vec3(0.173, 0.180, 0.192), vec3(0.212, 0.220, 0.235), step(s, 5.0 * 1.41421)), uFillA);
+            } else
+                over(uColor.rgb, uFillA);
+        }
+    }
+    if (uColor.a > 0.0) {
+        float sd  = sdBox(vP, vec2(0.0), uHalf);
+        float a   = cover(abs(sd) - 0.75 * uWpp);
+        if (uDashed == 1) {
+            float along = (q.x - uHalf.x > q.y - uHalf.y) ? vP.y : vP.x;
+            a *= step(mod(along / uWpp, 14.0), 8.0);
+        }
+        over(uColor.rgb, a * uColor.a);
+    }
+    if (uBrackets > 0.0) {
+        for (int i = 0; i < 4; ++i) {
+            vec2  sg  = vec2(i == 1 || i == 3 ? 1.0 : -1.0, i < 2 ? 1.0 : -1.0);
+            bool  HOT = i == uHot;
+            float L   = (HOT ? 22.0 : 14.0) * uWpp, T = (HOT ? 3.0 : 2.0) * uWpp;
+            vec2  C   = sg * (uHalf + 3.0 * uWpp);
+            float d   = min(sdBox(vP, C - sg * vec2(L, T) * 0.5, vec2(L, T) * 0.5),
+                            sdBox(vP, C - sg * vec2(T, L) * 0.5, vec2(T, L) * 0.5));
+            over(HOT ? uHotColor : vec3(0.92, 0.93, 0.94), cover(d) * uBrackets * (HOT ? 1.0 : 0.75));
+        }
+    }
+    for (int i = 0; i < 2; ++i) {
+        if (i >= uLines)
+            break;
+        vec2  A = uLineP[i].xy, B = uLineP[i].zw, AB = B - A;
+        float h = clamp(dot(vP - A, AB) / max(dot(AB, AB), 1e-12), 0.0, 1.0);
+        float d = length(vP - A - AB * h) - 0.65 * uWpp;
+        float dash = step(mod(h * length(AB) / uWpp, 12.0), 7.0);
+        over(uLineC[i].rgb, cover(d) * dash * uLineC[i].a);
+    }
+    if (acc.a <= 0.001)
+        discard;
+    fragColor = vec4(acc.rgb / acc.a, acc.a);
+}
+)GLSL";
+        const GLuint V = compileShader(GL_VERTEX_SHADER, VS);
+        const GLuint F = compileShader(GL_FRAGMENT_SHADER, FS);
+        if (V && F)
+            m_frameProgram = linkProgram(V, F);
+        for (const GLuint SH : {V, F})
+            if (SH)
+                glDeleteShader(SH);
+        if (!m_frameProgram)
+            return;
+        glGenVertexArrays(1, &m_frameVAO);
+        glGenBuffers(1, &m_frameVBO);
+        glBindVertexArray(m_frameVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, m_frameVBO);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), nullptr);
+        glBindVertexArray(0);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+    }
+    const GLuint P = m_frameProgram;
+    glUseProgram(P);
+    glUniformMatrix4fv(glGetUniformLocation(P, "uMVP"), 1, GL_FALSE, vp.m.data());
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_BLEND);
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+    // In front of the window it marks, which lies in the same plane.
+    glEnable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(-1.f, -8.f);
+    glBindVertexArray(m_frameVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_frameVBO);
+    const float TAN = std::tan(kFovDeg * 3.14159265f / 360.0f);
+    for (const auto& M : m_frameMarks) {
+        const Vec3  D    = M.center - m_camera.position;
+        const float DIST = std::max(0.05f, std::sqrt(D.x * D.x + D.y * D.y + D.z * D.z));
+        const float WPP  = 2.0f * DIST * TAN / static_cast<float>(m_sceneHeight);
+        // The quad: the frame, its brackets and its lines, a margin round.
+        float x0 = -M.halfW, x1 = M.halfW, y0 = -M.halfH, y1 = M.halfH;
+        for (const auto& L : M.lines)
+            x0 = std::min({x0, L.x0, L.x1}), x1 = std::max({x1, L.x0, L.x1}), y0 = std::min({y0, L.y0, L.y1}), y1 = std::max({y1, L.y0, L.y1});
+        const float MG = 10.0f * WPP;
+        x0 -= MG, x1 += MG, y0 -= MG, y1 += MG;
+        const float V[] = {x0, y0, x1, y0, x1, y1, x0, y0, x1, y1, x0, y1};
+        glBufferData(GL_ARRAY_BUFFER, sizeof(V), V, GL_DYNAMIC_DRAW);
+        glUniform3f(glGetUniformLocation(P, "uC"), M.center.x, M.center.y, M.center.z);
+        glUniform3f(glGetUniformLocation(P, "uR"), M.right.x, M.right.y, M.right.z);
+        glUniform3f(glGetUniformLocation(P, "uU"), M.up.x, M.up.y, M.up.z);
+        glUniform2f(glGetUniformLocation(P, "uHalf"), M.halfW, M.halfH);
+        glUniform4f(glGetUniformLocation(P, "uContent"), M.contentL, M.contentT, M.contentR, M.contentB);
+        glUniform1f(glGetUniformLocation(P, "uWpp"), WPP);
+        glUniform1i(glGetUniformLocation(P, "uFill"), static_cast<int>(M.fill));
+        glUniform1f(glGetUniformLocation(P, "uFillA"), M.fillAlpha);
+        glUniform4f(glGetUniformLocation(P, "uColor"), M.color.x, M.color.y, M.color.z, M.edge);
+        glUniform1i(glGetUniformLocation(P, "uDashed"), M.dashed ? 1 : 0);
+        glUniform1f(glGetUniformLocation(P, "uBrackets"), M.brackets);
+        glUniform1i(glGetUniformLocation(P, "uHot"), M.hot);
+        glUniform3f(glGetUniformLocation(P, "uHotColor"), M.hotColor.x, M.hotColor.y, M.hotColor.z);
+        const int N = static_cast<int>(std::min<size_t>(M.lines.size(), 2));
+        float     LP[8] = {}, LC[8] = {};
+        for (int i = 0; i < N; ++i) {
+            const auto& L = M.lines[static_cast<size_t>(i)];
+            LP[i * 4 + 0] = L.x0, LP[i * 4 + 1] = L.y0, LP[i * 4 + 2] = L.x1, LP[i * 4 + 3] = L.y1;
+            LC[i * 4 + 0] = L.color.x, LC[i * 4 + 1] = L.color.y, LC[i * 4 + 2] = L.color.z, LC[i * 4 + 3] = L.alpha;
+        }
+        glUniform1i(glGetUniformLocation(P, "uLines"), N);
+        glUniform4fv(glGetUniformLocation(P, "uLineP"), 2, LP);
+        glUniform4fv(glGetUniformLocation(P, "uLineC"), 2, LC);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+    }
+    glDisable(GL_POLYGON_OFFSET_FILL);
+    glPolygonOffset(0.f, 0.f);
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 
 void GLScene::drawDim(float dim) {

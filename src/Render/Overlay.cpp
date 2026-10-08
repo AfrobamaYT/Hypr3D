@@ -34,6 +34,7 @@ namespace Overlay {
         constexpr SRGBA UI       = hex(0x5cb8e6);
         constexpr SRGBA LABEL    = hex(0x8a959e);
         constexpr SRGBA VALUE    = hex(0xd7dde2);
+        constexpr SRGBA AMBER    = hex(0xf5be5a);
         constexpr const char* SANS = "Manrope";
         constexpr const char* MONO = "JetBrains Mono";
 
@@ -422,6 +423,30 @@ namespace Overlay {
                     cairo_stroke(CR);
                 }
                 dot(ERROR);
+                break;
+            }
+            case EMark::Resize:
+            case EMark::Lock: {
+                // The window's brackets; a resize corner adds a stroke along
+                // the diagonal it drags, a fixed size an amber block.
+                const SRGBA& C = mark == EMark::Lock ? AMBER : UI;
+                source(CR, C);
+                for (const double SX : {-1.0, 1.0})
+                    for (const double SY : {-1.0, 1.0}) {
+                        const double X0 = SX < 0 ? -12 : 5, Y0 = SY < 0 ? -12 : 5;
+                        cairo_rectangle(CR, X0, SY < 0 ? -12 : 10, 7, 2);
+                        cairo_rectangle(CR, SX < 0 ? -12 : 10, Y0, 2, 7);
+                    }
+                cairo_fill(CR);
+                if (mark == EMark::Lock) {
+                    cairo_rectangle(CR, -2.5, -2.5, 5, 5);
+                    cairo_fill(CR);
+                } else {
+                    cairo_set_line_width(CR, 2);
+                    cairo_move_to(CR, -9, -9);
+                    cairo_line_to(CR, 9, 9);
+                    cairo_stroke(CR);
+                }
                 break;
             }
             case EMark::None: break;
@@ -815,6 +840,35 @@ namespace Overlay {
         auto*        CR = cairo_create(S);
         drawPanel(CR, 2, 2, PW, PH, 9 * s, s);
         draw(CR, t, 2 + 10 * s, 2 + (PH - t.h) / 2);
+        cairo_destroy(CR);
+        auto I = finish(S, nullptr, {}, 1.0);
+        cairo_surface_destroy(S);
+        I.ax = I.ay = 2.0f;
+        return I;
+    }
+    SImage paintReadout(const std::string& str, const std::string& sub, ETone tone, float scale) {
+        // A panel 6 px in, 3 px between the lines: the size 500 13 mono in
+        // the tone, the note 400 11 mono in grey; the panel's line takes
+        // the tone too.
+        const double s    = std::max(0.5f, scale);
+        const SRGBA& TONE = tone == ETone::Amber ? AMBER : tone == ETone::Muted ? SUB : UI;
+        SText        a    = text(str, 500, 13, TONE, s, MONO);
+        SText        b    = text(sub, 400, 11, SUB, s, MONO);
+        const double PW = std::ceil(std::max(a.w, sub.empty() ? 0.0 : b.w) + 16 * s);
+        const double PH = std::ceil(a.h + (sub.empty() ? 0.0 : 3 * s + b.h) + 10 * s);
+        const int    W = static_cast<int>(PW + 4), H = static_cast<int>(PH + 4);
+        auto*        S  = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, W, H);
+        auto*        CR = cairo_create(S);
+        roundRect(CR, 2, 2, PW, PH, 4 * s);
+        source(CR, PANEL);
+        cairo_fill(CR);
+        roundRect(CR, 2 + 0.5 * s, 2 + 0.5 * s, PW - s, PH - s, 3.5 * s);
+        source(CR, TONE, 0.55);
+        cairo_set_line_width(CR, s);
+        cairo_stroke(CR);
+        draw(CR, a, 2 + 8 * s, 2 + 5 * s);
+        if (!sub.empty())
+            draw(CR, b, 2 + 8 * s, 2 + 5 * s + a.h + 3 * s);
         cairo_destroy(CR);
         auto I = finish(S, nullptr, {}, 1.0);
         cairo_surface_destroy(S);

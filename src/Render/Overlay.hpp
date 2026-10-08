@@ -32,6 +32,8 @@ namespace Overlay {
         Gun,     // red cross: the gun on something it can shoot
         GunIdle, // white cross at 55 %: the gun on nothing with a process
         GunHold, // the ring filling while the kill is held
+        Resize,  // brackets with a diagonal stroke: Super + right drag resizes from this corner
+        Lock,    // amber brackets round an amber block: this window has a fixed size
     };
 
     // charge: GunHold's fill, 0..1.
@@ -75,6 +77,16 @@ namespace Overlay {
     // A small mono tag, as F2's "1 : 1" over the window's corner. The
     // anchor is its top left.
     SImage paintTag(const std::string& text, float scale);
+
+    // The size readout at a resized window's corner (the owner's approved
+    // "Room Interactions" draft, 2026-10-08): a line of size in mono and a
+    // grey line under it. The anchor is the panel's top left.
+    enum class ETone : uint8_t {
+        Accent, // drawing a size
+        Amber,  // at a limit, or the app chose another size
+        Muted,  // waiting for the app
+    };
+    SImage paintReadout(const std::string& text, const std::string& sub, ETone tone, float scale);
 
     // A pill of key hints, as at the bottom of Super+F's screen; `bare`:
     // the keys alone, no pill. Its anchor is its top centre, bare its top

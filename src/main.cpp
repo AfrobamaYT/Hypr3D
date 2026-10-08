@@ -195,6 +195,21 @@ static double g_msUpdate3D = 0.0;     // per-section profiling (exponential avg)
 static double g_msJolt     = 0.0;
 static double g_msRender   = 0.0;
 static double g_msRenderSpan = 0.0;    // one neighbour's pass, the same average
+// The target monitor's frames: when each began (the last 240), and the
+// capture pass's cost -- for the status file's "frames:" line.
+static std::array<std::chrono::steady_clock::time_point, 240> g_frameAt{};
+static size_t   g_frameCount = 0;
+static double   g_msCapture = 0.0, g_msCaptureMax = 0.0;
+static uint64_t g_snapsAtFrame = 0;
+static double   g_snapsPerFrame = 0.0;
+// Frame by frame, the last 240 target frames, for the status file's
+// framelog: the interval, the capture pass and its snapshots' render and
+// copy, how many, the still count, and why each snapshot was taken.
+struct SFrameRec { float ms, cap, render, copy; int snaps, still, onTime; char why[24]; };
+static std::string g_snapWhy; // a aimed, f focused, d fading, g alpha grace, D dragged, s silhouette, L layer, c content
+static std::array<SFrameRec, 240> g_frameRec{};
+static double g_lastCapMs = 0.0;
+static int    g_lastSnaps = 0;
 static std::string g_lastError;        // last caught handler exception
 
 static void dumpErrorNow(const std::string& what) {
@@ -2428,6 +2443,8 @@ static void refreshCaptures(
     if (!g_resizeHeldGone.empty()) {
         if (Render::GL::g_pHyprOpenGL)
             Render::GL::g_pHyprOpenGL->makeEGLCurrent();
+        for (auto& H : g_resizeHeldGone)
+            g_capture.releaseHeld(H);
         g_resizeHeldGone.clear();
     }
 
@@ -2495,10 +2512,14 @@ static void refreshCaptures(
             consumedSkirt = true;
         }
 
+        const auto BEFORE = g_capture.rendered();
         if (info.isLayer)
             g_capture.makeSnapshotLayer(info.layer, info.monitor ? info.monitor : mon, FORCE || finalSkirt);
         else
             g_capture.makeSnapshot(info.window, info.monitor ? info.monitor : mon, FORCE || finalSkirt);
+        if (g_capture.rendered() != BEFORE)
+            g_snapWhy += FADING ? 'd' : ALPHA_GRACE ? 'g' : info.id == g_lastAimedId ? 'a' : info.id == FOCUSED_ID ? 'f' :
+                (g_world.dragActive() && g_world.draggedId() == info.id) ? 'D' : finalSkirt ? 's' : info.isLayer ? 'L' : 'c';
     }
 
     if (consumedSkirt)
@@ -2524,6 +2545,9 @@ static void serviceCapture() {
         return;
 
     g_capturing = true;
+    const auto CAP_T0 = std::chrono::steady_clock::now();
+    g_snapWhy.clear();
+    g_capture.m_msRender = g_capture.m_msCopy = 0;
 
     // On the way out the 2D layout is back already (flightLeave): the
     // windows must not be taken out of it again.
@@ -2531,6 +2555,12 @@ static void serviceCapture() {
         ghostWindows(eligibleWindowsSpanned());
     refreshCaptures(eligibleWindowsSpanned(), MON);
 
+    const double CAP_MS = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - CAP_T0).count();
+    g_msCapture    = g_msCapture * 0.9 + CAP_MS * 0.1;
+    g_msCaptureMax = std::max(g_msCaptureMax * 0.995, CAP_MS);
+    g_snapsPerFrame = g_snapsPerFrame * 0.9 + static_cast<double>(g_capture.rendered() - g_snapsAtFrame) * 0.1;
+    g_lastCapMs = CAP_MS, g_lastSnaps = static_cast<int>(g_capture.rendered() - g_snapsAtFrame);
+    g_snapsAtFrame  = g_capture.rendered();
     g_capturing = false;
 }
 
@@ -3367,8 +3397,9 @@ static GLScene::SHudQuad backdropQuad(const PHLMONITOR& mon) {
     Q.texture = SNAP->bigTex ? SNAP->bigTex : SNAP->texID;
     Q.x0 = static_cast<float>(X / W * 2.0 - 1.0), Q.x1 = static_cast<float>((X + BOX->w) / W * 2.0 - 1.0);
     Q.y0 = static_cast<float>(Y / H * 2.0 - 1.0), Q.y1 = static_cast<float>((Y + BOX->h) / H * 2.0 - 1.0);
-    Q.u0 = static_cast<float>(X / SW), Q.u1 = static_cast<float>((X + BOX->w) / SW);
-    Q.v0 = static_cast<float>(Y / SH), Q.v1 = static_cast<float>((Y + BOX->h) / SH);
+    const double OX = SNAP->texOrigin.x, OY = SNAP->texOrigin.y; // the texture's own corner
+    Q.u0 = static_cast<float>((X - OX) / SW), Q.u1 = static_cast<float>((X - OX + BOX->w) / SW);
+    Q.v0 = static_cast<float>((Y - OY) / SH), Q.v1 = static_cast<float>((Y - OY + BOX->h) / SH);
     return Q;
 }
 
@@ -4042,7 +4073,7 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
 
         // The app drew the new size: its old frame fades out over the new
         // one in 120 ms, still in the frame's top left, a hair in front.
-        if (RV.held && RV.id == entity.id && SNAPSHOT->fb != RV.held->fb) {
+        if (RV.held && RV.id == entity.id && SNAPSHOT->serial != RV.held->serial) {
             const auto& H = *RV.held;
             const float A = 1.0f - std::clamp(static_cast<float>((nowSeconds() - RV.at) / 0.12), 0.0f, 1.0f);
             if (A > 0.0f && H.texSpan.x > 0.0 && H.texSpan.y > 0.0) {
@@ -4052,7 +4083,7 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
                     RV.up * static_cast<float>((RV.shown.y - CH) * 0.5 / PPU) + RV.normal * 0.002f;
                 GLScene::WindowRender old = render;
                 old.id       = 0;
-                old.texture  = H.texID;
+                old.texture  = H.bigTex ? H.bigTex : H.texID;
                 old.x = C.x, old.y = C.y, old.z = C.z;
                 old.width    = static_cast<float>(CW / PPU);
                 old.height   = static_cast<float>(CH / PPU);
@@ -4871,9 +4902,7 @@ static void releaseResize() {
 // The app drew the new size, or 5 s passed: whatever size it has now.
 static void settleResize(const PHLWINDOW& W) {
     auto& R = g_resizeView;
-    const auto* SNAP = g_capture.get(R.id);
-    if (SNAP && SNAP->texID && !SNAP->bigTex)
-        R.held = *SNAP; // the old frame, until it has faded (120 ms)
+    R.held = g_capture.hold(R.id); // the old frame, until it has faded (120 ms)
     const Vector2D SURF = W->resource() ? W->resource()->m_current.size : R.asked;
     R.actual = SURF.x > 0.0 && SURF.y > 0.0 ? SURF : R.asked;
     R.chose  = std::fabs(R.actual.x - R.asked.x) > kResizeSnapPx || std::fabs(R.actual.y - R.asked.y) > kResizeSnapPx;
@@ -5009,7 +5038,7 @@ static void applyResizeView(const Compat::CWindowCapture::SSnapshot* SNAP, World
     using EPhase  = SResizeView::EPhase;
     const auto& R = g_resizeView;
     const bool OLD = R.phase == EPhase::Drag || R.phase == EPhase::Pending || R.phase == EPhase::Cancel ||
-        (R.held && SNAP && SNAP->fb == R.held->fb);
+        (R.held && SNAP && SNAP->serial == R.held->serial);
     if (!OLD) {
         E.center = R.center;
         return;
@@ -6494,8 +6523,9 @@ static std::vector<GLScene::SHudQuad> hudQuadsFor(const PHLMONITOR& mon) {
         Q.x1 = static_cast<float>((H.box.x + H.box.w) / W * 2.0 - 1.0);
         Q.y0 = static_cast<float>(H.box.y / HGT * 2.0 - 1.0); // -1 = the top
         Q.y1 = static_cast<float>((H.box.y + H.box.h) / HGT * 2.0 - 1.0);
-        Q.u0 = static_cast<float>(H.box.x / SW), Q.u1 = static_cast<float>((H.box.x + H.box.w) / SW);
-        Q.v0 = static_cast<float>(H.box.y / SH), Q.v1 = static_cast<float>((H.box.y + H.box.h) / SH);
+        const double OX = SNAP->texOrigin.x, OY = SNAP->texOrigin.y; // the texture's own corner
+        Q.u0 = static_cast<float>((H.box.x - OX) / SW), Q.u1 = static_cast<float>((H.box.x - OX + H.box.w) / SW);
+        Q.v0 = static_cast<float>((H.box.y - OY) / SH), Q.v1 = static_cast<float>((H.box.y - OY + H.box.h) / SH);
         out.push_back(Q);
     }
     return out;
@@ -6792,6 +6822,28 @@ static void dumpStatus(bool force = false) {
         << " (RT_GL=" << (int)Render::IHyprRenderer::RT_GL << ")\n";
     out << "msUpdate3D=" << g_msUpdate3D << " msJolt=" << g_msJolt
         << " msRender=" << g_msRender << " msRenderSpan=" << g_msRenderSpan << "\n";
+    {
+        // The target monitor's frame intervals over the last 240 frames, in
+        // ms: the pacing, not only the average.
+        const size_t N = std::min(g_frameCount, g_frameAt.size());
+        std::vector<double> iv;
+        for (size_t i = 1; i < N; ++i) {
+            const auto A = g_frameAt[(g_frameCount - i - 1) % g_frameAt.size()], B = g_frameAt[(g_frameCount - i) % g_frameAt.size()];
+            iv.push_back(std::chrono::duration<double, std::milli>(B - A).count());
+        }
+        std::ranges::sort(iv);
+        const auto PCT = [&](double p) { return iv.empty() ? 0.0 : iv[std::min(iv.size() - 1, static_cast<size_t>(p * (iv.size() - 1) + 0.5))]; };
+        out << "frames: n=" << iv.size() << " p50=" << PCT(0.5) << " p90=" << PCT(0.9) << " p99=" << PCT(0.99)
+            << " max=" << (iv.empty() ? 0.0 : iv.back()) << " capture=" << g_msCapture << "/" << g_msCaptureMax
+            << " snaps=" << g_snapsPerFrame << "\n";
+        out << "framelog (ms/capture/snaps/still,onTime/render/copy/why):";
+        for (size_t i = 0; i < N; ++i) {
+            const auto& R = g_frameRec[(g_frameCount - N + i) % g_frameRec.size()];
+            out << " " << std::lround(R.ms * 10) / 10.0 << "/" << std::lround(R.cap * 10) / 10.0 << "/" << R.snaps << "/" << R.still << R.onTime
+                << "/" << std::lround(R.render * 10) / 10.0 << "/" << std::lround(R.copy * 10) / 10.0 << "/" << (R.why[0] ? R.why : "-");
+        }
+        out << "\n";
+    }
     {
         out << "span=" << (g_cfgSpan ? 1 : 0) << " monitors=";
         for (const auto& M : spannedMonitors()) {
@@ -7117,6 +7169,7 @@ static void onRenderStage(eRenderStage stage) {
         return;
 
     const auto U3_T0 = std::chrono::steady_clock::now();
+    g_frameAt[g_frameCount++ % g_frameAt.size()] = U3_T0;
     update3D(dt);
     g_msUpdate3D = g_msUpdate3D * 0.9 +
         std::chrono::duration<double, std::milli>(
@@ -7142,6 +7195,13 @@ static void onRenderStage(eRenderStage stage) {
     const uint64_t SIG = frameFingerprint();
     g_stillFrames = SIG == g_frameSig && !runsOnTime() ? g_stillFrames + 1 : 0;
     g_frameSig = SIG;
+    {
+        const size_t I = (g_frameCount - 1) % g_frameAt.size(), P = (g_frameCount + g_frameAt.size() - 2) % g_frameAt.size();
+        g_frameRec[I] = {g_frameCount > 1 ? static_cast<float>(std::chrono::duration<double, std::milli>(g_frameAt[I] - g_frameAt[P]).count()) : 0.f,
+                         static_cast<float>(g_lastCapMs), static_cast<float>(g_capture.m_msRender), static_cast<float>(g_capture.m_msCopy),
+                         g_lastSnaps, g_stillFrames, runsOnTime() ? 1 : 0, {}};
+        std::snprintf(g_frameRec[I].why, sizeof(g_frameRec[I].why), "%s", g_snapWhy.c_str());
+    }
     if (!roomStill())
         damageCurrentMonitor();
     else if (g_stillFrames == kStillFrames)

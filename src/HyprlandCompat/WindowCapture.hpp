@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <unordered_map>
 
 namespace H3D::Compat {
@@ -85,6 +86,19 @@ class CWindowCapture {
         // Identity of the client's last-committed buffer at snapshot time:
         // the cheap "did the content change" signal between frames.
         std::uintptr_t lastBuffer = 0;
+
+        // Where the texture's top left sits, monitor-local logical: 0,0 for
+        // a monitor-sized texture, the surface's own corner for one of its
+        // own size (texSpan is then the surface's size).
+        Vector2D texOrigin = {};
+
+        // New for every snapshot taken: "is this still that snapshot".
+        uint64_t serial = 0;
+
+        // Its texture is held by someone else (a resize's fading old
+        // frame): the next snapshot neither reuses nor deletes it, and
+        // only releaseHeld() does.
+        bool held = false;
     };
 
     // Per-window silhouette state: the traced outline + the cadence
@@ -144,7 +158,21 @@ class CWindowCapture {
 
     void destroySnapshotGL(SSnapshot& snapshot);
 
+    // The surface's part of the monitor-sized snapshot fb, copied into a
+    // texture of its own size -- kept while the size holds, the previous
+    // snapshot's unless held -- and mipmapped there. snapshot then samples
+    // that texture whole (bigTex, texID 0) and the fb goes.
+    bool adoptOwnTexture(std::uintptr_t id, SSnapshot& snapshot, unsigned int fbID, int srcX, int srcY, int w, int h);
+
+    uint64_t m_serial = 0;
+
   public:
+    // The current snapshot of `id`, its texture now held by the caller: the
+    // capture takes new snapshots into a new texture. Release it with
+    // releaseHeld, with the GL context current.
+    std::optional<SSnapshot> hold(std::uintptr_t id);
+    void                     releaseHeld(SSnapshot& snapshot);
+
 
     // True if this id currently has a live snapshot.
     bool has(std::uintptr_t id) const;
@@ -163,7 +191,18 @@ class CWindowCapture {
 
     void shutdownGL();
 
+    // Snapshots actually rendered (not skipped as unchanged) since load: the
+    // status file's per-frame capture count.
+    uint64_t rendered() const {
+        return m_rendered;
+    }
+    // ms spent in the snapshots' renders and in copying them into their own
+    // textures with mipmaps, since the caller last zeroed them: the status
+    // file's framelog.
+    double m_msRender = 0, m_msCopy = 0;
+
   private:
+    uint64_t m_rendered = 0;
     std::unordered_map<std::uintptr_t, SSnapshot> m_snapshots;
     std::unordered_map<std::uintptr_t, SSkirtState> m_skirtStates;
 };

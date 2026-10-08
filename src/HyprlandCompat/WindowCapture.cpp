@@ -1,4 +1,5 @@
 #include "HyprlandCompat/WindowCapture.hpp"
+#include <chrono>
 
 #include "HyprlandCompat/WindowsCompat.hpp"
 
@@ -445,7 +446,10 @@ bool CWindowCapture::makeSnapshot(const PHLWINDOW& window, const PHLMONITOR& mon
 
     // Renders the window (content + decorations) into a fresh plugin-ownable
     // framebuffer. Requires the window to currently pass shouldRenderWindow.
+    ++m_rendered;
+    const auto PT0 = std::chrono::steady_clock::now();
     auto fb = g_pHyprRenderer->makeSnapshotFB(window);
+    m_msRender += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - PT0).count();
 
     if (SHIFTED)
         WORKSPACE->m_renderOffset->setValueAndWarp(ORIGINAL);
@@ -465,22 +469,33 @@ bool CWindowCapture::makeSnapshot(const PHLWINDOW& window, const PHLMONITOR& mon
         snapshot.fb = nullptr;
         return false;
     }
-    buildMipmaps(snapshot.texID);
+
+    // The window's part of the fb, in a texture of its own size: the
+    // monitor-sized one was new every snapshot, and mipmapping it -- 4K on
+    // the 4K monitor -- took 2.6 to 3.4 ms each time, ten times the
+    // render's own 0.3 ms (measured 2026-10-09, frame-pace.sh).
+    {
+        const double SX = monitor->m_pixelSize.x / MONLOGI.x, SY = monitor->m_pixelSize.y / MONLOGI.y;
+        auto*        GLFB = dynamic_cast<Render::GL::CGLFramebuffer*>(fb.get());
+        const int    PX = static_cast<int>(std::lround((fullBox.x + shift.x) * SX)), PY = static_cast<int>(std::lround((fullBox.y + shift.y) * SY));
+        const int    PW = std::min(static_cast<int>(std::lround(fullBox.w * SX)), snapshot.width - std::max(0, PX));
+        const int    PH = std::min(static_cast<int>(std::lround(fullBox.h * SY)), snapshot.height - std::max(0, PY));
+        const auto   PT1 = std::chrono::steady_clock::now();
+        if (!GLFB || PW <= 0 || PH <= 0 || !adoptOwnTexture(ID, snapshot, GLFB->getFBID(), std::max(0, PX), std::max(0, PY), PW, PH))
+            return false;
+        m_msCopy += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - PT1).count();
+    }
 
     // Record the geometry the snapshot was rendered at. The live box may be
     // written later in the same frame (the resize path runs after render.pre),
     // and the UV subrect must stay aligned with the captured pixels, not with
-    // the live geometry.
-    snapshot.fullBox = fullBox;
-    snapshot.sampledBox = CBox{
-        fullBox.x + static_cast<int>(shift.x),
-        fullBox.y + static_cast<int>(shift.y),
-        fullBox.w,
-        fullBox.h,
-    };
+    // the live geometry. The texture is the box alone: sampled whole.
+    snapshot.fullBox       = fullBox;
+    snapshot.sampledBox    = CBox{0, 0, fullBox.w, fullBox.h};
     snapshot.surfaceOffset = surfOffset;
     snapshot.surfaceSize   = surfSize;
-    snapshot.texSpan       = MONLOGI;
+    snapshot.texSpan       = Vector2D{fullBox.w, fullBox.h};
+    snapshot.texOrigin     = Vector2D{fullBox.x, fullBox.y};
     snapshot.lastBuffer    = bufferIdentity(window->resource());
 
     // Drop the previous snapshot first: the SP releases the framebuffer's GL
@@ -537,12 +552,11 @@ bool CWindowCapture::makeTiledSnapshot(
 
     // Reuse the composite texture while the box size is unchanged.
     GLuint       bigTex = 0;
-    if (IT != m_snapshots.end() && IT->second.bigTex &&
-        static_cast<int>(IT->second.texSpan.x) == static_cast<int>(fullBox.w) &&
-        static_cast<int>(IT->second.texSpan.y) == static_cast<int>(fullBox.h)) {
+    if (IT != m_snapshots.end() && IT->second.bigTex && !IT->second.held &&
+        IT->second.width == TEXW && IT->second.height == TEXH) {
         bigTex = IT->second.bigTex;
     } else {
-        if (IT != m_snapshots.end() && IT->second.bigTex)
+        if (IT != m_snapshots.end() && IT->second.bigTex && !IT->second.held)
             destroyTexture(IT->second.bigTex);
 
         bigTex = createBlankTexture(TEXW, TEXH);
@@ -577,6 +591,7 @@ bool CWindowCapture::makeTiledSnapshot(
             if (WORKSPACE)
                 WORKSPACE->m_renderOffset->setValueAndWarp(shift);
 
+            ++m_rendered;
             auto fb = g_pHyprRenderer->makeSnapshotFB(window);
 
             if (WORKSPACE)
@@ -629,7 +644,9 @@ bool CWindowCapture::makeTiledSnapshot(
     snapshot.surfaceOffset = surfOffset;
     snapshot.surfaceSize   = surfSize;
     snapshot.texSpan       = Vector2D{fullBox.w, fullBox.h};
+    snapshot.texOrigin     = Vector2D{fullBox.x, fullBox.y};
     snapshot.lastBuffer    = bufferIdentity(window->resource());
+    snapshot.serial        = ++m_serial;
 
     m_snapshots.erase(id);
     m_snapshots.emplace(id, std::move(snapshot));
@@ -678,7 +695,7 @@ void CWindowCapture::refreshSkirtMask(std::uintptr_t id, SSnapshot& snapshot,
     const bool DUE = !ST.valid || STALE || ST.age % 64 == 1;
 
     if (DUE && (SETTLED || THROTTLE_OK)) {
-        const GLuint SRC = snapshot.texID;
+        const GLuint SRC = snapshot.texID ? snapshot.texID : snapshot.bigTex;
 
         if (!SRC) {
             snapshot.skirtError = 1;
@@ -845,7 +862,10 @@ bool CWindowCapture::makeSnapshotLayer(const PHLLS& layer, const PHLMONITOR& mon
             return true;
     }
 
+    ++m_rendered;
+    const auto LT0 = std::chrono::steady_clock::now();
     auto fb = g_pHyprRenderer->makeSnapshotFB(layer);
+    m_msRender += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - LT0).count();
 
     if (!fb)
         return false;
@@ -862,7 +882,20 @@ bool CWindowCapture::makeSnapshotLayer(const PHLLS& layer, const PHLMONITOR& mon
         snapshot.fb = nullptr;
         return false;
     }
-    buildMipmaps(snapshot.texID);
+
+    // The picking mask and its outline go on from the last snapshot, read
+    // back again only on a size change and every 32nd: a fresh snapshot
+    // started without them, so every layer snapshot read its pixels back
+    // -- a GPU stall each -- and a bar redrawing its 16 surfaces held one
+    // frame for 122 ms (measured 2026-10-09, frame-pace.sh).
+    if (auto PREV = m_snapshots.find(ID); PREV != m_snapshots.end() && PREV->second.alphaValid) {
+        snapshot.alphaMask  = std::move(PREV->second.alphaMask);
+        snapshot.alphaW     = PREV->second.alphaW;
+        snapshot.alphaH     = PREV->second.alphaH;
+        snapshot.alphaValid = true;
+        snapshot.maskAge    = PREV->second.maskAge;
+        snapshot.outlines   = PREV->second.outlines;
+    }
 
     snapshot.fullBox       = LOCAL;
     snapshot.sampledBox    = LOCAL;
@@ -935,11 +968,75 @@ bool CWindowCapture::makeSnapshotLayer(const PHLLS& layer, const PHLMONITOR& mon
     }
 
     snapshot.lastBuffer = bufferIdentity(SURFACE);
+    const auto LT2 = std::chrono::steady_clock::now();
 
+    // The layer's part of the fb in a texture of its own size, as for a
+    // window: caelestia's sixteen surfaces -- many of them 1x1 -- were each
+    // a monitor-sized texture mipmapped whole.
+    {
+        auto*     GLFB = dynamic_cast<Render::GL::CGLFramebuffer*>(fb.get());
+        const int PX = std::clamp(static_cast<int>(std::lround(LOCAL.x * SX)), 0, std::max(0, snapshot.width - 1));
+        const int PY = std::clamp(static_cast<int>(std::lround(LOCAL.y * SY)), 0, std::max(0, snapshot.height - 1));
+        const int RW = std::min(PW, snapshot.width - PX), RH = std::min(PH, snapshot.height - PY);
+        if (!GLFB || RW <= 0 || RH <= 0 || !adoptOwnTexture(ID, snapshot, GLFB->getFBID(), PX, PY, RW, RH))
+            return false;
+        snapshot.sampledBox = CBox{0, 0, LOCAL.w, LOCAL.h};
+        snapshot.texSpan    = Vector2D{LOCAL.w, LOCAL.h};
+        snapshot.texOrigin  = Vector2D{LOCAL.x, LOCAL.y};
+    }
+    m_msCopy += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - LT2).count();
+
+    if (auto IT = m_snapshots.find(ID); IT != m_snapshots.end())
+        destroySnapshotGL(IT->second);
     m_snapshots.erase(ID);
     m_snapshots.emplace(ID, std::move(snapshot));
 
     return true;
+}
+
+bool CWindowCapture::adoptOwnTexture(std::uintptr_t id, SSnapshot& snapshot, unsigned int fbID, int srcX, int srcY, int w, int h) {
+    GLuint tex = 0;
+    if (auto IT = m_snapshots.find(id); IT != m_snapshots.end() && IT->second.bigTex && !IT->second.held &&
+        IT->second.width == w && IT->second.height == h) {
+        tex                = IT->second.bigTex;
+        IT->second.bigTex = 0; // moves on to this snapshot
+    } else
+        tex = createBlankTexture(w, h);
+    if (!tex)
+        return false;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbID);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, srcX, srcY, w, h);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    buildMipmaps(tex);
+    snapshot.fb     = nullptr; // the monitor-sized fb goes
+    snapshot.texID  = 0;
+    snapshot.bigTex = tex;
+    snapshot.width  = w;
+    snapshot.height = h;
+    snapshot.serial = ++m_serial;
+    return true;
+}
+
+std::optional<CWindowCapture::SSnapshot> CWindowCapture::hold(std::uintptr_t id) {
+    const auto IT = m_snapshots.find(id);
+    if (IT == m_snapshots.end() || (!IT->second.bigTex && !IT->second.texID))
+        return std::nullopt;
+    IT->second.held = true;
+    return IT->second;
+}
+
+void CWindowCapture::releaseHeld(SSnapshot& snapshot) {
+    snapshot.held = false;
+    // Still the current snapshot of its surface (none taken since): the
+    // capture owns the texture again.
+    for (auto& [id, current] : m_snapshots)
+        if (current.serial == snapshot.serial && current.held) {
+            current.held    = false;
+            snapshot.bigTex = 0;
+        }
+    destroySnapshotGL(snapshot);
 }
 
 bool CWindowCapture::has(std::uintptr_t id) const {
@@ -956,6 +1053,8 @@ void CWindowCapture::destroySnapshotGL(SSnapshot& snapshot) {
     if (snapshot.bigTex && Render::GL::g_pHyprOpenGL)
         Render::GL::g_pHyprOpenGL->makeEGLCurrent();
 
+    if (snapshot.held)
+        snapshot.bigTex = 0; // its holder releases it (releaseHeld)
     destroyTexture(snapshot.bigTex);
 
     // The monitor-sized fb frees its GL objects through the SP.

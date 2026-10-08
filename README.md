@@ -130,9 +130,28 @@ hyprctl eval 'hl.plugin.hypr3d.portal("deltarune")'   -- removes it
 | `note` | what the plate adds when you are at the portal, e.g. "Played today · 38 h" |
 | `color` | `"#rrggbb"`: the pool of light it throws on the floor |
 
+| `color2` | `"#rrggbb"`: its second colour, for the light behind its starting panel |
+| `door` | `{ left, top, right, bottom }`, 0..1: where the door is in the picture -- what grows to the screen |
+
 Under each portal stands a plate with its title. Aimed at from within 3 m,
 the portal is the one in focus: the others dim, its pool brightens, and its
-plate opens to the note and how to go in.
+plate opens to the note and how to go in. At its threshold its light floods
+the floor and the plate fades.
+
+Walking through, its door grows to the whole screen (1 s), settles blurred
+behind a starting panel, and the first window that appears after it ends
+that, fading over 340 ms. The program the portal started tells the panel
+what happens:
+
+```lua
+hl.plugin.hypr3d.portal_state("steam:730", { step = 2, steps = 4, part = 0.4, text = "Steam checks for updates", detail = "steam://rungameid/730" })
+hl.plugin.hypr3d.portal_state("steam:730", { failed = "Counter-Strike 2 did not start", text = "Steam is not running. ...", hint = "Start Steam and try again" })
+hl.plugin.hypr3d.portal_state("steam:730", { ended = true, note = "Played just now · 39 h" })
+```
+
+A failure keeps the panel: Enter runs the portal's command again, Esc walks
+back out. When the game quits (`ended`), the player stands two steps in
+front of its portal, facing it, its plate with the new note.
 
 Each start goes out on socket2 as `{"event":"portal","name":"deltarune","started":true,...}`.
 A portal lives as long as the plugin; a wrong call fails with the reason.

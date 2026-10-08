@@ -93,6 +93,7 @@ extern "C" {
 #include <memory>
 #include <numbers>
 #include <optional>
+#include <unordered_set>
 #include <hyprutils/animation/BezierCurve.hpp>
 #include <stdexcept>
 #include <string>
@@ -1165,13 +1166,79 @@ struct SPortal {
     GLScene::SPortalSpec spec;
     std::string          command;
     std::string          title, note; // its plate: the game's name, and what Steam knows of it
+    float                door[4] = {0.f, 0.f, 1.f, 1.f}; // the door in its picture: left, top, right, bottom (0..1)
+    Vec3                 color2{};     // the second of its colours
     bool                 inside = false; // the player stood in it last frame
     double               quietUntil = 0.0; // no second start before this
 };
 static std::vector<SPortal> g_portals;
+
+// Going through a portal (the owner's approved "Portals" draft): its cover
+// grows from the door to the whole screen (the dive), settles blurred
+// behind Larch's starting panel -- the steps come from whoever started the
+// game, through hl.plugin.hypr3d.portal_state -- and the first window that
+// appears after it ends the run, fading it out over 340 ms. A failure keeps
+// the panel: Enter tries again, Esc walks back out in front of the portal.
+struct SPortalRun {
+    enum class EPhase { None, Dive, Starting, Failed, Fading } phase = EPhase::None;
+    std::string name;
+    double      start = 0.0, phaseAt = 0.0;
+    float       from[4] = {-1.f, -1.f, 1.f, 1.f}; // the door on screen at the step through, target NDC
+    std::unordered_set<std::uintptr_t> known;      // the windows there were
+    // What the starter said (portal_state).
+    int         step = 1, steps = 4;
+    float       part = 0.3f;
+    std::string text = "Steam is asked to start the game", detail;
+    std::string failTitle, failText, failHint;
+    // Painted when it changed.
+    std::string scrimKey, titleKey, panelKey, hintKey;
+    std::shared_ptr<const Overlay::SImage> scrim, title, panel, hints;
+};
+static SPortalRun g_portalRun;
 static double nowSeconds();
 static void   notify(const std::string& text, const CHyprColor& color);
 static constexpr float kPortalFront = 2.5f; // m in front of the player, for front = true
+
+// The door of a portal where it stands on screen now, target NDC.
+static bool portalDoorOnScreen(const SPortal& P, float out[4]) {
+    const float ASPECT = g_scene.portalAspect(P.spec.name);
+    if (ASPECT <= 0.0f)
+        return false;
+    const float W = P.spec.width, H = W * ASPECT;
+    const Vec3  FACE{std::sin(P.spec.yaw), 0.f, -std::cos(P.spec.yaw)};
+    const Vec3  R = normalize(cross(FACE * -1.0f, Vec3{0.f, 1.f, 0.f}));
+    float x0 = 1e9f, y0 = 1e9f, x1 = -1e9f, y1 = -1e9f;
+    for (const float U : {P.door[0], P.door[2]})
+        for (const float V : {P.door[1], P.door[3]}) {
+            const Vec3 C = P.spec.base + R * ((U - 0.5f) * W) + Vec3{0.f, (1.0f - V) * H, 0.f};
+            float      x = 0.f, y = 0.f;
+            if (!g_scene.project(C, x, y))
+                return false;
+            x0 = std::min(x0, x), y0 = std::min(y0, y), x1 = std::max(x1, x), y1 = std::max(y1, y);
+        }
+    out[0] = x0, out[1] = y0, out[2] = x1, out[3] = y1;
+    return true;
+}
+
+static std::vector<Compat::SWindowInfo> eligibleWindowsSpanned();
+static void startPortalRun(const SPortal& P, bool started) {
+    auto& R   = g_portalRun;
+    R         = {};
+    R.name    = P.spec.name;
+    R.start   = R.phaseAt = nowSeconds();
+    R.phase   = SPortalRun::EPhase::Dive;
+    R.detail  = P.command;
+    if (!portalDoorOnScreen(P, R.from))
+        R.from[0] = -0.2f, R.from[1] = -0.3f, R.from[2] = 0.2f, R.from[3] = 0.3f;
+    for (const auto& I : eligibleWindowsSpanned())
+        if (!I.isLayer)
+            R.known.insert(I.id);
+    if (!started) {
+        R.failTitle = (P.title.empty() ? P.spec.name : P.title) + " did not start";
+        R.failText  = "Its command did not run.";
+        R.failHint  = "Try again";
+    }
+}
 
 static void syncPortals() {
     std::vector<GLScene::SPortalSpec> specs;
@@ -1207,15 +1274,14 @@ static void updatePortals() {
         const Vec3  D = P - PORTAL.spec.base;
         const bool  INSIDE = std::fabs(dot(D, FACE)) < 0.25f && std::fabs(dot(D, RIGHT)) < W * 0.35f &&
             D.y >= 0.0f && D.y <= H;
-        if (INSIDE && !PORTAL.inside && nowSeconds() >= PORTAL.quietUntil) {
+        if (INSIDE && !PORTAL.inside && nowSeconds() >= PORTAL.quietUntil &&
+            g_portalRun.phase == SPortalRun::EPhase::None) {
             PORTAL.quietUntil = nowSeconds() + 3.0;
             const auto PID = Config::Supplementary::executor()->spawn(PORTAL.command);
             postRoomEvent("{\"event\":\"portal\",\"name\":" + jsonString(PORTAL.spec.name) +
                           ",\"started\":" + (PID ? "true" : "false") + ",\"t\":" +
                           std::to_string(monotonicNs()) + "}");
-            notify(PID ? "[hypr3d] portal " + PORTAL.spec.name + ": starting" :
-                         "[hypr3d] portal " + PORTAL.spec.name + ": its command did not start",
-                   PID ? CHyprColor{0.2f, 0.8f, 0.4f, 1.0f} : CHyprColor{1.0f, 0.2f, 0.2f, 1.0f});
+            startPortalRun(PORTAL, PID != 0);
         }
         PORTAL.inside = INSIDE;
     }
@@ -4894,6 +4960,8 @@ static void rememberRoom() {
 
 static void deactivate3D() {
     g_flight = {};
+    g_portalRun.phase = SPortalRun::EPhase::None;
+    g_scene.setPortalDive({});
     endReading(true);
     // Windows still in the bin, their applications not gone yet: back where
     // they were let go, not remembered tiny.
@@ -6566,6 +6634,7 @@ static uint64_t frameFingerprint() {
 static bool runsOnTime() {
     return g_debugHud                        // the HUD counts frames
         || g_aimLabelBusy || g_featureFading || g_flight.active
+        || g_portalRun.phase != SPortalRun::EPhase::None
         || g_viewMode != 0                   // F5: the player's own animation
         || g_scene.scenePending() || joltShapesPending()
         || g_sightPending
@@ -7338,6 +7407,176 @@ static GLScene::SOverlaySprite roomCheckSprite(float scale) {
     return {A.check, GLScene::EAnchor::TopLeft, 96.0f * scale, 1.0f, 96.0f * scale};
 }
 
+// Two steps in front of a portal, facing it: where its run leaves the
+// player -- Esc out of the start, or the game quit.
+static void placeBeforePortal(const SPortal& P) {
+    const Vec3 FACE{std::sin(P.spec.yaw), 0.f, -std::cos(P.spec.yaw)};
+    auto&      CAM = g_scene.camera();
+    const Vec3 FEET = P.spec.base + FACE * 1.4f;
+    CAM.position = Vec3{FEET.x, FEET.y + Camera::kEyeHeight, FEET.z};
+    CAM.yaw      = P.spec.yaw + std::numbers::pi_v<float>;
+    CAM.pitch    = 0.0f;
+    if (!g_playerBody.IsInvalid() && g_bodyIf) {
+        g_bodyIf->SetPositionAndRotation(g_playerBody,
+                                         JPH::RVec3(CAM.position.x, CAM.position.y - PLAYER_EYE_OFF, CAM.position.z),
+                                         JPH::Quat::sIdentity(), JPH::EActivation::Activate);
+        g_bodyIf->SetLinearVelocity(g_playerBody, JPH::Vec3::sZero());
+    }
+    damageCurrentMonitor();
+}
+
+static const SPortal* runPortal() {
+    const auto IT = std::ranges::find_if(g_portals, [](const SPortal& p) { return p.spec.name == g_portalRun.name; });
+    return IT != g_portals.end() ? &*IT : nullptr;
+}
+
+// Esc: the run ends, the player stands two steps in front of the portal.
+static void endPortalRun() {
+    if (const auto* P = runPortal())
+        placeBeforePortal(*P);
+    g_portalRun.phase = SPortalRun::EPhase::None;
+    g_scene.setPortalDive({});
+}
+
+// Enter after a failure: its command once more, straight to the panel.
+static void retryPortalRun() {
+    const auto* P = runPortal();
+    if (!P)
+        return;
+    const auto PID = Config::Supplementary::executor()->spawn(P->command);
+    auto&      R   = g_portalRun;
+    R.failTitle.clear();
+    R.step = 1, R.part = 0.3f, R.text = "Steam is asked to start the game";
+    R.phase   = SPortalRun::EPhase::Starting;
+    R.phaseAt = nowSeconds() - 1.0; // its cover settled already
+    if (!PID) {
+        R.failTitle = (P->title.empty() ? P->spec.name : P->title) + " did not start";
+        R.failText  = "Its command did not run.";
+        R.failHint  = "Try again";
+        R.phase     = SPortalRun::EPhase::Failed;
+    }
+}
+
+// Every frame while a run goes: the cover on screen, and the starting
+// screen over it.
+static std::vector<GLScene::SOverlaySprite> portalRunTick(float scale) {
+    using EPhase = SPortalRun::EPhase;
+    auto&       R = g_portalRun;
+    const auto* P = runPortal();
+    std::vector<GLScene::SOverlaySprite> out;
+    if (R.phase == EPhase::None || !P || !g_monitor) {
+        if (R.phase != EPhase::None)
+            R.phase = EPhase::None;
+        g_scene.setPortalDive({});
+        return out;
+    }
+    const double NOW  = nowSeconds();
+    const auto   FADE = [](double x) { return larchEase(ELarchEase::Fade, static_cast<float>(std::clamp(x, 0.0, 1.0))); };
+    const float  PW = g_monitor->m_pixelSize.x, PH = g_monitor->m_pixelSize.y;
+
+    // The first window that appears ends the start.
+    if (R.phase == EPhase::Starting)
+        for (const auto& I : eligibleWindowsSpanned())
+            if (!I.isLayer && !R.known.contains(I.id) && I.id != g_menuId) {
+                R.phase = EPhase::Fading, R.phaseAt = NOW;
+                break;
+            }
+    if (R.phase == EPhase::Dive && NOW - R.start >= 1.0) {
+        R.phase   = R.failTitle.empty() ? EPhase::Starting : EPhase::Failed;
+        R.phaseAt = R.start + 1.0;
+    }
+    if (R.phase == EPhase::Fading && NOW - R.phaseAt >= 0.34) {
+        R.phase = EPhase::None;
+        g_scene.setPortalDive({});
+        return out;
+    }
+
+    // The cover: from the door to the whole screen, cropped as a cover is.
+    const float ASPECT = g_scene.portalAspect(P->spec.name); // its picture's height over width
+    const float DU = P->door[2] - P->door[0], DV = P->door[3] - P->door[1];
+    const float DOOR_AR = ASPECT > 0.f ? DU / (DV * ASPECT) : 0.6667f; // width over height
+    const float SCREEN_AR = PH > 0.f ? PW / PH : 1.7778f;
+    float cu0 = P->door[0], cu1 = P->door[2], cv0 = P->door[1], cv1 = P->door[3];
+    if (DOOR_AR < SCREEN_AR) { // narrower than the screen: its middle band
+        const float KEEP = DV * DOOR_AR / SCREEN_AR, MID = (cv0 + cv1) * 0.5f;
+        cv0 = MID - KEEP * 0.5f, cv1 = MID + KEEP * 0.5f;
+    } else {
+        const float KEEP = DU * SCREEN_AR / DOOR_AR, MID = (cu0 + cu1) * 0.5f;
+        cu0 = MID - KEEP * 0.5f, cu1 = MID + KEEP * 0.5f;
+    }
+    GLScene::SPortalDive D;
+    D.name = P->spec.name;
+    D.rim  = P->spec.lit ? P->spec.color : Vec3{0x5c / 255.f, 0xb8 / 255.f, 0xe6 / 255.f};
+    const double SINCE = NOW - R.phaseAt;
+    if (R.phase == EPhase::Dive) {
+        const float LIN = static_cast<float>(std::clamp((NOW - R.start) / 1.0, 0.0, 1.0));
+        const float K   = larchEase(ELarchEase::Dive, LIN);
+        const float SW  = 1.0f + 0.035f * std::sin(std::numbers::pi_v<float> * std::clamp(LIN / 0.4f, 0.0f, 1.0f));
+        float       x0 = R.from[0] + (-1.f - R.from[0]) * K, y0 = R.from[1] + (-1.f - R.from[1]) * K;
+        float       x1 = R.from[2] + (1.f - R.from[2]) * K, y1 = R.from[3] + (1.f - R.from[3]) * K;
+        const float CX = (x0 + x1) * 0.5f, CY = (y0 + y1) * 0.5f;
+        D.x0 = CX + (x0 - CX) * SW, D.x1 = CX + (x1 - CX) * SW, D.y0 = CY + (y0 - CY) * SW, D.y1 = CY + (y1 - CY) * SW;
+        D.u0 = P->door[0] + (cu0 - P->door[0]) * K, D.u1 = P->door[2] + (cu1 - P->door[2]) * K;
+        D.v0 = P->door[1] + (cv0 - P->door[1]) * K, D.v1 = P->door[3] + (cv1 - P->door[3]) * K;
+        D.alpha = 1.0f, D.rimAlpha = 1.0f;
+    } else {
+        // Settled: blurred and darkened (blur 28 px, brightness .45), the
+        // rim gone; fading out as the game's window comes.
+        const float GONE = R.phase == EPhase::Fading ? FADE(SINCE / 0.34) : 0.0f;
+        const float IN   = R.phase == EPhase::Fading ? 1.0f : FADE(SINCE / 0.34);
+        D.x0 = -1.f, D.y0 = -1.f, D.x1 = 1.f, D.y1 = 1.f;
+        D.u0 = cu0, D.u1 = cu1, D.v0 = cv0, D.v1 = cv1;
+        D.blur = 5.0f * IN, D.bright = 1.0f - 0.55f * IN;
+        D.rimAlpha = R.phase == EPhase::Fading ? 0.0f : 1.0f - FADE(SINCE / 0.22);
+        D.alpha = 1.0f - GONE;
+
+        const std::string NAME = P->title.empty() ? P->spec.name : P->title;
+        const auto        C1 = Overlay::SColour{D.rim.x, D.rim.y, D.rim.z};
+        const auto        C2 = Overlay::SColour{P->color2.x, P->color2.y, P->color2.z};
+        if (const auto K = std::to_string(PW) + "x" + std::to_string(PH) + NAME; K != R.scrimKey) {
+            R.scrimKey = K;
+            R.scrim    = std::make_shared<const Overlay::SImage>(Overlay::paintPortalScrim(static_cast<int>(PW), static_cast<int>(PH), C1, C2));
+        }
+        if (const auto K = NAME + std::to_string(scale); K != R.titleKey) {
+            R.titleKey = K;
+            R.title    = std::make_shared<const Overlay::SImage>(Overlay::paintPortalTitle(NAME, C1, scale));
+        }
+        Overlay::SStart ST;
+        const bool FAILED = R.phase == EPhase::Failed;
+        ST.failed = FAILED;
+        ST.title  = FAILED ? R.failTitle : "Starting " + NAME;
+        ST.step = R.step, ST.steps = R.steps, ST.part = R.part;
+        ST.text   = FAILED ? R.failText : R.text;
+        ST.detail = R.detail;
+        const auto PK = std::to_string(FAILED) + ST.title + "|" + std::to_string(ST.step) + "/" + std::to_string(ST.steps) + "|" +
+            std::to_string(static_cast<int>(ST.part * 100)) + ST.text + ST.detail + std::to_string(scale);
+        if (PK != R.panelKey) {
+            R.panelKey = PK;
+            R.panel    = std::make_shared<const Overlay::SImage>(Overlay::paintStartPanel(ST, scale));
+        }
+        std::vector<Overlay::SKey> keys;
+        if (FAILED)
+            keys.push_back({{"Enter"}, R.failHint.empty() ? "Try again" : R.failHint});
+        keys.push_back({{"Esc"}, "Back to the room"});
+        std::string HK;
+        for (const auto& K : keys)
+            HK += K.caps[0] + K.label + "|";
+        HK += std::to_string(scale);
+        if (HK != R.hintKey) {
+            R.hintKey = HK;
+            R.hints   = std::make_shared<const Overlay::SImage>(Overlay::paintHintPill(keys, scale, true));
+        }
+        const float  A    = (1.0f - GONE) * (R.phase == EPhase::Fading ? 1.0f : FADE(SINCE / 0.22));
+        const float  KY   = PH / 1080.0f;
+        out.push_back({R.scrim, GLScene::EAnchor::TopLeft, 0.0f, (1.0f - GONE) * IN, 0.0f});
+        out.push_back({R.title, GLScene::EAnchor::TopLeft, 400.0f * KY, A, 96.0f * scale});
+        out.push_back({R.panel, GLScene::EAnchor::TopLeft, 600.0f * KY, A, 96.0f * scale});
+        out.push_back({R.hints, GLScene::EAnchor::TopLeft, PH - 76.0f * scale, A, 96.0f * scale});
+    }
+    g_scene.setPortalDive(D);
+    return out;
+}
+
 // The portals' plates (the owner's approved "Portals" draft): the game's
 // name on a Larch plate under each door's threshold. Aimed at from within
 // 3 m, the door is the one in focus -- the others dim -- and its plate opens
@@ -7354,9 +7593,30 @@ static std::vector<GLScene::SOverlaySprite> portalPlates(float scale) {
     };
     static std::unordered_map<std::string, SPlate> plates;
     std::vector<GLScene::SOverlaySprite> out;
+    if (g_portalRun.phase != SPortalRun::EPhase::None)
+        return out; // the cover fills the screen
     const auto  HIT   = firstAlongAim();
     const auto* FOCUS = HIT.kind == SAimHit::EKind::Portal && HIT.t <= kPortalFocusMetres ? &g_portals[HIT.index] : nullptr;
-    g_scene.setPortalFocus(FOCUS ? FOCUS->spec.name : "");
+    // At a portal's threshold -- in front of it, under 1.2 m, within its
+    // door: its light floods the deck and its plate fades out (220 ms);
+    // stepping back still cancels.
+    static std::unordered_map<std::string, double> atThreshold;
+    const Vec3 BODY = playerCenter();
+    const SPortal* THRESHOLD = nullptr;
+    for (const auto& P : g_portals) {
+        const Vec3  FACE{std::sin(P.spec.yaw), 0.f, -std::cos(P.spec.yaw)};
+        const Vec3  RIGHT = normalize(cross(FACE * -1.0f, Vec3{0.f, 1.f, 0.f}));
+        const Vec3  D = BODY - P.spec.base;
+        const float FRONT = dot(D, FACE);
+        if (FRONT > 0.0f && FRONT < 1.2f && std::fabs(dot(D, RIGHT)) < P.spec.width * 0.35f) {
+            THRESHOLD = &P;
+            atThreshold.try_emplace(P.spec.name, nowSeconds());
+        } else
+            atThreshold.erase(P.spec.name);
+    }
+    if (THRESHOLD)
+        FOCUS = THRESHOLD;
+    g_scene.setPortalFocus(FOCUS ? FOCUS->spec.name : "", THRESHOLD != nullptr);
     const Vec3 EYE = g_scene.camera().position;
     for (const auto& P : g_portals) {
         const Vec3 D = P.spec.base - EYE;
@@ -7389,7 +7649,12 @@ static std::vector<GLScene::SOverlaySprite> portalPlates(float scale) {
             plate.key   = KEY;
             plate.image = std::make_shared<const Overlay::SImage>(Overlay::paintLabel(LABEL, scale));
         }
-        out.push_back({plate.image, GLScene::EAnchor::World, 16.0f * scale, FOCUS && &P != FOCUS ? 0.45f : 1.0f, 0.0f, P.spec.base});
+        float alpha = FOCUS && &P != FOCUS ? 0.45f : 1.0f;
+        if (const auto T = atThreshold.find(P.spec.name); T != atThreshold.end()) {
+            alpha *= 1.0f - larchEase(ELarchEase::Fade, static_cast<float>((nowSeconds() - T->second) / 0.22));
+            g_aimLabelBusy = true;
+        }
+        out.push_back({plate.image, GLScene::EAnchor::World, 16.0f * scale, alpha, 0.0f, P.spec.base});
     }
     std::erase_if(plates, [](const auto& E) {
         return std::ranges::none_of(g_portals, [&](const SPortal& P) { return P.spec.name == E.first; });
@@ -7406,6 +7671,14 @@ static void overlayTick() {
     else {
         g_aimOverlay.useId = 0;
         std::ranges::move(aimTick(SCALE), std::back_inserter(sprites));
+    }
+    // Through a portal its cover fills the screen: nothing of the room's
+    // overlay over it but the starting screen.
+    if (auto run = portalRunTick(SCALE); g_portalRun.phase != SPortalRun::EPhase::None) {
+        const bool COVERED = g_portalRun.phase != SPortalRun::EPhase::Dive;
+        if (COVERED)
+            sprites.clear();
+        std::ranges::move(run, std::back_inserter(sprites));
     }
     for (auto& S : sprites)
         S.alpha *= flightCross();
@@ -7920,6 +8193,19 @@ static void onKeyboardKeyRoom(
             useEnd();
         else
             useBegin();
+        info.cancelled = true;
+        return;
+    }
+
+    // Through a portal: Esc walks back out in front of it, Enter tries a
+    // start that failed once more.
+    if (PRESSED && g_portalRun.phase != SPortalRun::EPhase::None &&
+        g_portalRun.phase != SPortalRun::EPhase::Fading &&
+        (SYM == XKB_KEY_Escape || (SYM == XKB_KEY_Return && g_portalRun.phase == SPortalRun::EPhase::Failed))) {
+        if (SYM == XKB_KEY_Escape)
+            endPortalRun();
+        else
+            retryPortalRun();
         info.cancelled = true;
         return;
     }
@@ -8969,6 +9255,19 @@ static bool portalLua(lua_State* L) {
     portal.spec.width = std::clamp(NUMBER("width", 1.8f), 0.3f, 10.0f);
     portal.title      = STRING("title");
     portal.note       = STRING("note");
+    lua_getfield(L, 2, "door");
+    if (lua_istable(L, -1))
+        for (int k = 0; k < 4; ++k) {
+            lua_rawgeti(L, -1, k + 1);
+            if (lua_isnumber(L, -1))
+                portal.door[k] = std::clamp(static_cast<float>(lua_tonumber(L, -1)), 0.0f, 1.0f);
+            lua_pop(L, 1);
+        }
+    lua_pop(L, 1);
+    if (portal.door[2] <= portal.door[0] || portal.door[3] <= portal.door[1]) {
+        lua_pushstring(L, "portal: door = { left, top, right, bottom } needs right > left and bottom > top");
+        return false;
+    }
     if (const auto COLOR = STRING("color"); !COLOR.empty()) {
         unsigned rgb = 0;
         if (COLOR.size() != 7 || COLOR[0] != '#' || std::sscanf(COLOR.c_str() + 1, "%6x", &rgb) != 1) {
@@ -8977,6 +9276,15 @@ static bool portalLua(lua_State* L) {
         }
         portal.spec.lit   = true;
         portal.spec.color = Vec3{((rgb >> 16) & 0xff) / 255.f, ((rgb >> 8) & 0xff) / 255.f, (rgb & 0xff) / 255.f};
+    }
+    portal.color2 = portal.spec.color;
+    if (const auto COLOR = STRING("color2"); !COLOR.empty()) {
+        unsigned rgb = 0;
+        if (COLOR.size() != 7 || COLOR[0] != '#' || std::sscanf(COLOR.c_str() + 1, "%6x", &rgb) != 1) {
+            lua_pushstring(L, ("portal: color2 '" + COLOR + "' is not #rrggbb").c_str());
+            return false;
+        }
+        portal.color2 = Vec3{((rgb >> 16) & 0xff) / 255.f, ((rgb >> 8) & 0xff) / 255.f, (rgb & 0xff) / 255.f};
     }
     if (portal.spec.image.empty() || !std::filesystem::is_regular_file(portal.spec.image)) {
         lua_pushstring(L, ("portal: image '" + portal.spec.image + "' is not a file").c_str());
@@ -9101,6 +9409,92 @@ static int luaObject(lua_State* L) {
     return 0;
 }
 
+// hl.plugin.hypr3d.portal_state(name, { ... }): what the program a portal
+// started says of the start -- { step = 2, steps = 4, part = 0.5, text =
+// "Checking for updates", detail = "..." }; { failed = "X did not start",
+// text = "Steam is not running. ...", hint = "Start Steam and try again" };
+// or { ended = true, note = "Played just now · 39 h" } when the game quit:
+// the player stands two steps in front of its portal again, its plate with
+// the new note.
+static bool portalStateLua(lua_State* L) {
+    if (lua_type(L, 1) != LUA_TSTRING || !lua_istable(L, 2)) {
+        lua_pushstring(L, "portal_state: a portal's name and a table");
+        return false;
+    }
+    const std::string NAME = lua_tostring(L, 1);
+    const auto        IT   = std::ranges::find_if(g_portals, [&](const SPortal& p) { return p.spec.name == NAME; });
+    if (IT == g_portals.end()) {
+        lua_pushstring(L, ("portal_state: there is no portal '" + NAME + "'").c_str());
+        return false;
+    }
+    const auto STRING = [&](const char* key) -> std::optional<std::string> {
+        lua_getfield(L, 2, key);
+        std::optional<std::string> out;
+        if (lua_type(L, -1) == LUA_TSTRING)
+            out = lua_tostring(L, -1);
+        lua_pop(L, 1);
+        return out;
+    };
+    const auto NUMBER = [&](const char* key) -> std::optional<double> {
+        lua_getfield(L, 2, key);
+        std::optional<double> out;
+        if (lua_isnumber(L, -1))
+            out = lua_tonumber(L, -1);
+        lua_pop(L, 1);
+        return out;
+    };
+    lua_getfield(L, 2, "ended");
+    const bool ENDED = lua_toboolean(L, -1);
+    lua_pop(L, 1);
+    using EPhase = SPortalRun::EPhase;
+    auto&      R      = g_portalRun;
+    const bool THIS   = R.name == NAME && R.phase != EPhase::None;
+    const auto TITLE  = IT->title.empty() ? IT->spec.name : IT->title;
+    if (const auto NOTE = STRING("note"))
+        IT->note = *NOTE;
+    if (ENDED) {
+        if (THIS && (R.phase == EPhase::Dive || R.phase == EPhase::Starting)) {
+            // Gone before it showed a window: a failure, not a game.
+            R.failTitle = TITLE + " did not start";
+            R.failText  = "It quit again before its window came.";
+            R.failHint  = "Try again";
+            if (R.phase == EPhase::Starting)
+                R.phase = EPhase::Failed;
+        } else if (!THIS && roomOpen()) {
+            placeBeforePortal(*IT);
+        }
+        return true;
+    }
+    if (!THIS)
+        return true; // nothing on screen to tell
+    if (const auto FAILED = STRING("failed")) {
+        R.failTitle = *FAILED;
+        R.failText  = STRING("text").value_or("");
+        R.failHint  = STRING("hint").value_or("Try again");
+        if (R.phase == EPhase::Starting)
+            R.phase = EPhase::Failed;
+        return true;
+    }
+    if (const auto V = NUMBER("step"))
+        R.step = std::clamp(static_cast<int>(*V), 1, 16);
+    if (const auto V = NUMBER("steps"))
+        R.steps = std::clamp(static_cast<int>(*V), 1, 16);
+    if (const auto V = NUMBER("part"))
+        R.part = std::clamp(static_cast<float>(*V), 0.0f, 1.0f);
+    if (const auto V = STRING("text"))
+        R.text = *V;
+    if (const auto V = STRING("detail"))
+        R.detail = *V;
+    damageCurrentMonitor();
+    return true;
+}
+
+static int luaPortalState(lua_State* L) {
+    if (!portalStateLua(L))
+        return lua_error(L);
+    return 0;
+}
+
 static int luaPortal(lua_State* L) {
     if (!portalLua(L))
         return lua_error(L);
@@ -9220,6 +9614,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "portal", luaPortal))
         throw std::runtime_error("[hypr3d] failed to register Lua portal");
+
+    if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "portal_state", luaPortalState))
+        throw std::runtime_error("[hypr3d] failed to register Lua portal_state");
 
     if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "object", luaObject))
         throw std::runtime_error("[hypr3d] failed to register Lua object");

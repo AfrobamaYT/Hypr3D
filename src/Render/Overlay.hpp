@@ -76,8 +76,28 @@ namespace Overlay {
     // anchor is its top left.
     SImage paintTag(const std::string& text, float scale);
 
-    // A pill of key hints, as at the bottom of Super+F's screen.
-    SImage paintHintPill(const std::vector<SKey>& keys, float scale);
+    // A pill of key hints, as at the bottom of Super+F's screen; `bare`:
+    // the keys alone, no pill. Its anchor is its top centre, bare its top
+    // left.
+    SImage paintHintPill(const std::vector<SKey>& keys, float scale, bool bare = false);
+
+    // Through a portal (the owner's approved "Portals" draft): the light of
+    // the game's two colours over its blurred cover, w x h px, anchored at
+    // its top left; the eyebrow and the game's name, anchored at the top
+    // left; and the panel of its start -- or of its failure.
+    struct SColour {
+        double r = 0, g = 0, b = 0;
+    };
+    SImage paintPortalScrim(int w, int h, SColour ac, SColour ac2);
+    SImage paintPortalTitle(const std::string& name, SColour ac, float scale);
+    struct SStart {
+        std::string title;        // "Starting DELTARUNE"
+        int         step = 1, steps = 4;
+        float       part = 0.45f; // of the current step
+        std::string text, detail; // "Steam is starting the game", the command
+        bool        failed = false; // title in red, text a sentence, no bars
+    };
+    SImage paintStartPanel(const SStart& start, float scale);
 
     // The pointer of a window in use: Larch's arrow, its anchor the tip; and
     // the ring that shows where it is, its anchor the centre.

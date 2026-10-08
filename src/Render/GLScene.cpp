@@ -2441,6 +2441,69 @@ void GLScene::drawPortals(const Mat4& vp) {
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 
+void GLScene::drawPortalDive(int width, int height) {
+    const auto& D = m_dive;
+    if (D.alpha <= 0.002f || width <= 0 || height <= 0)
+        return;
+    const auto P = std::ranges::find_if(m_portals, [&](const SPortalGL& p) { return p.spec.name == D.name; });
+    if (P == m_portals.end() || !P->tex)
+        return;
+    if (!m_overlayVAO) {
+        glGenVertexArrays(1, &m_overlayVAO);
+        glGenBuffers(1, &m_overlayVBO);
+        glBindVertexArray(m_overlayVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, m_overlayVBO);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), reinterpret_cast<void*>(0));
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), reinterpret_cast<void*>(3 * sizeof(float)));
+    }
+    glUseProgram(m_sceneProgram);
+    const Mat4 I = Mat4::identity();
+    glUniformMatrix4fv(m_sceneMVP, 1, GL_FALSE, I.m.data());
+    glUniform4f(m_sceneUVRect, 0.f, 0.f, 1.f, 1.f);
+    glUniform1i(m_sceneTexture, 0);
+    glActiveTexture(GL_TEXTURE0);
+    glBindVertexArray(m_overlayVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_overlayVBO);
+    glEnable(GL_BLEND);
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    const auto quad = [&](float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1) {
+        const float V[] = {x0, y0, 0.f, u0, v0, x1, y0, 0.f, u1, v0, x1, y1, 0.f, u1, v1,
+                           x0, y0, 0.f, u0, v0, x1, y1, 0.f, u1, v1, x0, y1, 0.f, u0, v1};
+        glBufferData(GL_ARRAY_BUFFER, sizeof(V), V, GL_DYNAMIC_DRAW);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+    };
+    // The rim's glow under the cover, then the cover, then its 4 px line.
+    const float PX = 2.0f / width, PY = 2.0f / height;
+    glUniform1i(m_sceneTextured, 0);
+    if (D.rimAlpha > 0.0f)
+        for (int r = 6; r >= 1; --r) {
+            const float G = static_cast<float>(r) * 28.0f / 6.0f;
+            glUniform4f(m_sceneColorUniform, D.rim.x, D.rim.y, D.rim.z, D.rimAlpha * D.alpha * 0.10f);
+            quad(D.x0 - G * PX, D.y0 - G * PY, D.x1 + G * PX, D.y1 + G * PY, 0.f, 0.f, 1.f, 1.f);
+        }
+    glUniform1i(m_sceneTextured, 1);
+    glUniform1f(m_sceneLodBias, D.blur);
+    glUniform4f(m_sceneColorUniform, D.bright, D.bright, D.bright, D.alpha);
+    glBindTexture(GL_TEXTURE_2D, P->tex);
+    quad(D.x0, D.y0, D.x1, D.y1, D.u0, D.v0, D.u1, D.v1);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glUniform1f(m_sceneLodBias, 0.0f);
+    if (D.rimAlpha > 0.0f) {
+        glUniform1i(m_sceneTextured, 0);
+        glUniform4f(m_sceneColorUniform, D.rim.x, D.rim.y, D.rim.z, D.rimAlpha * D.alpha);
+        const float LX = 4.0f * PX, LY = 4.0f * PY;
+        quad(D.x0 - LX, D.y0 - LY, D.x1 + LX, D.y0, 0.f, 0.f, 1.f, 1.f);
+        quad(D.x0 - LX, D.y1, D.x1 + LX, D.y1 + LY, 0.f, 0.f, 1.f, 1.f);
+        quad(D.x0 - LX, D.y0, D.x0, D.y1, 0.f, 0.f, 1.f, 1.f);
+        quad(D.x1, D.y0, D.x1 + LX, D.y1, 0.f, 0.f, 1.f, 1.f);
+    }
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+
 void GLScene::drawPortalPools(const Mat4& vp) {
     // Each lit portal throws a pool of its colour on the floor, so the doors
     // tell apart before they can be read: an ellipse half again as wide as
@@ -2470,7 +2533,7 @@ void GLScene::drawPortalPools(const Mat4& vp) {
         const Vec3  RIGHT = normalize(cross(FACE * -1.0f, Vec3{0.f, 1.f, 0.f}));
         const float AX = 0.74f * P.spec.width, AZ = 0.28f * P.spec.width;
         const Vec3  AT = P.spec.base + Vec3{0.f, 0.01f, 0.f}; // a hair over the floor
-        const float STRENGTH = (m_portalFocus == P.spec.name ? 0.7f : m_portalFocus.empty() ? 0.45f : 0.2f);
+        const float STRENGTH = m_portalFocus == P.spec.name ? (m_portalFlood ? 1.0f : 0.7f) : m_portalFocus.empty() ? 0.45f : 0.2f;
         for (int r = 0; r < RINGS; ++r) {
             const float IN = static_cast<float>(r) / RINGS, OUT = static_cast<float>(r + 1) / RINGS;
             V.clear();
@@ -3114,8 +3177,10 @@ bool GLScene::render(
 
     drawFullscreen(std::clamp(alpha, 0.0f, 1.0f));
     drawHud(std::clamp(alpha, 0.0f, 1.0f));
-    if (primary)
+    if (primary) {
+        drawPortalDive(width, height);
         drawOverlay(width, height);
+    }
 
     // --- restore compositor state ---
     glUseProgram(static_cast<GLuint>(oldProgram));

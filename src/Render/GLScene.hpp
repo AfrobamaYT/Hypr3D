@@ -221,7 +221,38 @@ class GLScene {
     };
     void setPortals(const std::vector<SPortalSpec>& portals);
     // The portal the player is at, its name: the others dim. Empty: none.
-    void setPortalFocus(const std::string& name) { m_portalFocus = name; }
+    // `flood`: at its threshold, its light floods the deck.
+    void setPortalFocus(const std::string& name, bool flood = false) {
+        m_portalFocus = name;
+        m_portalFlood = flood;
+    }
+
+    // A portal being gone through (main's portal run): its picture's
+    // subrect (u, v; v down) on a screen quad (the target's NDC, y = -1 at
+    // the top) -- from where the door stands to the whole screen -- held
+    // there blurred (`blur`: mip levels) and darkened (`bright`) behind the
+    // starting panel. The rim is the wipe line: 4 px in the game's colour
+    // with a 28 px glow. alpha 0: none.
+    struct SPortalDive {
+        std::string name;
+        float       x0 = -1.f, y0 = -1.f, x1 = 1.f, y1 = 1.f;
+        float       u0 = 0.f, v0 = 0.f, u1 = 1.f, v1 = 1.f;
+        float       blur = 0.f, bright = 1.f, alpha = 0.f;
+        Vec3        rim{};
+        float       rimAlpha = 0.f;
+    };
+    void setPortalDive(const SPortalDive& dive) { m_dive = dive; }
+    // A world point on the primary view's target: NDC, y = -1 at the top.
+    bool project(const Vec3& p, float& x, float& y) const {
+        const auto& M = m_lastVP.m;
+        const float X = M[0] * p.x + M[4] * p.y + M[8] * p.z + M[12];
+        const float Y = M[1] * p.x + M[5] * p.y + M[9] * p.z + M[13];
+        const float W = M[3] * p.x + M[7] * p.y + M[11] * p.z + M[15];
+        if (W <= 1e-4f)
+            return false;
+        x = X / W, y = -Y / W;
+        return true;
+    }
     // Height over width of a portal's picture; 0 while it is not loaded.
     float portalAspect(const std::string& name) const;
 
@@ -426,6 +457,9 @@ class GLScene {
     };
     std::vector<SPortalGL>    m_portals;
     std::string               m_portalFocus;
+    bool                      m_portalFlood = false;
+    SPortalDive               m_dive{};
+    void                      drawPortalDive(int width, int height);
     void                      drawPortalPools(const Mat4& vp);
     std::vector<unsigned int> m_portalTrash; // textures to delete in render
     unsigned int              m_portalVAO = 0, m_portalVBO = 0;

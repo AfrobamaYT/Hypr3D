@@ -618,7 +618,7 @@ namespace Overlay {
         I.ay = static_cast<float>(Y0);
         return I;
     }
-    SImage paintHintPill(const std::vector<SKey>& keys, float scale) {
+    SImage paintHintPill(const std::vector<SKey>& keys, float scale, bool bare) {
         const double s = std::max(0.5f, scale);
         struct SGroup {
             std::vector<SText> caps;
@@ -638,15 +638,16 @@ namespace Overlay {
             inner += G.w + (groups.empty() ? 0 : 30 * s);
             groups.push_back(std::move(G));
         }
-        const double   PW = std::ceil(inner + 40 * s), PH = 52 * s, R = 22 * s;
-        const SMargins M  = floatMargins(s);
+        const double   PW = std::ceil(inner + (bare ? 0 : 40 * s)), PH = (bare ? CAP.h : 52) * s, R = 22 * s;
+        const SMargins M  = bare ? SMargins{2, 2, 2, 2} : floatMargins(s);
         const int      W = static_cast<int>(std::ceil(PW + M.l + M.r)), H = static_cast<int>(std::ceil(PH + M.t + M.b));
         auto*          S  = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, W, H);
         auto*          CR = cairo_create(S);
         const double   X0 = std::round(M.l), Y0 = std::round(M.t);
-        drawPanel(CR, X0, Y0, PW, PH, R, s);
+        if (!bare)
+            drawPanel(CR, X0, Y0, PW, PH, R, s);
         const double MID = Y0 + PH / 2;
-        double       x   = X0 + 20 * s;
+        double       x   = X0 + (bare ? 0 : 20 * s);
         for (const auto& G : groups) {
             for (const auto& C : G.caps) {
                 drawCap(CR, C, x, MID - CAP.h * s / 2, CAP, s);
@@ -657,10 +658,12 @@ namespace Overlay {
             x += G.label.w + 30 * s;
         }
         cairo_destroy(CR);
-        auto A = floatShadow(W, H, X0, Y0, PW, PH, R, s);
-        auto I = finish(S, &A, {0, 0, 0, 0.5}, 1.0);
+        std::vector<float> A;
+        if (!bare)
+            A = floatShadow(W, H, X0, Y0, PW, PH, R, s);
+        auto I = finish(S, bare ? nullptr : &A, {0, 0, 0, 0.5}, 1.0);
         cairo_surface_destroy(S);
-        I.ax = static_cast<float>(X0 + PW / 2);
+        I.ax = static_cast<float>(bare ? X0 : X0 + PW / 2);
         I.ay = static_cast<float>(Y0);
         return I;
     }
@@ -816,6 +819,132 @@ namespace Overlay {
         auto I = finish(S, nullptr, {}, 1.0);
         cairo_surface_destroy(S);
         I.ax = I.ay = 2.0f;
+        return I;
+    }
+    SImage paintPortalScrim(int w, int h, SColour ac, SColour ac2) {
+        // Two soft lights of the game's colours, and the top and bottom
+        // darkened: radial-gradient(820px 560px at 780px 380px, ac 28 %,
+        // transparent 72 %), (760px 520px at 1160px 440px, ac2 22 %), and
+        // linear-gradient(.55 black, transparent 20 %, transparent 66 %,
+        // .55 black) -- on the draft's 1920 x 1080, here scaled to w x h.
+        w = std::max(1, w), h = std::max(1, h);
+        auto*        S  = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, w, h);
+        auto*        CR = cairo_create(S);
+        const double KX = w / 1920.0, KY = h / 1080.0;
+        const auto   light = [&](double cx, double cy, double rx, double ry, SColour c, double a) {
+            cairo_save(CR);
+            cairo_translate(CR, cx * KX, cy * KY);
+            cairo_scale(CR, rx * KX, ry * KY);
+            auto* G = cairo_pattern_create_radial(0, 0, 0, 0, 0, 1);
+            cairo_pattern_add_color_stop_rgba(G, 0, c.r, c.g, c.b, a);
+            cairo_pattern_add_color_stop_rgba(G, 0.72, c.r, c.g, c.b, 0);
+            cairo_set_source(CR, G);
+            cairo_arc(CR, 0, 0, 1, 0, 2 * std::numbers::pi);
+            cairo_fill(CR);
+            cairo_pattern_destroy(G);
+            cairo_restore(CR);
+        };
+        light(780, 380, 820, 560, ac, 0.28);
+        light(1160, 440, 760, 520, ac2, 0.22);
+        auto* V = cairo_pattern_create_linear(0, 0, 0, h);
+        cairo_pattern_add_color_stop_rgba(V, 0, 0, 0, 0, 0.55);
+        cairo_pattern_add_color_stop_rgba(V, 0.20, 0, 0, 0, 0);
+        cairo_pattern_add_color_stop_rgba(V, 0.66, 0, 0, 0, 0);
+        cairo_pattern_add_color_stop_rgba(V, 1, 0, 0, 0, 0.55);
+        cairo_set_source(CR, V);
+        cairo_paint(CR);
+        cairo_pattern_destroy(V);
+        cairo_destroy(CR);
+        auto I = finish(S, nullptr, {}, 1.0);
+        cairo_surface_destroy(S);
+        return I;
+    }
+
+    SImage paintPortalTitle(const std::string& name, SColour ac, float scale) {
+        const double s = std::max(0.5f, scale);
+        const SRGBA  AC{ac.r, ac.g, ac.b, 1.0};
+        SText        eyebrow = text("THROUGH THE PORTAL", 800, 14, AC, s, SANS, 0, 14 * 0.08);
+        SText        title   = text(name, 800, 60, TITLE, s, SANS, 1400);
+        const int    W = static_cast<int>(std::ceil(std::max(18 * s + eyebrow.w, title.w) + 4));
+        const int    H = static_cast<int>(std::ceil(eyebrow.h + 12 * s + title.h + 4));
+        auto*        S  = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, W, H);
+        auto*        CR = cairo_create(S);
+        cairo_arc(CR, 2 + 4 * s, 2 + eyebrow.h / 2, 4 * s, 0, 2 * std::numbers::pi);
+        source(CR, AC);
+        cairo_fill(CR);
+        draw(CR, eyebrow, 2 + 18 * s, 2);
+        draw(CR, title, 2, 2 + eyebrow.h + 12 * s);
+        cairo_destroy(CR);
+        auto I = finish(S, nullptr, {}, 1.0);
+        cairo_surface_destroy(S);
+        I.ax = I.ay = 2.0f;
+        return I;
+    }
+
+    SImage paintStartPanel(const SStart& st, float scale) {
+        const double s = std::max(0.5f, scale);
+        const double PW = 580 * s, PAD = (st.failed ? 28 : 24) * s, GAP = (st.failed ? 10 : 16) * s, R = 22 * s;
+        constexpr SRGBA PRIMARY = hex(0x1793d1), FILL_BUTTON = {1, 1, 1, 0.07};
+        SText title = text(st.title, 800, 18, st.failed ? ERROR : HEADING, s, SANS, st.failed ? 520 : 400);
+        SText count = text(st.failed ? "" : "Step " + std::to_string(st.step) + " of " + std::to_string(st.steps), 600, 15, SUB, s);
+        SText line  = text(st.text, st.failed ? 600 : 700, 15, st.failed ? SUB : TEXT, s, SANS, st.failed ? 0 : 300);
+        if (st.failed) {
+            // A sentence: wrapped at the panel's inner width.
+            pango_layout_set_width(line.layout, static_cast<int>((580 - 56) * s * PANGO_SCALE));
+            pango_layout_set_wrap(line.layout, PANGO_WRAP_WORD);
+            pango_layout_set_line_spacing(line.layout, 1.5f);
+            PangoRectangle ink, logical;
+            pango_layout_get_pixel_extents(line.layout, &ink, &logical);
+            line.w = logical.width, line.h = logical.height;
+        }
+        SText detail = text(st.detail, 400, 13, SUB, s, MONO, 220);
+        const double ROW1 = std::max(title.h, count.h), BARS = 6 * s, ROW3 = std::max(line.h, detail.h);
+        const double PH = std::ceil(2 * PAD + ROW1 + GAP + (st.failed ? line.h : BARS + GAP + ROW3));
+        const SMargins M  = floatMargins(s);
+        const int      W  = static_cast<int>(std::ceil(PW + M.l + M.r)), H = static_cast<int>(std::ceil(PH + M.t + M.b));
+        auto*          S  = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, W, H);
+        auto*          CR = cairo_create(S);
+        const double   X0 = std::round(M.l), Y0 = std::round(M.t);
+        drawPanel(CR, X0, Y0, PW, PH, R, s);
+        double y = Y0 + PAD;
+        const double X = X0 + PAD, IW = PW - 2 * PAD;
+        draw(CR, title, X, y + (ROW1 - title.h) / 2);
+        if (!st.failed)
+            draw(CR, count, X + IW - count.w, y + (ROW1 - count.h) / 2);
+        y += ROW1 + GAP;
+        if (st.failed)
+            draw(CR, line, X, y);
+        else {
+            // One bar a step: done ones full, the current one to its part.
+            const int    N  = std::max(1, st.steps);
+            const double BW = (IW - 8 * s * (N - 1)) / N;
+            for (int i = 0; i < N; ++i) {
+                const double BX = X + i * (BW + 8 * s);
+                roundRect(CR, BX, y, BW, BARS, 3 * s);
+                source(CR, FILL_BUTTON);
+                cairo_fill(CR);
+                const double F = i + 1 < st.step ? 1.0 : i + 1 == st.step ? std::clamp(static_cast<double>(st.part), 0.0, 1.0) : 0.0;
+                if (F > 0) {
+                    cairo_save(CR);
+                    cairo_rectangle(CR, BX, y, BW * F, BARS);
+                    cairo_clip(CR);
+                    roundRect(CR, BX, y, BW, BARS, 3 * s);
+                    source(CR, PRIMARY);
+                    cairo_fill(CR);
+                    cairo_restore(CR);
+                }
+            }
+            y += BARS + GAP;
+            const double ASC = std::max(line.baseline, detail.baseline);
+            draw(CR, line, X, y + ASC - line.baseline);
+            draw(CR, detail, X + IW - detail.w, y + ASC - detail.baseline);
+        }
+        cairo_destroy(CR);
+        auto A = floatShadow(W, H, X0, Y0, PW, PH, R, s);
+        auto I = finish(S, &A, {0, 0, 0, 0.5}, 1.0);
+        cairo_surface_destroy(S);
+        I.ax = static_cast<float>(X0);
+        I.ay = static_cast<float>(Y0);
         return I;
     }
 }

@@ -40,6 +40,7 @@
 #include <hyprland/src/managers/SeatManager.hpp>
 #include <hyprland/src/managers/SessionLockManager.hpp>
 #include <hyprland/src/config/supplementary/executor/Executor.hpp>
+#include <hyprland/src/config/shared/actions/ConfigActions.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
 #include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
 #include <hyprland/src/config/values/ConfigValues.hpp>
@@ -296,6 +297,15 @@ static float g_fsStartRoll = 0.f;
 static std::chrono::steady_clock::time_point g_fsPhaseStart{};
 static bool  g_fsWasOn = false; // a fullscreen window existed since the last poll
 static PHLWINDOWREF g_fsLastFSWindow; // the most recent fullscreen window
+// A window that went fullscreen on a monitor other than the one in front of
+// the player, and the workspace it came from: brought in front for the
+// fullscreen, sent home when it ends. The fullscreen windows on the other
+// monitors at the last poll, so only a NEW one is brought (a game already
+// fullscreen there when the room opened stays where it is).
+static PHLWINDOWREF    g_fsHomeWindow;
+static PHLWORKSPACEREF g_fsHomeWorkspace;
+static std::vector<std::uintptr_t> g_fsElsewhere;
+static bool g_fsElsewhereKnown = false;
 static std::uintptr_t g_fsCurrentId = 0; // the id of the CURRENT fullscreen window, 0 = none
 static float g_fsAlpha = 1.0f;  // composite alpha during the transition
 
@@ -3662,6 +3672,36 @@ static void pollFullscreen() {
             std::max(g_fsFade - STEP, FADE_TARGET);
     }
 
+    // Super+F on a window whose 2D home is another monitor fullscreened it
+    // THERE: the room went on drawing over that monitor, and the one in front
+    // of the player showed nothing new (measured on the owner's three
+    // monitors). A window that turns fullscreen elsewhere while the room is
+    // open is brought to the workspace in front; the passthrough below takes
+    // it on the next poll, and the end of the passthrough sends it home.
+    std::vector<std::uintptr_t> elsewhere;
+    PHLWINDOW bring;
+    for (const auto& OTHER : spannedMonitors()) {
+        if (OTHER == MON)
+            continue;
+        const auto W = Fullscreen::controller()->getFullscreenWindow(OTHER);
+        if (!W)
+            continue;
+        const auto ID = Compat::windowId(W);
+        elsewhere.push_back(ID);
+        if (g_fsElsewhereKnown && !bring && g_world.find(ID) &&
+            std::find(g_fsElsewhere.begin(), g_fsElsewhere.end(), ID) == g_fsElsewhere.end())
+            bring = W;
+    }
+    g_fsElsewhere      = elsewhere;
+    g_fsElsewhereKnown = true;
+    if (bring && !FSW && g_fsPhase == EFullscreenPhase::None && ownsInput() &&
+        MON->m_activeWorkspace) {
+        g_fsHomeWindow    = bring;
+        g_fsHomeWorkspace = bring->m_workspace;
+        Config::Actions::moveToWorkspace(MON->m_activeWorkspace, true, bring);
+        return;
+    }
+
     if (g_fsPhase == EFullscreenPhase::None) {
         if (FSW && !g_fsWasOn && ownsInput())
             startTo2D(FSW);
@@ -3842,6 +3882,16 @@ static void applyFullscreenAnimation() {
                 startTo2D(W2, /*captureRestoreBox*/ false);
             } else {
                 if (W2) {
+                    // Home first: a window brought in front from another
+                    // monitor goes back to the workspace it came from, so the
+                    // box below lands where it lived.
+                    if (g_fsHomeWindow.lock() == W2) {
+                        if (const auto HOME = g_fsHomeWorkspace.lock())
+                            Config::Actions::moveToWorkspace(HOME, true, W2);
+                        g_fsHomeWindow    = {};
+                        g_fsHomeWorkspace = {};
+                    }
+
                     // The original position AND the pre-fullscreen size:
                     // Hyprland remembered the size when the FS was engaged,
                     // the box lerp above already animated the real box there.
@@ -4375,9 +4425,14 @@ static void enter3D() {
     if (g_active)
         rememberRoom();
 
-    // The eye's monitor for this visit: where the room was opened from.
-    if (!g_active)
-        g_viewMonitor = targetMonitor();
+    // The eye's monitor for this visit: where the room was opened from. The
+    // fullscreen windows already on the other monitors stay where they are.
+    if (!g_active) {
+        g_viewMonitor      = targetMonitor();
+        g_fsElsewhereKnown = false;
+        g_fsHomeWindow     = {};
+        g_fsHomeWorkspace  = {};
+    }
 
     // Without this the render stage bails out immediately and the toggle does
     // nothing at all.

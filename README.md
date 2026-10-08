@@ -154,6 +154,24 @@ keybind); a window whose title is `title` comes to the eye at 1:1 as it
 opens, as F2 brings one, and goes when it closes. The menu itself is any
 program that opens such a window -- Larch's is `larch-room-menu`.
 
+### Resetting the windows
+
+```bash
+hyprctl eval 'hl.plugin.hypr3d.windows("reset")'   -- every window back in front of you
+hyprctl eval 'hl.plugin.hypr3d.windows("undo")'    -- and where they were again
+```
+
+`reset` puts every window where a window new to the room goes -- on the wall
+or the arc in front of the camera -- and leaves the player and the menu where
+they are; `reset()` also takes the player back to the spawn. The poses before
+are kept for one `undo`. Both fail with the reason when there is nothing to do.
+
+### The room's state
+
+The plugin writes flying, gravity and the HUD as `key=value` lines to
+`$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/hypr3d-state` whenever
+they change, for a menu to show.
+
 ## Controls
 
 | Input                         | Action                                         |

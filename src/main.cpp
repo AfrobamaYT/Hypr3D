@@ -2104,6 +2104,12 @@ static void ghostWindows(const std::vector<Compat::SWindowInfo>& INFOS) {
         if (!SAVE.window)
             continue;
 
+        // It floats now only because of the panel above: a tile before, a
+        // tile again when the room closes. Saved floating, it stayed a 720x480
+        // floating window in 2D -- windows "turned floating for no reason"
+        // (the owner, 2026-10-08).
+        SAVE.wasFloating = info.floating;
+
         Compat::applyWindowGhost(SAVE);
         g_layoutSaves.push_back(std::move(SAVE));
     }

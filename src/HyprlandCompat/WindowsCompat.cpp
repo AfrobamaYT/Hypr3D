@@ -6,6 +6,7 @@
 #include <hyprland/src/desktop/view/LayerSurface.hpp>
 #include <hyprland/src/desktop/Workspace.hpp>
 #include <hyprland/src/layout/target/Target.hpp>
+#include <hyprland/src/config/shared/actions/ConfigActions.hpp>
 #include <hyprland/src/managers/SeatManager.hpp>
 #include <hyprland/src/protocols/LayerShell.hpp>
 #include <hyprland/src/protocols/PointerConstraints.hpp>
@@ -212,7 +213,15 @@ void restoreWindowLayout(SWindowLayoutSave& save) {
     WINDOW->m_target->setFloating(true);
     WINDOW->m_target->setPositionGlobal(RESTORE_BOX);
     WINDOW->m_target->rememberFloatingSize(Vector2D{RESTORE_BOX.w, RESTORE_BOX.h});
-    WINDOW->m_target->setFloating(save.wasFloating);
+
+    // A tile goes back the way Hyprland's own settiled takes it: its space
+    // re-admits it and lays it out. Flipping the flag alone left it with the
+    // box set above -- two tiles side by side touched with no gap (915x1040
+    // instead of 908x1038), and a window opened in the room lay over its
+    // neighbours' tiles as a "tiled" 960x540 box: the owner's foot and Brave
+    // on top of each other on DP-3 (2026-10-08).
+    if (!save.wasFloating)
+        Config::Actions::floatWindow(Config::Actions::TOGGLE_ACTION_DISABLE, WINDOW);
 
     g_pHyprRenderer->damageWindow(WINDOW);
 }

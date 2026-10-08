@@ -1953,6 +1953,40 @@ void GLScene::drawCrosshair(int width, int height) {
             atX = X / W, atY = -Y / W;
     }
 
+    // A window in use shows a mouse pointer, not a cross: the arrow every
+    // desktop draws, its tip where the window's pointer is -- with Super+F's
+    // screen the owner looked for the cursor and saw a small cross.
+    if (m_cursorOn) {
+        // The arrow in pixels, y down, tip at 0,0: the head and the tail.
+        static constexpr float ARROW[][2] = {
+            {0.f, 0.f}, {0.f, 17.f}, {12.f, 12.f},
+            {4.f, 12.5f}, {7.f, 11.f}, {10.5f, 19.f},
+            {4.f, 12.5f}, {10.5f, 19.f}, {7.5f, 20.5f},
+        };
+        const auto drawArrow = [&](float dx, float dy, float r, float g, float b) {
+            std::vector<float> verts;
+            verts.reserve(9 * 5);
+            for (const auto& P : ARROW)
+                verts.insert(verts.end(), {atX + (P[0] + dx) * pxX, atY + (P[1] + dy) * pxY, 0.f, 0.f, 0.f});
+            glUseProgram(m_sceneProgram);
+            const Mat4 IDENTITY = Mat4::identity();
+            glUniformMatrix4fv(m_sceneMVP, 1, GL_FALSE, IDENTITY.m.data());
+            glUniform1i(m_sceneTextured, 0);
+            glUniform4f(m_sceneColorUniform, r, g, b, 1.0f);
+            glUniform4f(m_sceneUVRect, 0.0f, 0.0f, 1.0f, 1.0f);
+            glBindBuffer(GL_ARRAY_BUFFER, m_crosshairVBO);
+            glBufferSubData(GL_ARRAY_BUFFER, 0, static_cast<GLsizeiptr>(verts.size() * sizeof(float)), verts.data());
+            glBindVertexArray(m_crosshairVAO);
+            glDrawArrays(GL_TRIANGLES, 0, 9);
+            glBindVertexArray(0);
+        };
+        // A black rim from four shifted copies, the white arrow over it.
+        for (const auto& O : {std::pair{-1.2f, 0.f}, {1.2f, 0.f}, {0.f, -1.2f}, {0.f, 1.2f}})
+            drawArrow(O.first, O.second, 0.f, 0.f, 0.f);
+        drawArrow(0.f, 0.f, 1.f, 1.f, 1.f);
+        return;
+    }
+
     constexpr float OUTER_PX   = 10.0f;
     constexpr float INNER_PX   = 3.5f;
     constexpr float THICK_PX   = 1.4f;

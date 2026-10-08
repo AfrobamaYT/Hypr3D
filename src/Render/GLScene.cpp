@@ -2273,13 +2273,21 @@ void GLScene::drawRoom(const Mat4& vp, const ViewWindow& view,
     // are split along each other, and translucency composites in order. A
     // featured window (F2, F4) comes after the rest and the dark over them --
     // for the player's eyes: the companion's eye sees the room as it stands.
-    if (!m_featuredId || sight)
+    if (!m_featuredId || sight) {
         drawWindows(vp, windows);
-    else {
+        // A featured window gone (the menu closed): its dark and blur clear
+        // over the whole room.
+        if (!sight && m_featuredBlur > 0.0f)
+            drawBlur(m_featuredBlur);
+        if (!sight && m_featuredDim > 0.0f)
+            drawDim(m_featuredDim);
+    } else {
         std::vector<WindowRender> rest, featured;
         for (const auto& W : windows)
             (W.id == m_featuredId ? featured : rest).push_back(W);
         drawWindows(vp, rest);
+        if (m_featuredBlur > 0.0f)
+            drawBlur(m_featuredBlur);
         if (m_featuredDim > 0.0f)
             drawDim(m_featuredDim);
         m_windowsOnTop = true;
@@ -2541,6 +2549,144 @@ void GLScene::drawShadows(const Mat4& vp) {
     glBindTexture(GL_TEXTURE_2D, 0);
     glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+
+void GLScene::drawBlur(float amount) {
+    if (!m_sceneFBO || !m_sceneColor || m_sceneWidth <= 0 || m_sceneHeight <= 0)
+        return;
+    if (!m_blurDownProgram) {
+        static constexpr const char* VS = R"GLSL(#version 300 es
+layout(location = 0) in vec2 aPosition;
+layout(location = 1) in vec2 aUV;
+out vec2 vUV;
+void main() { gl_Position = vec4(aPosition, 0.0, 1.0); vUV = aUV; }
+)GLSL";
+        // The dual filter's two halves (Bjørge, "Bandwidth-Efficient
+        // Rendering", SIGGRAPH 2015): five taps going down, eight going up.
+        static constexpr const char* DOWN = R"GLSL(#version 300 es
+precision highp float;
+in vec2 vUV;
+uniform sampler2D uTex;
+uniform vec2 uHalf;
+out vec4 fragColor;
+void main() {
+    vec4 s = texture(uTex, vUV) * 4.0;
+    s += texture(uTex, vUV - uHalf);
+    s += texture(uTex, vUV + uHalf);
+    s += texture(uTex, vUV + vec2(uHalf.x, -uHalf.y));
+    s += texture(uTex, vUV - vec2(uHalf.x, -uHalf.y));
+    fragColor = s / 8.0;
+}
+)GLSL";
+        static constexpr const char* UP = R"GLSL(#version 300 es
+precision highp float;
+in vec2 vUV;
+uniform sampler2D uTex;
+uniform vec2 uHalf;
+out vec4 fragColor;
+void main() {
+    vec4 s = texture(uTex, vUV + vec2(-uHalf.x * 2.0, 0.0));
+    s += texture(uTex, vUV + vec2(-uHalf.x, uHalf.y)) * 2.0;
+    s += texture(uTex, vUV + vec2(0.0, uHalf.y * 2.0));
+    s += texture(uTex, vUV + vec2(uHalf.x, uHalf.y)) * 2.0;
+    s += texture(uTex, vUV + vec2(uHalf.x * 2.0, 0.0));
+    s += texture(uTex, vUV + vec2(uHalf.x, -uHalf.y)) * 2.0;
+    s += texture(uTex, vUV + vec2(0.0, -uHalf.y * 2.0));
+    s += texture(uTex, vUV + vec2(-uHalf.x, -uHalf.y)) * 2.0;
+    fragColor = s / 12.0;
+}
+)GLSL";
+        const GLuint V = compileShader(GL_VERTEX_SHADER, VS);
+        const GLuint D = compileShader(GL_FRAGMENT_SHADER, DOWN);
+        const GLuint U = compileShader(GL_FRAGMENT_SHADER, UP);
+        if (V && D)
+            m_blurDownProgram = linkProgram(V, D);
+        if (V && U)
+            m_blurUpProgram = linkProgram(V, U);
+        for (const GLuint SH : {V, D, U})
+            if (SH)
+                glDeleteShader(SH);
+        if (!m_blurDownProgram || !m_blurUpProgram)
+            return;
+    }
+    // Half, quarter and eighth of the room's size.
+    for (int i = 0; i < 3; ++i) {
+        auto&     L = m_blurLevels[i];
+        const int W = std::max(1, m_sceneWidth >> (i + 1)), H = std::max(1, m_sceneHeight >> (i + 1));
+        if (L.fbo && L.w == W && L.h == H)
+            continue;
+        if (!L.fbo) {
+            glGenFramebuffers(1, &L.fbo);
+            glGenTextures(1, &L.tex);
+        }
+        L.w = W, L.h = H;
+        glBindTexture(GL_TEXTURE_2D, L.tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glBindFramebuffer(GL_FRAMEBUFFER, L.fbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, L.tex, 0);
+    }
+
+    GLint viewport[4];
+    glGetIntegerv(GL_VIEWPORT, viewport);
+    const GLboolean DEPTH = glIsEnabled(GL_DEPTH_TEST), BLEND = glIsEnabled(GL_BLEND), CULL = glIsEnabled(GL_CULL_FACE);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_BLEND);
+    glActiveTexture(GL_TEXTURE0);
+    glBindVertexArray(m_fullscreenVAO);
+    // The spread of each tap, in source pixels: three levels at 2.5 come
+    // near the draft's 14 px blur on its 1280 px stage at 1920 px.
+    constexpr float SPREAD = 2.5f;
+    const auto pass = [&](GLuint program, GLuint fbo, int w, int h, GLuint tex, int tw, int th) {
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glViewport(0, 0, w, h);
+        glUseProgram(program);
+        glUniform1i(glGetUniformLocation(program, "uTex"), 0);
+        glUniform2f(glGetUniformLocation(program, "uHalf"), SPREAD * 0.5f / tw, SPREAD * 0.5f / th);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+    };
+    pass(m_blurDownProgram, m_blurLevels[0].fbo, m_blurLevels[0].w, m_blurLevels[0].h, m_sceneColor, m_sceneWidth, m_sceneHeight);
+    for (int i = 1; i < 3; ++i)
+        pass(m_blurDownProgram, m_blurLevels[i].fbo, m_blurLevels[i].w, m_blurLevels[i].h, m_blurLevels[i - 1].tex,
+             m_blurLevels[i - 1].w, m_blurLevels[i - 1].h);
+    for (int i = 2; i > 0; --i)
+        pass(m_blurUpProgram, m_blurLevels[i - 1].fbo, m_blurLevels[i - 1].w, m_blurLevels[i - 1].h, m_blurLevels[i].tex,
+             m_blurLevels[i].w, m_blurLevels[i].h);
+    // Back into the room, mixed over it by `amount`; its alpha stays.
+    glEnable(GL_BLEND);
+    glBlendColor(0.f, 0.f, 0.f, std::clamp(amount, 0.0f, 1.0f));
+    glBlendFuncSeparate(GL_CONSTANT_ALPHA, GL_ONE_MINUS_CONSTANT_ALPHA, GL_ZERO, GL_ONE);
+    pass(m_blurUpProgram, m_sceneFBO, m_sceneWidth, m_sceneHeight, m_blurLevels[0].tex, m_blurLevels[0].w, m_blurLevels[0].h);
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+    if (!BLEND)
+        glDisable(GL_BLEND);
+    if (DEPTH)
+        glEnable(GL_DEPTH_TEST);
+    if (CULL)
+        glEnable(GL_CULL_FACE);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glBindVertexArray(0);
+    glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+}
+
+void GLScene::releaseBlur() {
+    for (auto& L : m_blurLevels) {
+        if (L.fbo)
+            glDeleteFramebuffers(1, &L.fbo);
+        if (L.tex)
+            glDeleteTextures(1, &L.tex);
+        L = {};
+    }
+    for (auto* P : {&m_blurDownProgram, &m_blurUpProgram})
+        if (*P) {
+            glDeleteProgram(*P);
+            *P = 0;
+        }
 }
 
 void GLScene::drawDim(float dim) {
@@ -3028,6 +3174,7 @@ void GLScene::destroyGLObjects() {
         glDeleteBuffers(1, &m_dimVBO);
         m_dimVAO = m_dimVBO = 0;
     }
+    releaseBlur();
     if (m_shadowTex) {
         glDeleteTextures(1, &m_shadowTex);
         m_shadowTex = 0;

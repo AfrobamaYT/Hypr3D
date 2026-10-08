@@ -243,9 +243,13 @@ class GLScene {
     // The window being read or shown big (F2, F4): drawn after the rest of
     // the room and never hidden by it, over the room darkened by `dim`
     // (0 = as it is, 1 = black). id 0: none.
-    void setFeatured(std::uintptr_t id, float dim) {
-        m_featuredId  = id;
-        m_featuredDim = dim;
+    float featuredDim() const { return m_featuredDim; }
+    float featuredBlur() const { return m_featuredBlur; }
+    // `blur` (0..1): the room behind it blurred as well, the F1 menu's.
+    void setFeatured(std::uintptr_t id, float dim, float blur = 0.0f) {
+        m_featuredId   = id;
+        m_featuredDim  = dim;
+        m_featuredBlur = blur;
     }
 
     // View zoom (the C key): magnification narrows the render fov
@@ -428,6 +432,17 @@ class GLScene {
     bool           m_windowsOnTop = false; // drawWindows without the depth test
     unsigned int   m_dimVAO = 0, m_dimVBO = 0;
     void drawDim(float dim);
+    // The room blurred behind a featured window (dual Kawase: three halving
+    // passes down, three back up), mixed over the sharp room by `amount`.
+    struct SBlurLevel {
+        unsigned int fbo = 0, tex = 0;
+        int          w = 0, h = 0;
+    };
+    SBlurLevel     m_blurLevels[3];
+    unsigned int   m_blurDownProgram = 0, m_blurUpProgram = 0;
+    float          m_featuredBlur = 0.0f;
+    void           drawBlur(float amount);
+    void           releaseBlur();
     void drawFullscreen(float alpha);
     void drawOverlay(int width, int height);
 

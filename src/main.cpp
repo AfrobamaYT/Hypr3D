@@ -482,6 +482,8 @@ static float  g_mapGrabDist  = 0.0f; // camera-to-object-CENTER distance
 // F3 debug HUD: collision wireframe + room info overlay.
 static bool        g_debugHud = false;
 static float       g_debugFps = 0.0f;
+static bool g_aimLabelBusy = false; // overlayTick: a label still to appear or fold
+static bool g_featureFading = false; // the room clearing after the menu closed
 
 // C-key view zoom: g_zoomLevel glides toward the target (the wheel-adjusted
 // magnification while C is held, 1x when released). The wheel level resets
@@ -2442,6 +2444,8 @@ struct SRead {
     bool           back    = false; // on the way back to the room
     bool           arrived = false;
     float          legDim  = 0.f, dim = 0.f; // the room's dark, 0..1
+    float          legBlur = 0.f, blur = 0.f; // the room blurred behind it (the menu), 0..1
+    float          alpha   = 1.f; // the menu fading in
     std::chrono::steady_clock::time_point start;
     Vec3  legCenter{};      // the pose the current leg starts from
     float legYaw = 0.f, legPitch = 0.f, legRoll = 0.f, legScale = 1.f;
@@ -2509,6 +2513,13 @@ static constexpr float kScreenBackSeconds = 0.48f;
 static constexpr float kScreenDim        = 0.4f;
 static constexpr float kScreenBackDimSeconds = 0.4f;
 static constexpr float kScreenSwell      = 0.035f;
+// The F1 menu: it rises 60 px from just below the eye and grows from 0.86
+// over 460 ms, fading in over 220 ms, while the room behind blurs and dims
+// to 58 % over 320 ms; closed, the room clears over 320 ms.
+static constexpr float kMenuRisePx  = 60.0f;
+static constexpr float kMenuFrom    = 0.86f;
+static constexpr float kMenuFadeIn  = 0.22f;
+static constexpr float kMenuDim     = 0.42f;
 
 // The reading pose for a window of BOX (logical px, decorations included):
 // at the distance where the monitor's logical height fills the view, a
@@ -2631,10 +2642,13 @@ static void applyReading(const PHLMONITOR& mon, const CBox& BOX, World3D::SEntit
     } else
         readingPose(mon, BOX, g_read.screen ? kScreenFill : g_read.cinema ? kCinemaFill : 0.f,
                     to, toYaw, toPitch, toScale);
-    const float TO_DIM = g_read.back ? 0.0f : CINEMA ? kCinemaDim : g_read.screen ? kScreenDim : kReadDim;
+    const bool  MENU   = g_read.id == g_menuId && !g_read.cinema && !g_read.screen;
+    const float TO_DIM = g_read.back ? 0.0f : CINEMA ? kCinemaDim : g_read.screen ? kScreenDim : MENU ? kMenuDim : kReadDim;
     const float DIM_S  = g_read.screen ? (g_read.back ? kScreenBackDimSeconds : kScreenSeconds) : kReadDimSeconds;
-    g_read.dim = g_read.legDim + (TO_DIM - g_read.legDim) *
-        (CINEMA ? P : larchEase(ELarchEase::Fade, std::clamp(T / DIM_S, 0.0f, 1.0f)));
+    const float DIM_K  = CINEMA ? P : larchEase(ELarchEase::Fade, std::clamp(T / DIM_S, 0.0f, 1.0f));
+    g_read.dim  = g_read.legDim + (TO_DIM - g_read.legDim) * DIM_K;
+    g_read.blur = g_read.legBlur + ((MENU && !g_read.back ? 1.0f : 0.0f) - g_read.legBlur) * DIM_K;
+    g_read.alpha = MENU && !g_read.back && !g_read.arrived ? larchEase(ELarchEase::Fade, T / kMenuFadeIn) : 1.0f;
     // The screen swells as it lifts off: up 3.5 % by a fifth of the way,
     // back by two fifths.
     const float SWELL = g_read.screen && !g_read.back ?
@@ -2645,7 +2659,16 @@ static void applyReading(const PHLMONITOR& mon, const CBox& BOX, World3D::SEntit
     E.yaw    = g_read.legYaw + std::remainder(toYaw - g_read.legYaw, TWO_PI) * P;
     E.pitch  = g_read.legPitch + (toPitch - g_read.legPitch) * P;
     E.roll   = g_read.legRoll + std::remainder(toRoll - g_read.legRoll, TWO_PI) * P;
-    const float SCALE = (g_read.legScale + (toScale - g_read.legScale) * P) * SWELL;
+    float SCALE = (g_read.legScale + (toScale - g_read.legScale) * P) * SWELL;
+    // The menu does not fly from where it opened: it rises into its place
+    // from just below the eye, square to it all the way.
+    if (MENU && !g_read.back && !g_read.arrived) {
+        const auto& CAM = g_scene.camera();
+        const Vec3  UP  = normalize(cross(CAM.right(), CAM.forward()));
+        E.center = to - UP * (kMenuRisePx * World3D::toWorld(1.0f) * toScale * (1.0f - P));
+        E.yaw = toYaw, E.pitch = toPitch, E.roll = toRoll;
+        SCALE = toScale * (kMenuFrom + (1.0f - kMenuFrom) * P);
+    }
     E.width  = World3D::toWorld(BOX.w) * SCALE;
     E.height = World3D::toWorld(BOX.h) * SCALE;
 
@@ -2691,6 +2714,7 @@ static bool toggleReading(bool cinema, std::uintptr_t only = 0, bool screen = fa
     } else
         g_read.back = true;
     g_read.legDim    = g_read.dim;
+    g_read.legBlur   = g_read.blur;
     g_read.arrived   = false;
     g_read.start     = std::chrono::steady_clock::now();
     g_read.legCenter = E->center;
@@ -3429,7 +3453,26 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         // completely still (the owner, 2026-10-08).
         useMenu(menu);
     }
-    g_scene.setFeatured(g_read.id, g_read.dim);
+    // The room's dark and blur; a menu that closed takes them with it over
+    // 320 ms rather than at once.
+    {
+        static float  s_dim = 0.0f, s_blur = 0.0f;
+        static double s_goneAt = -1.0;
+        if (g_read.id) {
+            s_dim = g_read.dim, s_blur = g_read.blur, s_goneAt = -1.0;
+            g_scene.setFeatured(g_read.id, g_read.dim, g_read.blur);
+            g_featureFading = false;
+        } else if (s_dim > 0.0f || s_blur > 0.0f) {
+            if (s_goneAt < 0.0)
+                s_goneAt = nowSeconds();
+            const float K = 1.0f - larchEase(ELarchEase::Fade, static_cast<float>(nowSeconds() - s_goneAt) / kReadDimSeconds);
+            g_scene.setFeatured(0, s_dim * K, s_blur * K);
+            g_featureFading = K > 0.0f;
+            if (K <= 0.0f)
+                s_dim = s_blur = 0.0f;
+        } else
+            g_scene.setFeatured(0, 0.0f, 0.0f);
+    }
 
     // --- build the draw list from world + snapshot ---
     g_renderWindows.clear();
@@ -3482,6 +3525,8 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
             (LAST_FS_WIN && entity.id == Compat::windowId(LAST_FS_WIN));
 
         render.alpha = IS_FS_WINDOW ? 1.0f : g_fsFade;
+        if (entity.id == g_read.id)
+            render.alpha *= g_read.alpha; // the menu fading in
 
         // Crumpling (see g_crumple): a carried window by its distance to the
         // bin's opening, one in the bin by applyTrash; any other opens again.
@@ -6092,6 +6137,7 @@ static void dumpStatus(bool force = false) {
         out << "gun: out=" << (g_gun ? 1 : 0) << " holding=" << g_gunHold.id << " shots=" << g_gunShots.size() << "\n";
         out << "read: id=" << g_read.id << " menu=" << g_menuId << " arrived=" << (g_read.arrived ? 1 : 0)
             << " dim=" << g_read.dim << " screen=" << (g_read.screen ? 1 : 0) << " back=" << (g_read.back ? 1 : 0)
+            << " shown=" << g_scene.featuredDim() << "/" << g_scene.featuredBlur()
             << " following=" << (g_read.following ? 1 : 0) << " at=(" << g_read.atCenter.x << ","
             << g_read.atCenter.y << "," << g_read.atCenter.z << ") yaw=" << g_read.atYaw
             << " pitch=" << g_read.atPitch << "\n";
@@ -6255,11 +6301,10 @@ static uint64_t frameFingerprint() {
 
 // What moves on its own, with no state yet to show it: an animation clock,
 // work done off the main thread, a request waiting for the next frame.
-static bool g_aimLabelBusy = false; // overlayTick: a label still to appear or fold
 
 static bool runsOnTime() {
     return g_debugHud                        // the HUD counts frames
-        || g_aimLabelBusy
+        || g_aimLabelBusy || g_featureFading
         || g_viewMode != 0                   // F5: the player's own animation
         || g_scene.scenePending() || joltShapesPending()
         || g_sightPending

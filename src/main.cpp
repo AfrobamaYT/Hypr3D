@@ -7777,6 +7777,85 @@ static int luaReset(lua_State*) {
     return 0;
 }
 
+// Every window back where a window new to the room goes -- on the wall or the
+// arc in front of the player, as when the room opened -- the player staying
+// where they stand; the menu, in use, stays at the eye. The poses they had are
+// kept for one undo. Asked for from the room's menu (the owner, 2026-10-08):
+// reset() also takes the player back to the spawn and forgets the room.
+struct SWindowsUndo {
+    std::unordered_map<std::uintptr_t, SRememberedPose> poses;
+    std::uintptr_t                                       tv = 0;
+};
+static std::optional<SWindowsUndo> g_windowsUndo;
+
+static bool windowsLua(lua_State* L) {
+    const std::string VERB = lua_type(L, 1) == LUA_TSTRING ? lua_tostring(L, 1) : "";
+    if (VERB == "reset") {
+        if (!g_active) {
+            lua_pushstring(L, "windows: the room is closed");
+            return false;
+        }
+        SWindowsUndo undo;
+        undo.tv = g_tvWindowId;
+        std::vector<std::uintptr_t> ids;
+        for (const auto& E : g_world.entities()) {
+            if (E.id == g_menuId || std::ranges::any_of(g_trashed, [&](const STrashed& t) { return t.id == E.id; }))
+                continue;
+            SRememberedPose P;
+            if (const auto W = Compat::findWindowById(E.id))
+                P.window = W;
+            else if (const auto LS = Compat::findLayerById(E.id))
+                P.layer = LS;
+            else
+                continue;
+            P.center = E.center;
+            P.yaw = E.yaw, P.pitch = E.pitch, P.roll = E.roll;
+            undo.poses[E.id] = P;
+            ids.push_back(E.id);
+        }
+        if (g_read.id && g_read.id != g_menuId)
+            endReading(false);
+        for (const auto ID : ids) {
+            g_world.remove(ID);
+            g_room.poses.erase(ID);
+        }
+        g_tvWindowId = 0;
+        g_windowsUndo = std::move(undo);
+        damageCurrentMonitor();
+        return true;
+    }
+    if (VERB == "undo") {
+        if (!g_windowsUndo) {
+            lua_pushstring(L, "windows: nothing to undo");
+            return false;
+        }
+        for (const auto& [ID, P] : g_windowsUndo->poses) {
+            if (!P.window.lock() && !P.layer.lock())
+                continue; // closed since
+            if (auto* E = g_world.find(ID)) {
+                E->center = P.center;
+                E->yaw = P.yaw, E->pitch = P.pitch, E->roll = P.roll;
+            }
+            else
+                g_room.poses[ID] = P; // not back in the room yet: it goes here when it is
+        }
+        g_tvWindowId = g_windowsUndo->tv;
+        g_windowsUndo.reset();
+        updateShadows();
+        damageCurrentMonitor();
+        return true;
+    }
+    lua_pushstring(L, "windows: \"reset\" or \"undo\"");
+    return false;
+}
+
+// hl.plugin.hypr3d.windows("reset") / windows("undo"): see windowsLua.
+static int luaWindows(lua_State* L) {
+    if (!windowsLua(L))
+        return lua_error(L);
+    return 0;
+}
+
 // hl.plugin.hypr3d.companion(verb[, target]): go_to and look_at check the
 // target and set off, or fail with the reason -- hyprctl eval prints it and
 // exits non-zero. stop halts; state posts the room event now, for a bridge
@@ -8141,6 +8220,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "reset", luaReset))
         throw std::runtime_error("[hypr3d] failed to register Lua reset");
+
+    if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "windows", luaWindows))
+        throw std::runtime_error("[hypr3d] failed to register Lua windows");
 
     if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "config", luaConfig))
         throw std::runtime_error("[hypr3d] failed to register Lua config");

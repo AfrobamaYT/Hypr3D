@@ -2268,6 +2268,7 @@ void GLScene::drawRoom(const Mat4& vp, const ViewWindow& view,
 
     drawShadows(vp);
     drawBinHalo(vp);
+    drawPortalPools(vp);
     if (primary && !sight)
         drawBackdrop();
 
@@ -2397,21 +2398,25 @@ void GLScene::drawPortals(const Mat4& vp) {
     glUniform4f(m_sceneUVRect, 0.f, 0.f, 1.f, 1.f);
     glUniform1i(m_sceneTexture, 0);
     glUniform1i(m_sceneTextured, 1);
-    glUniform4f(m_sceneColorUniform, 1.f, 1.f, 1.f, 1.f);
-    // Its glow fades out softly, but only what is clearly there hides what
-    // stands behind: the cut writes depth for the opaque part alone.
-    glUniform1f(m_sceneAlphaCut, 0.35f);
     glEnable(GL_DEPTH_TEST);
-    glDepthMask(GL_TRUE);
     glEnable(GL_BLEND);
     glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
     glBindVertexArray(m_portalVAO);
     glBindBuffer(GL_ARRAY_BUFFER, m_portalVBO);
     glActiveTexture(GL_TEXTURE0);
 
+    // Twice: first only what is clearly there, writing depth, so it hides
+    // what stands behind; then its soft glow, which writes none and lands
+    // only where the first pass drew nothing (the same depth fails LESS).
+    for (int pass = 0; pass < 2; ++pass)
     for (const auto& P : m_portals) {
         if (!P.tex || P.aspect <= 0.0f)
             continue;
+        glUniform1f(m_sceneAlphaCut, pass == 0 ? 0.35f : 0.004f);
+        glDepthMask(pass == 0 ? GL_TRUE : GL_FALSE);
+        // At a portal, the others step back into the dark.
+        const float LIGHT = m_portalFocus.empty() || m_portalFocus == P.spec.name ? 1.0f : 0.45f;
+        glUniform4f(m_sceneColorUniform, LIGHT, LIGHT, LIGHT, 1.f);
         const float W = P.spec.width, H = P.spec.width * P.aspect;
         const Vec3  FACE{std::sin(P.spec.yaw), 0.f, -std::cos(P.spec.yaw)};
         // Seen from in front, looking along -FACE, the picture's left is on
@@ -2430,9 +2435,61 @@ void GLScene::drawPortals(const Mat4& vp) {
     }
 
     glUniform1f(m_sceneAlphaCut, 0.0f);
+    glDepthMask(GL_TRUE);
     glBindTexture(GL_TEXTURE_2D, 0);
     glBindVertexArray(0);
     glBindBuffer(GL_ARRAY_BUFFER, 0);
+}
+
+void GLScene::drawPortalPools(const Mat4& vp) {
+    // Each lit portal throws a pool of its colour on the floor, so the doors
+    // tell apart before they can be read: an ellipse half again as wide as
+    // the face, a third as deep, its light falling off from the middle to
+    // nothing at the edge, added to the floor. Rings of a mesh, as the bin's.
+    if (std::ranges::none_of(m_portals, [](const SPortalGL& P) { return P.spec.lit; }))
+        return;
+    constexpr int   SEG = 48, RINGS = 24;
+    constexpr float PI  = 3.14159265f;
+    ensureCrumpleBuffers();
+    glUseProgram(m_sceneProgram);
+    glUniformMatrix4fv(m_sceneMVP, 1, GL_FALSE, vp.m.data());
+    glUniform4f(m_sceneUVRect, 0.f, 0.f, 1.f, 1.f);
+    glUniform1i(m_sceneTextured, 0);
+    glEnable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_BLEND);
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE, GL_ZERO, GL_ONE);
+    glBindVertexArray(m_crumpleVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_crumpleVBO);
+    std::vector<float> V;
+    for (const auto& P : m_portals) {
+        if (!P.spec.lit)
+            continue;
+        const Vec3  FACE{std::sin(P.spec.yaw), 0.f, -std::cos(P.spec.yaw)};
+        const Vec3  RIGHT = normalize(cross(FACE * -1.0f, Vec3{0.f, 1.f, 0.f}));
+        const float AX = 0.74f * P.spec.width, AZ = 0.28f * P.spec.width;
+        const Vec3  AT = P.spec.base + Vec3{0.f, 0.01f, 0.f}; // a hair over the floor
+        const float STRENGTH = (m_portalFocus == P.spec.name ? 0.7f : m_portalFocus.empty() ? 0.45f : 0.2f);
+        for (int r = 0; r < RINGS; ++r) {
+            const float IN = static_cast<float>(r) / RINGS, OUT = static_cast<float>(r + 1) / RINGS;
+            V.clear();
+            for (int i = 0; i <= SEG; ++i) {
+                const float A = 2.0f * PI * static_cast<float>(i) / SEG;
+                const float C = std::cos(A), S = std::sin(A);
+                const Vec3  PI_ = AT + RIGHT * (C * AX * IN) + FACE * (S * AZ * IN);
+                const Vec3  PO  = AT + RIGHT * (C * AX * OUT) + FACE * (S * AZ * OUT);
+                V.insert(V.end(), {PI_.x, PI_.y, PI_.z, 0.f, 0.f, PO.x, PO.y, PO.z, 0.f, 0.f});
+            }
+            glUniform4f(m_sceneColorUniform, P.spec.color.x, P.spec.color.y, P.spec.color.z,
+                        STRENGTH * (1.0f - (IN + OUT) * 0.5f));
+            glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(V.size() * sizeof(float)), V.data(), GL_DYNAMIC_DRAW);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, static_cast<GLint>(V.size() / 5));
+        }
+    }
+    glBindVertexArray(0);
+    glBindBuffer(GL_ARRAY_BUFFER, 0);
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
 }
 
 void GLScene::drawHud(float alpha) {

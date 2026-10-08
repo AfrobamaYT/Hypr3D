@@ -50,6 +50,7 @@ namespace Overlay {
             Alert,   // name in red, the note under it
             Quiet,   // one line of grey text, no shadow
             Toast,   // a note at the top: a heading, a line under it
+            Plate,   // a name on a small plate, as under a portal
         };
         EStyle            style = EStyle::Full;
         std::string       name, note;

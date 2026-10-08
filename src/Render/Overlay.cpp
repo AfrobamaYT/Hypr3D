@@ -474,6 +474,11 @@ namespace Overlay {
                 row1.push_back(text(L.name, 600, 15, SUB, s, SANS, 520));
                 padX = 12, padY = 8, hasShadow = false;
                 break;
+            case E::Plate:
+                // The draft's plate: padding 8/14, radius 10, 800 15.
+                row1.push_back(text(L.name, 800, 15, HEADING, s, SANS, 300));
+                padX = 14, padY = 8, hasShadow = false;
+                break;
             case E::Toast:
                 row1.push_back(text(L.name, 800, 18, HEADING, s, SANS, 640));
                 second    = text(L.note, 600, 15, SUB, s, SANS, 640);
@@ -521,7 +526,7 @@ namespace Overlay {
         if (!groups.empty())
             contentH += 10 * s + CAP_SMALL.h * s;
         const double PW = std::ceil(contentW + 2 * padX * s), PH = std::ceil(contentH + 2 * padY * s);
-        const double R  = (L.style == E::Toast ? 22 : 14) * s;
+        const double R  = (L.style == E::Toast ? 22 : L.style == E::Plate ? 10 : 14) * s;
 
         const SMargins M = hasShadow ? floatMargins(s) : SMargins{2 * s, 2 * s, 2 * s, 2 * s};
         const int      W = static_cast<int>(std::ceil(PW + M.l + M.r)), H = static_cast<int>(std::ceil(PH + M.t + M.b));

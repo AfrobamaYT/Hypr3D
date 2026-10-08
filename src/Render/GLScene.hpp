@@ -214,8 +214,14 @@ class GLScene {
         Vec3        base{}; // the floor point under its middle
         float       yaw   = 0.0f;
         float       width = 1.8f;
+        // The pool of light it throws on the floor, in its own colour; none
+        // without one.
+        bool        lit = false;
+        Vec3        color{};
     };
     void setPortals(const std::vector<SPortalSpec>& portals);
+    // The portal the player is at, its name: the others dim. Empty: none.
+    void setPortalFocus(const std::string& name) { m_portalFocus = name; }
     // Height over width of a portal's picture; 0 while it is not loaded.
     float portalAspect(const std::string& name) const;
 
@@ -419,6 +425,8 @@ class GLScene {
         std::string  loaded; // the image path the texture holds
     };
     std::vector<SPortalGL>    m_portals;
+    std::string               m_portalFocus;
+    void                      drawPortalPools(const Mat4& vp);
     std::vector<unsigned int> m_portalTrash; // textures to delete in render
     unsigned int              m_portalVAO = 0, m_portalVBO = 0;
     int                       m_sceneAlphaCut = -1;

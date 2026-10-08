@@ -1164,6 +1164,7 @@ static bool companionStart(bool walk, const std::string& name, std::string& why)
 struct SPortal {
     GLScene::SPortalSpec spec;
     std::string          command;
+    std::string          title, note; // its plate: the game's name, and what Steam knows of it
     bool                 inside = false; // the player stood in it last frame
     double               quietUntil = 0.0; // no second start before this
 };
@@ -7198,9 +7199,10 @@ static std::vector<GLScene::SOverlaySprite> aimTick(float SCALE) {
                 break;
             }
             case SAimHit::EKind::Portal:
+                // The diamond; the portal's own plate says the rest
+                // (portalPlates).
                 mark   = EMark::Portal;
                 target = "portal:" + g_portals[HIT.index].spec.name;
-                label  = Overlay::SLabel{EStyle::Full, g_portals[HIT.index].spec.name, "portal", {{{}, "Walk in to play"}}};
                 break;
             case SAimHit::EKind::None: break;
         }
@@ -7336,15 +7338,74 @@ static GLScene::SOverlaySprite roomCheckSprite(float scale) {
     return {A.check, GLScene::EAnchor::TopLeft, 96.0f * scale, 1.0f, 96.0f * scale};
 }
 
+// The portals' plates (the owner's approved "Portals" draft): the game's
+// name on a Larch plate under each door's threshold. Aimed at from within
+// 3 m, the door is the one in focus -- the others dim -- and its plate opens
+// to what Steam knows of the game and how to go in. Plates are screen
+// sprites at the door's foot, as games set name plates.
+static constexpr float kPortalFocusMetres = 3.0f;
+static constexpr float kPortalPlateMetres = 14.0f; // no plate from further off
+
+static std::vector<GLScene::SOverlaySprite> portalPlates(float scale) {
+    using EStyle = Overlay::SLabel::EStyle;
+    struct SPlate {
+        std::string key;
+        std::shared_ptr<const Overlay::SImage> image;
+    };
+    static std::unordered_map<std::string, SPlate> plates;
+    std::vector<GLScene::SOverlaySprite> out;
+    const auto  HIT   = firstAlongAim();
+    const auto* FOCUS = HIT.kind == SAimHit::EKind::Portal && HIT.t <= kPortalFocusMetres ? &g_portals[HIT.index] : nullptr;
+    g_scene.setPortalFocus(FOCUS ? FOCUS->spec.name : "");
+    const Vec3 EYE = g_scene.camera().position;
+    for (const auto& P : g_portals) {
+        const Vec3 D = P.spec.base - EYE;
+        if (dot(D, D) > kPortalPlateMetres * kPortalPlateMetres)
+            continue;
+        // Drawn over everything, so not where the room stands between the
+        // eye and the door's foot (a plate showed through the sofa).
+        const Vec3  FOOT = P.spec.base + Vec3{0.f, 0.15f, 0.f};
+        const Vec3  TO   = FOOT - EYE;
+        const float LEN  = std::sqrt(dot(TO, TO));
+        bool        hidden = false;
+        for (size_t i = 0; !hidden && LEN > 0.01f && i < g_sceneObjects.size(); ++i) {
+            const auto* MODEL = g_scene.sceneModel(i);
+            float       t     = -1.0f;
+            if (!g_sceneObjects[i].dynamic && i < g_objTrees.size() && !g_objTrees[i].empty())
+                t = g_objTrees[i].rayCast(EYE, TO * (1.0f / LEN));
+            else if (MODEL && MODEL->loaded())
+                t = MODEL->rayCast(EYE, TO * (1.0f / LEN));
+            hidden = t > 0.0f && t < LEN - 0.05f;
+        }
+        if (hidden)
+            continue;
+        const std::string NAME = P.title.empty() ? P.spec.name : P.title;
+        const Overlay::SLabel LABEL = &P == FOCUS ?
+            Overlay::SLabel{EStyle::Full, NAME, P.note, {{{"W"}, "Walk in to play"}}} :
+            Overlay::SLabel{EStyle::Plate, NAME};
+        auto&      plate = plates[P.spec.name];
+        const auto KEY   = labelKeyOf(LABEL, scale);
+        if (plate.key != KEY) {
+            plate.key   = KEY;
+            plate.image = std::make_shared<const Overlay::SImage>(Overlay::paintLabel(LABEL, scale));
+        }
+        out.push_back({plate.image, GLScene::EAnchor::World, 16.0f * scale, FOCUS && &P != FOCUS ? 0.45f : 1.0f, 0.0f, P.spec.base});
+    }
+    std::erase_if(plates, [](const auto& E) {
+        return std::ranges::none_of(g_portals, [&](const SPortal& P) { return P.spec.name == E.first; });
+    });
+    return out;
+}
+
 // Every frame, after the aim and the drag moved: what the overlay shows.
 static void overlayTick() {
     const float SCALE = g_monitor ? static_cast<float>(g_monitor->m_scale) : 1.0f;
-    std::vector<GLScene::SOverlaySprite> sprites;
+    std::vector<GLScene::SOverlaySprite> sprites = portalPlates(SCALE);
     if (g_use.id)
-        sprites = pointerTick(SCALE);
+        std::ranges::move(pointerTick(SCALE), std::back_inserter(sprites));
     else {
         g_aimOverlay.useId = 0;
-        sprites = aimTick(SCALE);
+        std::ranges::move(aimTick(SCALE), std::back_inserter(sprites));
     }
     for (auto& S : sprites)
         S.alpha *= flightCross();
@@ -8906,6 +8967,17 @@ static bool portalLua(lua_State* L) {
     portal.spec.image = STRING("image");
     portal.command    = STRING("command");
     portal.spec.width = std::clamp(NUMBER("width", 1.8f), 0.3f, 10.0f);
+    portal.title      = STRING("title");
+    portal.note       = STRING("note");
+    if (const auto COLOR = STRING("color"); !COLOR.empty()) {
+        unsigned rgb = 0;
+        if (COLOR.size() != 7 || COLOR[0] != '#' || std::sscanf(COLOR.c_str() + 1, "%6x", &rgb) != 1) {
+            lua_pushstring(L, ("portal: color '" + COLOR + "' is not #rrggbb").c_str());
+            return false;
+        }
+        portal.spec.lit   = true;
+        portal.spec.color = Vec3{((rgb >> 16) & 0xff) / 255.f, ((rgb >> 8) & 0xff) / 255.f, (rgb & 0xff) / 255.f};
+    }
     if (portal.spec.image.empty() || !std::filesystem::is_regular_file(portal.spec.image)) {
         lua_pushstring(L, ("portal: image '" + portal.spec.image + "' is not a file").c_str());
         return false;

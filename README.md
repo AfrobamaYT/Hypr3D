@@ -126,6 +126,13 @@ hyprctl eval 'hl.plugin.hypr3d.portal("deltarune")'   -- removes it
 | `at` | the floor point under its middle; or `front = true`: 2.5 m in front of the player, facing him |
 | `yaw` | the direction it faces, degrees, as the camera's yaw; default: towards the spawn |
 | `width` | metres, default 1.8; the height follows the picture |
+| `title` | the name on its plate; default: the portal's name |
+| `note` | what the plate adds when you are at the portal, e.g. "Played today · 38 h" |
+| `color` | `"#rrggbb"`: the pool of light it throws on the floor |
+
+Under each portal stands a plate with its title. Aimed at from within 3 m,
+the portal is the one in focus: the others dim, its pool brightens, and its
+plate opens to the note and how to go in.
 
 Each start goes out on socket2 as `{"event":"portal","name":"deltarune","started":true,...}`.
 A portal lives as long as the plugin; a wrong call fails with the reason.

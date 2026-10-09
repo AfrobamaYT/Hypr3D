@@ -227,11 +227,19 @@ front, and again on the first move after 2 s still. On Super+F's screen a
 pill at the bottom says how to get back; it fades out after 3 s and comes
 back with the ring.
 
+While using a window, its application receives Escape and the ordinary
+function keys; F8 and Super+F remain the room controls. A new transient dialog
+of the used window takes the pointer and keyboard and comes into the reading
+view. Closing it restores the parent, its pointer and its previous screen view.
+
 ### The room's state
 
 The plugin writes flying, gravity and the HUD as `key=value` lines to
 `$XDG_RUNTIME_DIR/hypr/$HYPRLAND_INSTANCE_SIGNATURE/hypr3d-state` whenever
 they change, for a menu to show.
+An explicit `hl.plugin.hypr3d.status()` refreshes `/tmp/hypr3d-status.txt`
+immediately in an active room; it errors when the room is closed. The periodic
+dump is throttled and should not be used as a synchronous input-position query.
 
 ## Controls
 

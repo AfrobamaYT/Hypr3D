@@ -3594,6 +3594,7 @@ static float flightCross() {
     return larchEase(ELarchEase::Fade, static_cast<float>((flightTime() - kCrossAt) / 0.22));
 }
 
+static bool useChildWindow(const PHLWINDOW& window);
 static void syncWorld(const PHLMONITOR& mon, float dt) {
     g_binGlow = 1.0f; // applyTrash raises it this frame
     binCatchTick(dt);
@@ -3760,6 +3761,7 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
     }
 
     g_hudItems.clear();
+    std::vector<PHLWINDOW> freshChildren;
     for (const auto& info : INFOS) {
         if (std::ranges::any_of(g_gunShots, [&](const auto& s){ return s.charged && s.id == info.id; }))
             continue; // the frozen burning paper replaces the live surface
@@ -3876,6 +3878,7 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         }
         else {
             freshPose = true;
+            if (info.window) freshChildren.push_back(info.window);
             const auto& CAM = g_scene.camera();
             Vec3 FWD = CAM.forward();
 
@@ -4021,6 +4024,8 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
     const bool MENU_NEW = menu && menu != g_menuId;
     g_menuId = menu;
     g_world.setEntities(std::move(ENTITIES), false);
+    for (const auto& window : freshChildren)
+        if (useChildWindow(window)) break;
     updateShadows();
     if (MENU_NEW) {
         if (g_read.id && g_read.id != menu)
@@ -5234,6 +5239,8 @@ struct SUse {
     EKeyboardMode  mode{};      // to restore
     std::uintptr_t lockBefore = 0;
     bool           centre     = false; // to the middle once the surface has its size
+    struct Parent { PHLWINDOWREF window; Vector2D local; bool read, screen; };
+    std::vector<Parent> parents; // return through native modal dialogs
 };
 static SUse g_use;
 static bool usingWindow(std::uintptr_t id) { return id && g_use.id == id; }
@@ -5249,10 +5256,12 @@ static void useEnd() {
 }
 
 static void useWindow(const PHLWINDOW& window, Vector2D local) {
+    if (!g_use.id) {
+        g_use.mode = g_keyboardMode;
+        g_use.lockBefore = g_focusLockId;
+    }
     g_use.id         = Compat::windowId(window);
     g_use.local      = local;
-    g_use.mode       = g_keyboardMode;
-    g_use.lockBefore = g_focusLockId;
     if (Compat::focusedWindow() != window)
         Compat::focusWindow(window);
     g_focusLockId  = g_use.id;
@@ -5272,6 +5281,26 @@ static void useBegin() {
         return;
     }
     useWindow(TARGET.window, localFromHit(HIT));
+}
+
+static bool useChildWindow(const PHLWINDOW& window) {
+    const auto parent = Compat::findWindowById(g_use.id);
+    const auto* dialog = window ? g_world.find(Compat::windowId(window)) : nullptr;
+    if (!parent || !dialog || window->parent() != parent) return false;
+    const bool wasRead = g_read.id == g_use.id, wasScreen = g_read.screen;
+    if (g_read.id) {
+        auto saved = g_use;
+        endReading(true); // a screen ends its use mode as well
+        g_use = std::move(saved);
+    }
+    g_use.parents.push_back({parent,g_use.local,wasRead,wasScreen});
+    useWindow(window,{dialog->surfaceWidth*.5,dialog->surfaceHeight*.5});
+    g_use.centre = true;
+    // Use the existing reading view so a file chooser's minimum size cannot
+    // put its titlebar/buttons outside the view. Its parent is restored later.
+    toggleReading(false,Compat::windowId(window));
+    Compat::deliverMotion(window,g_use.local,inputTimeMs());
+    return true;
 }
 
 static void useMenu(std::uintptr_t id) {
@@ -5314,8 +5343,26 @@ static void useTick() {
         return;
     const auto* E = g_world.find(g_use.id);
     if (!E || !Compat::findWindowById(g_use.id) || E->logicalWidth <= 0 || E->logicalHeight <= 0) {
-        useEnd(); // it closed
+        while (!g_use.parents.empty()) {
+            const auto parent = g_use.parents.back();
+            g_use.parents.pop_back();
+            if (const auto window = parent.window.lock(); window && g_world.find(Compat::windowId(window))) {
+                useWindow(window, parent.local);
+                g_use.centre = false;
+                if (parent.read) toggleReading(false,Compat::windowId(window),parent.screen);
+                Compat::deliverMotion(window, g_use.local, inputTimeMs());
+                return;
+            }
+        }
+        useEnd(); // it and its parents closed
         return;
+    }
+    // A native modal blocks its parent. Keep typing/clicking usable without
+    // asking the user to leave F8, find the dialog, then enter F8 again.
+    for (const auto& window : Desktop::windowState()->windows()) {
+        // This Hyprland's isModal covers X11 only. Wayland transients are
+        // followed once when they appear (syncWorld's freshChildren).
+        if (window && window->m_isMapped && window->isModal() && useChildWindow(window)) return;
     }
     // It grows to its size over a few frames: the pointer keeps its middle
     // until the hand moves it.
@@ -9058,8 +9105,15 @@ static void onKeyboardKeyRoom(
         }
     }
 
-    // F3 toggles the debug HUD (collision wireframe + info overlay) in both
-    // keyboard modes: it never belongs to the focused window.
+    // At the desk the application owns its shortcuts (F3 find-next, F6
+    // address bar, F7 spelling/build, Escape cancel). Keep only the explicit
+    // room exit/screen controls and the room menu's own close key.
+    if (g_use.id && SYM != XKB_KEY_F8 &&
+        !(g_superHeld && (SYM == XKB_KEY_f || SYM == XKB_KEY_F)) &&
+        !(g_use.id == g_menuId && SYM == XKB_KEY_F1))
+        return;
+
+    // F3 toggles the debug HUD in the room's two keyboard modes.
     if (PRESSED && SYM == XKB_KEY_F3) {
         g_debugHud = !g_debugHud;
         g_scene.setMapDebugCollisions(g_debugHud);

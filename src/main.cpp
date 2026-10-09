@@ -2760,6 +2760,11 @@ static constexpr float kReadDistance = 1.0f;
 // window takes (F4's cinema, Super+F's screen).
 static void readingPose(const PHLMONITOR& mon, const CBox& BOX, float fill, Vec3& center,
                         float& yaw, float& pitch, float& scale) {
+    // The room menu asks for 1280x820. On a small display its 1:1 pose
+    // clipped both the header and the footer; contain the whole menu there.
+    if (fill <= 0.f && g_read.id == g_menuId &&
+        (BOX.w > mon->m_size.x * 0.9 || BOX.h > mon->m_size.y * 0.9))
+        fill = 0.9f;
     const auto& CAM = g_scene.camera();
     const Vec3  FWD = CAM.forward();
     const Vec3  RIGHT = CAM.right();

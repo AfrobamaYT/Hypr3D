@@ -9731,6 +9731,7 @@ static int luaConfig(lua_State* L) {
 static void resetRoom() {
     g_room = {};
     g_read = {};
+    g_menuId = 0; // an open menu must be brought to the new eye again
     g_trashed.clear();
     g_wallFit = 0.0f; // the wall is built afresh, sized for the camera then
     companionHalt("aborted", "The room was reset");

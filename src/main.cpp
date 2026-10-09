@@ -3669,6 +3669,7 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
     };
 
     std::unordered_map<std::uintptr_t, float> freshAngle;
+    std::unordered_map<std::uintptr_t, Vec3> freshOffset;
     if (!WALL) {
         std::vector<const Compat::SWindowInfo*> FRESH;
         for (const auto& info : INFOS)
@@ -3693,6 +3694,26 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
                 const float W = World3D::toWorld(f->monitorLocalBox.w) * WIN_SCALE;
                 freshAngle[f->id] = (along + W * 0.5f) / RADIUS;
                 along += W + GAP;
+            }
+        } else if (FRESH.size() == 1) {
+            // Opening windows one at a time used to put every one at the
+            // same point. Cascade them near the gaze on parallel planes;
+            // turning overlapping panels on an arc makes them intersect
+            // and can put a different window under the visible pixels.
+            const auto& CAM = g_scene.camera();
+            const Vec3 FWD = CAM.forward(), RIGHT = CAM.right();
+            const Vec3 UP = cross(RIGHT, FWD);
+            for (size_t slot = 0; slot <= g_world.entities().size(); ++slot) {
+                const Vec3 OFFSET = (RIGHT * 0.32f + UP * 0.20f - FWD * 0.07f) * static_cast<float>(slot);
+                const Vec3 AT = CAM.position + FWD * g_cfgSpawnDistance + OFFSET;
+                const bool TAKEN = std::ranges::any_of(g_world.entities(), [&](const auto& E) {
+                    const Vec3 D = E.center - AT;
+                    return Compat::findWindowById(E.id) && dot(D, D) < 0.04f;
+                });
+                if (!TAKEN) {
+                    freshOffset[FRESH.front()->id] = OFFSET;
+                    break;
+                }
             }
         }
     }
@@ -3846,6 +3867,8 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
                 }
 
                 entity.center = CAM.position + FWD * g_cfgSpawnDistance;
+                if (const auto OFFSET = freshOffset.find(info.id); OFFSET != freshOffset.end())
+                    entity.center = entity.center + OFFSET->second;
             }
 
             // Face the camera: with this model's convention (the normal's Y

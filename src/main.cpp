@@ -2698,6 +2698,11 @@ struct SHudItem {
     CBox           box; // monitor-local, logical px
 };
 static std::vector<SHudItem> g_hudItems;
+static bool hudLayer(const PHLLS& layer) {
+    // Some rices put Waybar on the bottom layer so ordinary windows cover
+    // it in 2D. It is still the bar when "in view" is chosen in the room.
+    return g_cfgHud && layer && (layer->m_layer >= 2 || layer->m_namespace == "waybar");
+}
 
 // The room's menu (config menu = { command, title }): F1 runs the command,
 // and the window with this title comes to the eye when it opens.
@@ -3427,7 +3432,7 @@ static void flightBegin(const std::vector<Compat::SWindowInfo>& infos) {
     std::vector<const Compat::SWindowInfo*> mine;
     bool ready = backdropQuad(g_monitor).texture != 0;
     for (const auto& I : infos) {
-        if (I.monitor != g_monitor || (I.isLayer && g_cfgHud && I.layer && I.layer->m_layer >= 2))
+        if (I.monitor != g_monitor || (I.isLayer && hudLayer(I.layer)))
             continue;
         const auto* SNAP = g_capture.get(I.id);
         ready = ready && SNAP && (SNAP->texID || SNAP->bigTex);
@@ -3735,7 +3740,7 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
 
     g_hudItems.clear();
     for (const auto& info : INFOS) {
-        if (g_cfgHud && info.isLayer && info.layer && info.layer->m_layer >= 2) {
+        if (info.isLayer && hudLayer(info.layer)) {
             g_hudItems.push_back({info.id, info.monitor, info.monitorLocalBox});
             continue;
         }

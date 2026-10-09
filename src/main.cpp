@@ -3852,6 +3852,7 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         // Seed pose: existing entities own their world position and rotation.
         // NEW windows spawn straight in front of the camera at a fixed read
         // distance, facing it.
+        bool freshPose = false;
         if (const auto* EXISTING = g_world.find(info.id)) {
             entity.center = EXISTING->center;
             entity.yaw = EXISTING->yaw;
@@ -3865,6 +3866,7 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
             entity.roll   = MEM->roll;
         }
         else {
+            freshPose = true;
             const auto& CAM = g_scene.camera();
             Vec3 FWD = CAM.forward();
 
@@ -3927,6 +3929,19 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         // on every resize.
         entity.width  = World3D::toWorld(BOX.w) * entity.spawnScale;
         entity.height = World3D::toWorld(BOX.h) * entity.spawnScale;
+
+        // Looking down at spawn put the bottom of ordinary desktop windows
+        // through the floor: controls were hidden behind the grid. Fresh
+        // arc windows have no roll; lift their lowest corner above the floor.
+        // Saved/carried poses and the fitted multi-monitor wall stay owned
+        // by their existing placement paths.
+        if (freshPose && info.window && !WALL) {
+            const float halfY = std::abs(std::cos(entity.pitch)) * entity.height * 0.5f;
+            float floorY = 0.f;
+            const float fromY = std::max(g_scene.camera().position.y, entity.center.y + halfY + 0.05f);
+            if (floorBelow(entity.center.x, fromY, entity.center.z, floorY))
+                entity.center.y = std::max(entity.center.y, floorY + halfY + 0.05f);
+        }
 
         if (g_read.id == info.id)
             applyReading(mon, BOX, entity);

@@ -169,9 +169,11 @@ void CLaserGun::draw(const Mat4& worldVP,int width,int height,const State& s) {
     const float age=s.shotAge;
     const float recoil=age>=0.f && age<0.24f ? std::sin(std::min(age/0.045f,1.f)*PI*0.5f)*std::exp(-age*16.f) : 0.f;
     const float lift=1.f-s.raised;
-    Vec3 pos{0.24f,-0.14f-lift*0.32f,-0.48f+recoil*0.04f};
+    const float aspect=float(width)/height;
+    const float fit=std::min(1.f,aspect/(4.f/3.f)); // portrait/square desktop outputs
+    Vec3 pos{0.24f*fit,-0.14f-(1.f-fit)*0.08f-lift*0.32f,-0.48f+recoil*0.04f};
     Vec3 rot{8.f+recoil*14.f,18.f,-7.f};
-    const float scale=0.32f;
+    const float scale=0.32f*fit;
     const Mat4 model=Mat4::translation(pos)*Mat4::rotationY(rot.y*PI/180.f)*Mat4::rotationX(rot.x*PI/180.f)*Mat4::rotationZ(rot.z*PI/180.f)*Mat4::scale({scale,scale,scale});
     const Mat4 vp=Mat4::perspective(60.f*PI/180.f,float(width)/height,0.02f,20.f);
     // A separate depth pass keeps the tool out of room walls and windows.
@@ -181,8 +183,8 @@ void CLaserGun::draw(const Mat4& worldVP,int width,int height,const State& s) {
     glEnable(GL_BLEND);glBlendFuncSeparate(GL_SRC_ALPHA,GL_ONE,GL_ZERO,GL_ONE);glDisable(GL_DEPTH_TEST);glDepthMask(GL_FALSE);
     const Vec3 energy=s.charged ? Vec3{1.f,0.3f,0.06f} : Vec3{0.1f,0.8f,1.f};
     if(s.charge>0.f){
-        glow(vp,muzzle,0.055f+0.09f*s.charge,energy,0.8f);
-        glow(vp,muzzle,0.025f+0.035f*s.charge,{1,1,1},s.charge);
+        glow(vp,muzzle,(0.055f+0.09f*s.charge)*fit,energy,0.8f);
+        glow(vp,muzzle,(0.025f+0.035f*s.charge)*fit,{1,1,1},s.charge);
     }
     const float shotLength=s.charged ? 0.32f : 0.18f;
     if(age>=0.f && age<shotLength){
@@ -194,10 +196,10 @@ void CLaserGun::draw(const Mat4& worldVP,int width,int height,const State& s) {
             const float depth=3.f,t=std::tan(30.f*PI/180.f);
             const Vec3 end{x*depth*t*float(width)/height,y*depth*t,-depth};
             const float fade=1.f-age/shotLength;
-            ribbon(vp,muzzle,end,s.charged?0.075f:0.028f,energy,fade);
-            ribbon(vp,muzzle,end,s.charged?0.023f:0.009f,{1,1,1},fade);
-            glow(vp,muzzle,0.18f,energy,fade);
-            glow(vp,end,0.45f,energy,fade);
+            ribbon(vp,muzzle,end,(s.charged?0.075f:0.028f)*fit,energy,fade);
+            ribbon(vp,muzzle,end,(s.charged?0.023f:0.009f)*fit,{1,1,1},fade);
+            glow(vp,muzzle,0.18f*fit,energy,fade);
+            glow(vp,end,0.45f*fit,energy,fade);
         }
     }
     glDepthMask(GL_TRUE);glEnable(GL_DEPTH_TEST);

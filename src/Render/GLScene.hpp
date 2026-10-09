@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Render/MapModel.hpp"
+#include "Render/LaserGun.hpp"
 #include "Render/Overlay.hpp"
 #include "Render/PlayerModel.hpp"
 #include "World/Camera.hpp"
@@ -62,6 +63,9 @@ class GLScene {
         // axis. Drawn as a creased mesh instead of the quad (drawCrumpled).
         float crumple = 0.0f;
         float spin    = 0.0f;
+        // A held snapshot after a charged shot, independent of its client.
+        float burn = -1.f;
+        Vec2 burnOrigin{0.5f,0.5f};
     };
 
     // Where one monitor looks through the view plane, in tangents of the view
@@ -75,6 +79,10 @@ class GLScene {
     };
 
     GLScene();
+    void setGun(const CLaserGun::State& state) { m_gunState = state; }
+    bool gunPending() const { return m_gun.pending(); }
+    bool gunLoaded() const { return m_gun.loaded(); }
+    const std::string& gunError() const { return m_gun.error(); }
 
     // Draws into `targetFBO` and composites the result over whatever is
     // already there with `alpha`, so the 2D desktop underneath fades out
@@ -557,6 +565,8 @@ class GLScene {
     std::vector<SceneTarget> m_otherSceneTargets;
 
     unsigned int m_sceneProgram = 0;
+    CLaserGun m_gun;
+    CLaserGun::State m_gunState{};
     unsigned int m_blitProgram = 0;
     unsigned int m_panoramaProgram = 0;
 

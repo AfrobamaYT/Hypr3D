@@ -605,7 +605,7 @@ namespace Overlay {
     SImage paintGunPill(float scale) {
         const double s = std::max(0.5f, scale);
         SText        name  = text("Process gun", 800, 16, TEXT, s);
-        SText        note  = text("click closes · hold 1 s kills", 600, 15, SUB, s);
+        SText        note  = text("click closes window · hold 1 s ends process", 600, 15, SUB, s);
         SText        cap   = text("F7", CAP.weight, CAP.px, CODE, s);
         SText        hint  = text("Put away", 700, 15, HINT, s);
         const double CAPW  = capWidth(cap, CAP, s);

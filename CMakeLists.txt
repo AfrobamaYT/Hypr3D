@@ -78,6 +78,15 @@ endif()
 
 find_package(PkgConfig REQUIRED)
 
+# Keep the viewmodel inside the standalone plugin, including hyprpm builds.
+# CMake reads the GLB; regeneration needs neither Python nor an asset tool.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/Assets/laser-pistol.glb")
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/src/Assets/laser-pistol.glb" LASER_HEX HEX)
+string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," LASER_BYTES "${LASER_HEX}")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/LaserPistol.hpp"
+    "#pragma once\n#include <cstdint>\nnamespace H3D { inline constexpr std::uint8_t kLaserPistol[] = {${LASER_BYTES}}; }\n")
+
 # --- Jolt Physics: rigid body simulation for scene objects ------------------
 # Included directly via Jolt/Jolt.cmake (the source list + the Jolt target),
 # bypassing Jolt's top-level app build. Directory-scope link_libraries keeps
@@ -116,6 +125,7 @@ pkg_check_modules(PANGOCAIRO REQUIRED IMPORTED_TARGET pangocairo cairo)
 add_library(hypr3d SHARED
     src/main.cpp
     src/Render/GLScene.cpp
+    src/Render/LaserGun.cpp
     src/Render/Overlay.cpp
     src/Render/MapModel.cpp
     src/Render/PlayerModel.cpp
@@ -138,6 +148,7 @@ target_include_directories(hypr3d
         "${HYPRLAND_SRC}"
         "${HYPRLAND_PROTOCOLS_INCLUDE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${CMAKE_CURRENT_BINARY_DIR}"
 )
 
 target_link_libraries(hypr3d PRIVATE

@@ -322,11 +322,14 @@ void decodeImage(const std::string& modelDir, const cgltf_image* image, int& w,
 } // namespace
 
 std::unique_ptr<CMapModel::SDecoded>
-CMapModel::decode(const std::string& path, std::stop_token stop) {
+CMapModel::decode(const std::string& path, std::stop_token stop,
+                  std::span<const uint8_t> embedded) {
     cgltf_options options{};
     cgltf_data*   raw = nullptr;
 
-    if (cgltf_parse_file(&options, path.c_str(), &raw) != cgltf_result_success)
+    const auto parsed = embedded.empty() ? cgltf_parse_file(&options, path.c_str(), &raw)
+        : cgltf_parse(&options, embedded.data(), embedded.size(), &raw);
+    if (parsed != cgltf_result_success)
         return nullptr;
 
     const std::unique_ptr<cgltf_data, decltype(&cgltf_free)> data{raw, cgltf_free};
@@ -558,7 +561,8 @@ void CMapModel::stopWorker() {
 }
 
 bool CMapModel::load(const std::string& path, const Vec3& position,
-                     const Vec3& rotationDeg, const Vec3& scale) {
+                     const Vec3& rotationDeg, const Vec3& scale,
+                     std::span<const uint8_t> embedded) {
     // A load still decoding is dropped; its thread stops at the next node.
     // One still uploading its textures is dropped as well.
     stopWorker();
@@ -574,10 +578,10 @@ bool CMapModel::load(const std::string& path, const Vec3& position,
     m_path   = path;
     m_failed = false;
 
-    m_worker = std::jthread([this, path](std::stop_token stop) {
+    m_worker = std::jthread([this, path, embedded](std::stop_token stop) {
         // An exception leaving this thread would terminate Hyprland.
         try {
-            m_decoded = decode(path, stop);
+            m_decoded = decode(path, stop, embedded);
         } catch (...) {
             m_decoded.reset();
         }

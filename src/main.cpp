@@ -31,6 +31,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <wayland-server-core.h>
 #include <unistd.h>
 #include <hyprland/src/Compositor.hpp>
@@ -3067,28 +3068,47 @@ static std::string g_binClosedName;
 static double      g_binClosedAt = -10.0;
 
 // The process gun (F7) -- "360 noscope discord when it freezes", four people
-// in the Reddit finds. Aim at a window and shoot: a left click asks it to
-// close, as Super+Q asks, and it jolts back where it was hit; hold the button
+// in the Reddit finds. Press to charge; release before the threshold to ask
+// the window to close, as Super+Q asks, with a laser and recoil. Hold the button
 // kGunKillSeconds and its process is killed (SIGKILL), as Hyprland's
-// forcekillactive does -- for a program that hangs, which Hyprland's own
-// check (CANRManager) marks: the ring around the crosshair fills red. A
+// forcekillactive does. Its retained window image burns from the hit point,
+// even when the client stops drawing or is already gone. A
 // program asked to close may still ask to save; only the held kill does not
 // ask. F7 again or Escape puts it away; while it is out, the left button does
 // not reach the windows.
 static bool g_gun = false;
+static bool g_gunTriggerDown = false; // a kept press owns its release, even after F7/F1
+static double g_gunChangedAt = -100.0;
 struct SGunShot {
     std::uintptr_t id = 0;
     std::chrono::steady_clock::time_point at;
     Vec3 push{}; // the shot's direction
+    Vec3 hit{};
+    bool charged = false;
+    std::optional<Compat::CWindowCapture::SSnapshot> held;
+    GLScene::WindowRender paper;
 };
 static std::vector<SGunShot> g_gunShots; // windows still jolting back
 struct SGunHold {
     bool           active = false;
     std::uintptr_t id = 0;
     std::chrono::steady_clock::time_point since;
+    PHLWINDOWREF window;
+    std::shared_ptr<int> process; // pidfd: never signal a reused numeric PID
+    Vec3 hit{};
+    Vec2 uv{0.5f,0.5f};
 };
 static SGunHold        g_gunHold;
+static std::vector<uint64_t> g_gunActions;
 static void            gunTick(); // with the trigger, by onMouseButton
+static void            gunRelease();
+static void clearGunEffects() {
+    g_gunHold = {};
+    for (auto& shot : g_gunShots)
+        if (shot.held) g_capture.releaseHeld(*shot.held);
+    g_gunShots.clear();
+    g_scene.setGun({});
+}
 static void            overlayTick(); // the crosshair overlay, every frame
 
 // The crosshair overlay (Overlay::, the owner's approved draft "Room
@@ -3132,6 +3152,7 @@ static SAimOverlay g_aimOverlay;
 static constexpr float kGunKillSeconds  = 1.0f;
 static constexpr float kGunJoltSeconds  = 0.3f;
 static constexpr float kGunJolt         = 0.25f; // m back at the hit
+static constexpr float kGunBurnSeconds  = 0.9f;
 
 // A window hit a moment ago is pushed back along the shot and springs home.
 static void applyGunJolt(std::uintptr_t id, World3D::SEntity& E) {
@@ -3740,6 +3761,8 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
 
     g_hudItems.clear();
     for (const auto& info : INFOS) {
+        if (std::ranges::any_of(g_gunShots, [&](const auto& s){ return s.charged && s.id == info.id; }))
+            continue; // the frozen burning paper replaces the live surface
         if (info.isLayer && hudLayer(info.layer)) {
             g_hudItems.push_back({info.id, info.monitor, info.monitorLocalBox});
             continue;
@@ -4141,6 +4164,15 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
                 g_renderWindows.push_back(old);
             }
         }
+    }
+
+    // Held texture and pose survive the application's death until the paper
+    // is gone. These decorative quads never enter the pickable world.
+    for (const auto& shot : g_gunShots) {
+        if (!shot.charged || !shot.held) continue;
+        auto paper = shot.paper;
+        paper.burn = std::clamp(std::chrono::duration<float>(std::chrono::steady_clock::now()-shot.at).count()/kGunBurnSeconds,0.f,1.f);
+        g_renderWindows.push_back(paper);
     }
 
     // The bin's halo (see g_binGlow): above 1 it shows.
@@ -5411,6 +5443,7 @@ static void rememberRoom() {
 }
 
 static void deactivate3D() {
+    clearGunEffects();
     g_flight = {};
     g_portalRun.phase = SPortalRun::EPhase::None;
     g_scene.setPortalDive({});
@@ -5661,6 +5694,7 @@ static void useEnd();
 
 static void flightLeave();
 static void close3D() {
+    g_gunHold = {}; // leaving cancels a charge before the exit animation
     useEnd();
     if (g_transitionTarget > 0.5f)
         flightLeave();
@@ -6949,7 +6983,9 @@ static void dumpStatus(bool force = false) {
         out << "flight: active=" << (g_flight.active ? 1 : 0) << " leaving=" << (g_flight.leaving ? 1 : 0)
             << " t=" << flightTime() << " count=" << g_flight.count << " backdrop=" << backdropQuad(g_monitor).texture
             << " transition=" << g_transition << "\n";
-        out << "gun: out=" << (g_gun ? 1 : 0) << " holding=" << g_gunHold.id << " shots=" << g_gunShots.size() << "\n";
+        out << "gun: out=" << (g_gun ? 1 : 0) << " holding=" << g_gunHold.id << " shots=" << g_gunShots.size()
+            << " model=" << (g_scene.gunLoaded() ? "ready" : g_scene.gunPending() ? "pending" : "off")
+            << " error=" << g_scene.gunError() << "\n";
         out << "read: id=" << g_read.id << " menu=" << g_menuId << " arrived=" << (g_read.arrived ? 1 : 0)
             << " dim=" << g_read.dim << " screen=" << (g_read.screen ? 1 : 0) << " back=" << (g_read.back ? 1 : 0)
             << " shown=" << g_scene.featuredDim() << "/" << g_scene.featuredBlur()
@@ -7140,6 +7176,7 @@ static bool runsOnTime() {
         || g_resizeView.phase != SResizeView::EPhase::None
         || (g_resizeHover.id && g_resizeHover.alpha > 0.0f && g_resizeHover.alpha < 1.0f)
         || !g_gunShots.empty() || g_gunHold.active
+        || (g_gun && (nowSeconds()-g_gunChangedAt < 0.25 || g_scene.gunPending()))
         || headBusy()
         || g_transition != g_transitionTarget
         || g_fsPhase == EFullscreenPhase::To2D || g_fsPhase == EFullscreenPhase::To3D;
@@ -7502,49 +7539,128 @@ static PHLWINDOW gunTarget() {
     return nullptr;
 }
 
-// The process gun's trigger (g_gun): the window under the crosshair is shot.
-static void gunFire() {
-    const auto WINDOW = gunTarget();
-    if (!WINDOW)
-        return; // a layer or the void: nothing to shoot
-    const auto ID  = Compat::windowId(WINDOW);
-    const auto NOW = std::chrono::steady_clock::now();
-    std::erase_if(g_gunShots, [&](const SGunShot& S) { return S.id == ID; });
-    g_gunShots.push_back({ID, NOW, g_scene.camera().centerRay()});
-    g_gunHold = {true, ID, NOW};
-    if (g_pEventLoopManager)
-        g_pEventLoopManager->doLater([ID] {
-            if (const auto W = Compat::findWindowById(ID))
-                W->sendClose();
-        });
+static int gunProcessWindows(const PHLWINDOW& target) {
+    int count = 0;
+    for (const auto& window : Desktop::windowState()->windows())
+        if (window && window->m_isMapped && window->getPID() == target->getPID())
+            ++count;
+    return count;
 }
 
-// Every frame: shots that are done, and the kill being held -- dropped if
-// the crosshair left the window, carried out when held long enough.
-static void gunTick() {
-    const auto NOW = std::chrono::steady_clock::now();
-    std::erase_if(g_gunShots, [&](const SGunShot& S) {
-        return std::chrono::duration<float>(NOW - S.at).count() >= kGunJoltSeconds;
-    });
-    if (g_gun && g_gunHold.active) {
-        const auto WINDOW = gunTarget();
-        if (!WINDOW || Compat::windowId(WINDOW) != g_gunHold.id)
-            g_gunHold = {};
-        else {
-            if (std::chrono::duration<float>(NOW - g_gunHold.since).count() >= kGunKillSeconds) {
-                const auto ID = g_gunHold.id;
-                g_gunHold = {};
-                if (g_pEventLoopManager)
-                    g_pEventLoopManager->doLater([ID] {
-                        const auto W = Compat::findWindowById(ID);
-                        const pid_t PID = W ? W->getPID() : 0;
-                        if (PID > 1 && PID != getpid()) {
-                            ::kill(PID, SIGKILL);
-                            notify("[hypr3d] killed " + W->m_title, CHyprColor{1.0f, 0.3f, 0.2f, 1.0f});
-                        }
-                    });
+// The process gun's trigger (g_gun): the window under the crosshair is shot.
+static void gunFire() {
+    g_gunTriggerDown = true;
+    g_gunHold = {};
+    const auto W = gunTarget();
+    g_gunHold.active = true;
+    g_gunHold.since = std::chrono::steady_clock::now();
+    g_gunHold.hit = g_scene.camera().position + g_scene.camera().centerRay()*12.f;
+    if (!W) return; // a miss never acts on a later target
+    g_gunHold.id = Compat::windowId(W);
+    g_gunHold.window = W;
+    for (const auto& hit : g_world.pickAll(g_scene.camera().position,g_scene.camera().centerRay()))
+        if (hit.id == g_gunHold.id) {
+            g_gunHold.hit = hit.point;
+            g_gunHold.uv = {hit.u,1.f-hit.v};
+            break;
+        }
+    const pid_t pid = W->getPID();
+    if (pid > 1 && pid != getpid()) {
+        const int fd = static_cast<int>(::syscall(SYS_pidfd_open,pid,0));
+        if (fd >= 0)
+            g_gunHold.process = std::shared_ptr<int>(new int(fd),[](int* p){::close(*p);delete p;});
+    }
+}
+
+static void gunShoot(bool charged) {
+    const auto hold = g_gunHold;
+    g_gunHold = {};
+    if (!hold.active || !g_gun || g_use.id || !ownsInput() || g_transitionTarget < 0.5f) return;
+    const auto W = hold.window.lock();
+    if (hold.id && (!W || Compat::findWindowById(hold.id) != W || gunTarget() != W)) return;
+    SGunShot shot;
+    shot.id = hold.id; shot.at = std::chrono::steady_clock::now();
+    shot.push = g_scene.camera().centerRay(); shot.hit = hold.hit;
+    shot.charged = charged;
+    if (charged && W) {
+        if (!hold.process) {
+            notify("[hypr3d] the process could not be held; charged shot cancelled",CHyprColor{1.f,.3f,.2f,1.f});
+            return;
+        }
+        const auto* E = g_world.find(hold.id);
+        const auto R = std::ranges::find_if(g_renderWindows,[&](const auto& r){return r.id==hold.id;});
+        if (!E || R == g_renderWindows.end() || !(shot.held=g_capture.hold(hold.id))) {
+            notify("[hypr3d] no window image to burn; charged shot cancelled",CHyprColor{1.f,.3f,.2f,1.f});
+            return;
+        }
+        shot.paper = *R;
+        const auto& snap = *shot.held;
+        shot.paper.texture = snap.bigTex ? snap.bigTex : snap.texID;
+        shot.paper.width = E->width * snap.sampledBox.w/std::max(E->logicalWidth,1.f);
+        shot.paper.height = E->height * snap.sampledBox.h/std::max(E->logicalHeight,1.f);
+        shot.paper.u0=snap.sampledBox.x/snap.texSpan.x;
+        shot.paper.u1=(snap.sampledBox.x+snap.sampledBox.w)/snap.texSpan.x;
+        shot.paper.v0=(snap.sampledBox.y+snap.sampledBox.h)/snap.texSpan.y;
+        shot.paper.v1=snap.sampledBox.y/snap.texSpan.y;
+        shot.paper.burnOrigin=hold.uv;shot.paper.depth=0.f;shot.paper.crumple=0.f;
+    }
+    g_gunShots.push_back(std::move(shot));
+    if (!W || !g_pEventLoopManager) return;
+    const PHLWINDOWREF weak = W;
+    const auto process = hold.process;
+    const auto id = hold.id;
+    const auto token = std::make_shared<uint64_t>(0);
+    *token = g_pEventLoopManager->doLater([weak,process,id,charged,token] {
+        std::erase(g_gunActions,*token);
+        const auto window = weak.lock();
+        if (!window || Compat::findWindowById(id)!=window || sessionLocked()) return;
+        if (!charged) { window->sendClose(); return; }
+        if (::syscall(SYS_pidfd_send_signal,*process,SIGKILL,nullptr,0)!=0) {
+            notify(std::string("[hypr3d] could not end the process: ")+std::strerror(errno),CHyprColor{1.f,.3f,.2f,1.f});
+            for (auto& s : g_gunShots) if(s.id==id && s.charged){
+                if(s.held)g_capture.releaseHeld(*s.held);
+                s.held.reset();s.charged=false;
             }
         }
+    });
+    g_gunActions.push_back(*token);
+}
+
+static void gunRelease() {
+    g_gunTriggerDown = false;
+    if (ownsInput() && !g_use.id) gunShoot(false);
+    else g_gunHold = {};
+}
+
+// Every frame: a charged shot retains its paper until the burn is complete.
+static void gunTick() {
+    const auto now = std::chrono::steady_clock::now();
+    std::erase_if(g_gunShots,[&](SGunShot& s){
+        const bool done=std::chrono::duration<float>(now-s.at).count() >= (s.charged?kGunBurnSeconds:kGunJoltSeconds);
+        if(done && s.held)g_capture.releaseHeld(*s.held);
+        return done;
+    });
+    if(g_gunHold.active){
+        const auto W=gunTarget();
+        if(!g_gun || g_use.id || !ownsInput() || g_transitionTarget < 0.5f ||
+            (g_gunHold.id ? W!=g_gunHold.window.lock() : bool(W)))
+            g_gunHold = {};
+        else if(std::chrono::duration<float>(now-g_gunHold.since).count()>=kGunKillSeconds)
+            gunShoot(true);
+    }
+    CLaserGun::State visual;
+    if(g_gun && !g_use.id && g_fsPhase==EFullscreenPhase::None){
+        visual.raised=larchEase(ELarchEase::Move,static_cast<float>((nowSeconds()-g_gunChangedAt)/.2));
+        if(g_gunHold.active)visual.charge=std::clamp(std::chrono::duration<float>(now-g_gunHold.since).count()/kGunKillSeconds,0.f,1.f);
+        if(!g_gunShots.empty()){
+            const auto& s=g_gunShots.back();visual.shotAge=std::chrono::duration<float>(now-s.at).count();
+            visual.charged=s.charged;visual.target=s.hit;
+        }
+    }
+    g_scene.setGun(visual);
+    static std::string reported;
+    if(!g_scene.gunError().empty() && reported!=g_scene.gunError()){
+        reported=g_scene.gunError();dumpErrorNow(reported);notify(reported,CHyprColor{1.f,.3f,.2f,1.f});
     }
 }
 
@@ -7902,16 +8018,18 @@ static std::vector<GLScene::SOverlaySprite> aimTick(float SCALE) {
             charge = std::chrono::duration<float>(std::chrono::steady_clock::now() - g_gunHold.since).count() / kGunKillSeconds;
         if (const auto WINDOW = gunTarget()) {
             const auto ID = Compat::windowId(WINDOW);
+            const auto count = gunProcessWindows(WINDOW);
+            const auto affected = count > 1 ? " · " + std::to_string(count) + " windows" : "";
             if (g_gunHold.active && g_gunHold.id == ID && charge > 0.0f) {
                 mark    = EMark::GunHold;
                 target  = "gunhold:" + std::to_string(ID);
-                label   = Overlay::SLabel{EStyle::Alert, "Killing " + windowName(WINDOW), "Let go now to only close it", {}, 6.0f};
+                label   = Overlay::SLabel{EStyle::Alert, "Charging · " + windowName(WINDOW), "Release to close · hold to end the process" + affected, {}, 6.0f};
                 labelDy = 32.0f, wait = false;
             } else {
                 mark   = EMark::Gun;
                 target = "gun:" + std::to_string(ID);
-                label  = Overlay::SLabel{EStyle::Full, windowName(WINDOW), "process " + std::to_string(WINDOW->getPID()),
-                                         {{{"Click"}, "Close"}, {{"Hold 1 s"}, "Kill"}}};
+                label  = Overlay::SLabel{EStyle::Full, windowName(WINDOW), "process " + std::to_string(WINDOW->getPID()) + affected,
+                                         {{{"Click"}, "Close window"}, {{"Hold 1 s"}, "End process"}}};
             }
         } else {
             mark      = EMark::GunIdle;
@@ -8452,6 +8570,9 @@ static void onMouseButton(
     IPointer::SButtonEvent event,
     Event::SCallbackInfo& info
 ) {
+    if(event.button==BTN_LEFT && event.state==WL_POINTER_BUTTON_STATE_RELEASED && g_gunTriggerDown){
+        gunRelease();info.cancelled=true;damageCurrentMonitor();return;
+    }
     if (!ownsInput())
         return;
     damageCurrentMonitor(); // a still room draws again (roomStill)
@@ -8957,7 +9078,10 @@ static void onKeyboardKeyRoom(
 
     // F7: the process gun out, or away (g_gun); Escape puts it away too.
     if (PRESSED && (SYM == XKB_KEY_F7 || (g_gun && SYM == XKB_KEY_Escape))) {
+        cancelResize();
+        resetPointerGesture();
         g_gun     = SYM == XKB_KEY_F7 ? !g_gun : false;
+        g_gunChangedAt = nowSeconds();
         g_gunHold = {};
         info.cancelled = true;
         return;
@@ -10486,6 +10610,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
+    if(g_pEventLoopManager)
+        for(const auto token : g_gunActions)g_pEventLoopManager->removeDoLater(token);
+    g_gunActions.clear();
     // Hyprland keeps the last frame's pass elements until the next
     // beginRender() clears them -- ours included. After dlclose() that clear()
     // ran the destructor of a CHypr3DPassElement whose code was gone: unloading
@@ -10555,6 +10682,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
 
     if (Render::GL::g_pHyprOpenGL) {
         Render::GL::g_pHyprOpenGL->makeEGLCurrent();
+        clearGunEffects();
         g_scene.shutdown();
     }
 }

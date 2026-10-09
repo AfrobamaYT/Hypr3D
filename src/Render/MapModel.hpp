@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <stop_token>
 #include <string>
 #include <thread>
@@ -34,8 +35,10 @@ class CMapModel {
     // decoding the file on a worker thread; poll() makes the GL objects once
     // that is done. mtime is NOT checked here -- the caller decides when the
     // file changed.
+    // Embedded GLB bytes must outlive the worker (the built-in model is static).
     bool load(const std::string& path, const Vec3& position,
-              const Vec3& rotationDeg, const Vec3& scale);
+              const Vec3& rotationDeg, const Vec3& scale,
+              std::span<const uint8_t> embedded = {});
     // Finishes a load whose worker is done. Every frame, context current.
     void poll();
     void destroy();
@@ -160,7 +163,8 @@ class CMapModel {
     // The file's meshes and images, read and decoded without GL.
     struct SDecoded;
     static std::unique_ptr<SDecoded> decode(const std::string& path,
-                                            std::stop_token stop);
+                                            std::stop_token stop,
+                                            std::span<const uint8_t> embedded = {});
     void finishUpload();
     void dropUpload();
     void releaseMesh();

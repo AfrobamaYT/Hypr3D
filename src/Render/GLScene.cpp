@@ -1611,6 +1611,13 @@ void GLScene::drawWindows(
         if (window.width <= 0.0f || window.height <= 0.0f)
             continue;
 
+        if (window.burn >= 0.f) {
+            m_gun.drawPaper(vp, {window.texture,{window.x,window.y,window.z},
+                window.width,window.height,window.yaw,window.pitch,window.roll,
+                window.u0,window.v0,window.u1,window.v1,window.burn,window.burnOrigin});
+            continue;
+        }
+
         // Crumpled: an opaque creased mesh, written to depth before the
         // translucent windows are blended over and behind it.
         if (window.crumple > 0.001f) {
@@ -3310,6 +3317,8 @@ bool GLScene::render(
         refreshPlayer();
     drawRoom(vp, VIEW, windows, dt, primary, false);
     if (primary)
+        m_gun.draw(vp, width, height, m_gunState);
+    if (primary)
         m_lastVP = vp;
 
     // Read back one pixel of the offscreen scene while it is still bound. A
@@ -3502,6 +3511,8 @@ void GLScene::shutdown() {
 }
 
 void GLScene::destroyGLObjects() {
+    m_gun.shutdown();
+    m_gunState = {};
     for (auto& P : m_portals)
         if (P.tex) {
             glDeleteTextures(1, &P.tex);

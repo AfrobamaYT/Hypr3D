@@ -209,8 +209,17 @@ rested on a window, an object with a `label` or a portal for 120 ms, a label
 under it names it and the keys that work there; after 2 s it folds to the
 name. Carrying a window over the waste bin, the ring turns red and the label
 says that letting go closes it. With the process gun (F7) the mark is a red
-cross, the label adds the process number, and a pill at the top says the gun
-is out.
+cross, the label adds the process number and the number of windows sharing
+that process, and a pill at the top says the gun is out. The built-in laser
+pistol includes its texture; it needs no external model path. A short click
+fires on release and asks the target window to close normally (including a
+save prompt if the application needs one). Hold for one second to charge a
+shot that ends its process; the last window image burns from the impact point
+with a glowing edge, curled paper and drifting ash. This also works on a
+frozen application. The other windows of that process close as well.
+Putting the gun away with F7 or Escape, leaving the room, entering window-use
+mode or aiming away before the charge completes cancels the shot. A press on
+empty space never closes a window that appears later under the crosshair.
 
 A window in use -- Super+F's screen, the F1 menu, F8 -- shows Larch's arrow
 where its pointer is. A blue ring shows where it is when the window comes in

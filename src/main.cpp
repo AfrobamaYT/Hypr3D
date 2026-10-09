@@ -123,6 +123,8 @@ struct SRememberedPose {
     PHLLSREF     layer;
     Vec3         center{};
     float        yaw = 0.0f, pitch = 0.0f, roll = 0.0f;
+    Vec2         surfaceSize{};
+    float        scale = 1.f;
 };
 struct SRoomMemory {
     bool  valid = false;
@@ -3854,7 +3856,7 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         // Seed pose: existing entities own their world position and rotation.
         // NEW windows spawn straight in front of the camera at a fixed read
         // distance, facing it.
-        bool freshPose = false;
+        bool fitFloor = false;
         if (const auto* EXISTING = g_world.find(info.id)) {
             entity.center = EXISTING->center;
             entity.yaw = EXISTING->yaw;
@@ -3875,9 +3877,11 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
             entity.yaw    = MEM->yaw;
             entity.pitch  = MEM->pitch;
             entity.roll   = MEM->roll;
+            fitFloor = MEM->surfaceSize.x > 0.f &&
+                (MEM->surfaceSize.x != entity.surfaceWidth || MEM->surfaceSize.y != entity.surfaceHeight || MEM->scale != entity.spawnScale);
         }
         else {
-            freshPose = true;
+            fitFloor = true;
             if (info.window) freshChildren.push_back(info.window);
             const auto& CAM = g_scene.camera();
             Vec3 FWD = CAM.forward();
@@ -3944,17 +3948,19 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
 
         // Looking down at spawn put the bottom of ordinary desktop windows
         // through the floor: controls were hidden behind the grid. Fresh
-        // arc windows have no roll; lift the client's lower edge above the floor.
-        // Saved/carried poses and the fitted multi-monitor wall stay owned
-        // by their existing placement paths.
-        if (freshPose && info.window && !WALL) {
+        // Lift new windows and remembered windows whose 2D size changed.
+        // Unchanged saved/carried poses and the fitted wall keep their places.
+        if (fitFloor && info.window && !WALL) {
             const float k = World3D::toWorld(1.f) * entity.spawnScale;
             // Popup extents can grow below the client. They are overlays;
             // placing them must not lift the parent out of the user's view.
-            const float bottomOffset = std::cos(entity.pitch) * k *
-                (entity.logicalHeight*.5f-entity.surfaceOffsetY-entity.surfaceHeight);
+            const Mat4 rotation = Mat4::rotationY(entity.yaw) * Mat4::rotationX(entity.pitch) * Mat4::rotationZ(entity.roll);
+            const float rootX = entity.surfaceOffsetX + entity.surfaceWidth*.5f - entity.logicalWidth*.5f;
+            const float rootY = entity.logicalHeight*.5f - entity.surfaceOffsetY - entity.surfaceHeight*.5f;
+            const float bottomOffset = k * (rotation.m[1]*rootX + rotation.m[5]*rootY -
+                std::abs(rotation.m[1])*entity.surfaceWidth*.5f - std::abs(rotation.m[5])*entity.surfaceHeight*.5f);
             float floorY = 0.f;
-            const float fromY = std::max(g_scene.camera().position.y, entity.center.y + entity.height*.5f + 0.05f);
+            const float fromY = std::max(g_scene.camera().position.y, entity.center.y);
             if (floorBelow(entity.center.x, fromY, entity.center.z, floorY))
                 entity.center.y = std::max(entity.center.y, floorY + 0.05f - bottomOffset);
         }
@@ -5518,6 +5524,8 @@ static void rememberRoom() {
         P.yaw    = E.yaw;
         P.pitch  = E.pitch;
         P.roll   = E.roll;
+        P.surfaceSize = {E.surfaceWidth,E.surfaceHeight};
+        P.scale = E.spawnScale;
         g_room.poses[E.id] = P;
     }
 }

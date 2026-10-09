@@ -34,6 +34,9 @@ std::vector<SWindowInfo> enumerateEligibleWindows(const PHLMONITOR& monitor);
 // True if the window still belongs to the eligible set (mapped, not hidden).
 bool isWindowEligible(const PHLWINDOW& window, const PHLMONITOR& monitor);
 
+// Mapped native popup surfaces, in monitor-local logical coordinates.
+std::vector<CBox> windowPopupBoxes(const PHLWINDOW& window, const PHLMONITOR& monitor);
+
 // Full decorated box (client surface + border/titlebar) in monitor-local
 // logical px, plus the client surface's offset inside it and its size. Used
 // both for the entity/UV geometry and -- crucially -- recorded together with

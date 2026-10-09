@@ -66,6 +66,8 @@ class GLScene {
         // A held snapshot after a charged shot, independent of its client.
         float burn = -1.f;
         Vec2 burnOrigin{0.5f,0.5f};
+        struct PopupRect { float x, y, w, h; }; // normalized, top-left origin
+        std::vector<PopupRect> popups;
     };
 
     // Where one monitor looks through the view plane, in tangents of the view
@@ -488,6 +490,7 @@ class GLScene {
     void refreshPanorama();
 
     void drawWindows(const Mat4& vp, const std::vector<WindowRender>& windows);
+    void drawPopups(const Mat4& vp, const std::vector<WindowRender>& windows);
     // A window crumpled like paper (WindowRender::crumple): a creased mesh,
     // opaque and depth-written, drawn before the translucent windows.
     void drawCrumpled(const Mat4& vp, const WindowRender& window);

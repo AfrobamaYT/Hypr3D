@@ -3858,6 +3858,15 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
             entity.yaw = EXISTING->yaw;
             entity.pitch = EXISTING->pitch;
             entity.roll = EXISTING->roll;
+            // A menu changes the enclosing box, not its parent's position.
+            // Keep the client origin fixed while the popup tree grows/shrinks.
+            if (entity.surfaceWidth == EXISTING->surfaceWidth && entity.surfaceHeight == EXISTING->surfaceHeight) {
+                const float k = World3D::toWorld(1.f) * entity.spawnScale;
+                entity.center = entity.center + g_world.rightOf(info.id) * k *
+                    (EXISTING->surfaceOffsetX-EXISTING->logicalWidth*.5f-entity.surfaceOffsetX+entity.logicalWidth*.5f) +
+                    g_world.upOf(info.id) * k *
+                    (EXISTING->logicalHeight*.5f-EXISTING->surfaceOffsetY-entity.logicalHeight*.5f+entity.surfaceOffsetY);
+            }
         }
         else if (const auto* MEM = REMEMBERED(info)) {
             entity.center = MEM->center;
@@ -3932,15 +3941,19 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
 
         // Looking down at spawn put the bottom of ordinary desktop windows
         // through the floor: controls were hidden behind the grid. Fresh
-        // arc windows have no roll; lift their lowest corner above the floor.
+        // arc windows have no roll; lift the client's lower edge above the floor.
         // Saved/carried poses and the fitted multi-monitor wall stay owned
         // by their existing placement paths.
         if (freshPose && info.window && !WALL) {
-            const float halfY = std::abs(std::cos(entity.pitch)) * entity.height * 0.5f;
+            const float k = World3D::toWorld(1.f) * entity.spawnScale;
+            // Popup extents can grow below the client. They are overlays;
+            // placing them must not lift the parent out of the user's view.
+            const float bottomOffset = std::cos(entity.pitch) * k *
+                (entity.logicalHeight*.5f-entity.surfaceOffsetY-entity.surfaceHeight);
             float floorY = 0.f;
-            const float fromY = std::max(g_scene.camera().position.y, entity.center.y + halfY + 0.05f);
+            const float fromY = std::max(g_scene.camera().position.y, entity.center.y + entity.height*.5f + 0.05f);
             if (floorBelow(entity.center.x, fromY, entity.center.z, floorY))
-                entity.center.y = std::max(entity.center.y, floorY + halfY + 0.05f);
+                entity.center.y = std::max(entity.center.y, floorY + 0.05f - bottomOffset);
         }
 
         if (g_read.id == info.id)
@@ -4150,6 +4163,11 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
             (entity.logicalWidth < SNAPSHOT->sampledBox.w - 0.5 || entity.logicalHeight < SNAPSHOT->sampledBox.h - 0.5))
             render.outlines = nullptr;
 
+        if (const auto window = Compat::findWindowById(entity.id))
+            for (const auto& box : Compat::windowPopupBoxes(window, window->m_monitor.lock()))
+                render.popups.push_back({static_cast<float>((box.x-SNAPSHOT->fullBox.x)/SNAPSHOT->fullBox.w),
+                    static_cast<float>((box.y-SNAPSHOT->fullBox.y)/SNAPSHOT->fullBox.h),
+                    static_cast<float>(box.w/SNAPSHOT->fullBox.w),static_cast<float>(box.h/SNAPSHOT->fullBox.h)});
         g_renderWindows.push_back(render);
 
         // The app drew the new size: its old frame fades out over the new
@@ -4217,8 +4235,8 @@ static Vector2D localFromHit(const World3D::SHit& hit) {
         ENTITY->surfaceOffsetY;
 
     return {
-        std::clamp(X, 0.0f, ENTITY->surfaceWidth),
-        std::clamp(Y, 0.0f, ENTITY->surfaceHeight),
+        std::clamp(X, -ENTITY->surfaceOffsetX, ENTITY->logicalWidth-ENTITY->surfaceOffsetX),
+        std::clamp(Y, -ENTITY->surfaceOffsetY, ENTITY->logicalHeight-ENTITY->surfaceOffsetY),
     };
 }
 
@@ -5325,8 +5343,8 @@ static void useMove(double dx, double dy) {
         return;
     }
     g_use.centre  = false; // moved by hand: it stays where the hand put it
-    g_use.local.x = std::clamp(g_use.local.x + dx, 0.0, static_cast<double>(E->surfaceWidth));
-    g_use.local.y = std::clamp(g_use.local.y + dy, 0.0, static_cast<double>(E->surfaceHeight));
+    g_use.local.x = std::clamp(g_use.local.x + dx, -double(E->surfaceOffsetX), double(E->logicalWidth-E->surfaceOffsetX));
+    g_use.local.y = std::clamp(g_use.local.y + dy, -double(E->surfaceOffsetY), double(E->logicalHeight-E->surfaceOffsetY));
     Compat::deliverMotion(W, g_use.local, inputTimeMs());
     damageCurrentMonitor();
 }

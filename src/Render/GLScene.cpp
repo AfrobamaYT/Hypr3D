@@ -1963,6 +1963,30 @@ void GLScene::ensureCrumpleBuffers() {
     glBindBuffer(GL_ARRAY_BUFFER, 0);
 }
 
+void GLScene::drawPopups(const Mat4& vp, const std::vector<WindowRender>& windows) {
+    // Transient menus stay legible over the environment, like the pointer
+    // overlay. A popup growing below its parent must not sink into the floor.
+    glDisable(GL_DEPTH_TEST);
+    glDepthMask(GL_FALSE);
+    glDisable(GL_CULL_FACE);
+    glEnable(GL_BLEND);
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ZERO, GL_ONE);
+    for (const auto& w : windows) {
+        if (!w.texture || w.alpha <= 0.f || w.burn >= 0.f) continue;
+        const Mat4 model = Mat4::translation({w.x,w.y,w.z}) * Mat4::rotationY(w.yaw) *
+            Mat4::rotationX(w.pitch) * Mat4::rotationZ(w.roll) * Mat4::scale({w.width,w.height,1.f});
+        for (const auto& p : w.popups) {
+            const Mat4 mvp = vp * model * Mat4::translation({p.x+p.w*.5f-.5f,.5f-p.y-p.h*.5f,0.f}) *
+                Mat4::scale({p.w,p.h,1.f});
+            const float uv[] = {w.u0+(w.u1-w.u0)*p.x,w.v1+(w.v0-w.v1)*(p.y+p.h),
+                w.u0+(w.u1-w.u0)*(p.x+p.w),w.v1+(w.v0-w.v1)*p.y};
+            drawQuad(m_quadVAO,m_quadVertexCount,mvp,w.texture,uv,w.alpha,w.alpha,w.alpha,w.alpha);
+        }
+    }
+    glDepthMask(GL_TRUE);
+    glEnable(GL_DEPTH_TEST);
+}
+
 void GLScene::drawCrumpled(const Mat4& vp, const WindowRender& w) {
     constexpr int   NX = 28, NY = 18;
     constexpr float PI = 3.14159265f;
@@ -3316,6 +3340,7 @@ bool GLScene::render(
     if (primary)
         refreshPlayer();
     drawRoom(vp, VIEW, windows, dt, primary, false);
+    drawPopups(vp, windows);
     if (primary)
         m_gun.draw(vp, width, height, m_gunState);
     if (primary)

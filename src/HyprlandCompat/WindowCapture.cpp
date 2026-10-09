@@ -386,6 +386,9 @@ bool CWindowCapture::makeSnapshot(const PHLWINDOW& window, const PHLMONITOR& mon
     if (!decoratedSurfaceBox(window, monitor, fullBox, surfOffset, surfSize))
         return false;
 
+    // A child menu can redraw without a new buffer on its toplevel.
+    force = force || !windowPopupBoxes(window, monitor).empty();
+
     const Vector2D MONLOGI = monitor->m_size;
 
     // Unchanged content and geometry: keep the previous snapshot. The nested

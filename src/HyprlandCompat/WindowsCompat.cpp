@@ -3,6 +3,7 @@
 #include <hyprland/src/desktop/state/FocusState.hpp>
 #include <hyprland/src/desktop/state/WindowState.hpp>
 #include <hyprland/src/desktop/view/Window.hpp>
+#include <hyprland/src/desktop/view/Popup.hpp>
 #include <hyprland/src/desktop/view/LayerSurface.hpp>
 #include <hyprland/src/desktop/Workspace.hpp>
 #include <hyprland/src/layout/target/Target.hpp>
@@ -102,6 +103,20 @@ std::vector<SWindowInfo> enumerateEligibleWindows(const PHLMONITOR& monitor) {
     return out;
 }
 
+std::vector<CBox> windowPopupBoxes(const PHLWINDOW& window, const PHLMONITOR& monitor) {
+    std::vector<CBox> boxes;
+    if (!window || !monitor || !window->m_popupHead) return boxes;
+    window->m_popupHead->breadthfirst([&](SP<Desktop::View::CPopup> popup, void*) {
+        if (!popup->m_mapped || popup->inert() || !popup->resource()) return;
+        if (auto box = popup->surfaceLogicalBox()) {
+            box->x -= monitor->m_position.x;
+            box->y -= monitor->m_position.y;
+            if (box->w > 0 && box->h > 0) boxes.push_back(*box);
+        }
+    }, nullptr);
+    return boxes;
+}
+
 bool decoratedSurfaceBox(
     const PHLWINDOW&  window,
     const PHLMONITOR& monitor,
@@ -135,9 +150,20 @@ bool decoratedSurfaceBox(
         SURF.h + TOP + BOTTOM,
     };
 
+    // Real popup surfaces can be larger than decoration margins. Capture
+    // their whole tree without letting a dimAround rule expand the window.
+    for (const auto& popup : windowPopupBoxes(window, monitor)) {
+        const double right = std::max(fullBox.x + fullBox.w, popup.x + popup.w);
+        const double bottom = std::max(fullBox.y + fullBox.h, popup.y + popup.h);
+        fullBox.x = std::min(fullBox.x, popup.x);
+        fullBox.y = std::min(fullBox.y, popup.y);
+        fullBox.w = right - fullBox.x;
+        fullBox.h = bottom - fullBox.y;
+    }
+
     // Surface-local input coordinates are the hit position minus this offset,
     // so growing the quad to include borders never shifts input.
-    surfOffset = Vector2D{LEFT, TOP};
+    surfOffset = Vector2D{SURF.x - MONPOS.x - fullBox.x, SURF.y - MONPOS.y - fullBox.y};
     surfSize   = Vector2D{SURF.w, SURF.h};
 
     return fullBox.w > 0 && fullBox.h > 0;
@@ -343,6 +369,18 @@ int pointerConstraintOf(const PHLWINDOW& window) {
     return C->isLocked() ? 2 : 1;
 }
 
+// Native child surfaces own their pointer events; passing the coordinates
+// to the toplevel instead made visible menus impossible to select.
+static std::pair<SP<CWLSurfaceResource>, Vector2D> pointerSurface(
+    const PHLWINDOW& window, const Vector2D& local) {
+    const auto global = window->getWindowMainSurfaceBox().pos() + local;
+    if (window->m_popupHead)
+        if (const auto popup = window->m_popupHead->at(global, true))
+            if (const auto surface = popup->resource())
+                return {surface, global - popup->coordsGlobal()};
+    return {window->resource(), local};
+}
+
 void deliverMotion(
     const PHLWINDOW& window,
     const Vector2D& localLogical,
@@ -376,10 +414,11 @@ void deliverMotion(
         return;
     }
 
-    if (!pointerMoved(SURFACE, localLogical))
+    const auto [pointed, local] = pointerSurface(window, localLogical);
+    if (!pointerMoved(pointed, local))
         return;
 
-    g_pSeatManager->sendPointerMotion(timeMs, localLogical);
+    g_pSeatManager->sendPointerMotion(timeMs, local);
     g_pSeatManager->sendPointerFrame();
 }
 
@@ -406,8 +445,11 @@ void deliverClick(
     // does a pointer already at the point (pointerMoved).
     if (pointerConstraintOf(window) == 2)
         g_pSeatManager->setPointerFocus(SURFACE, localLogical);
-    else if (pointerMoved(SURFACE, localLogical))
-        g_pSeatManager->sendPointerMotion(timeMs, localLogical);
+    else {
+        const auto [pointed, local] = pointerSurface(window, localLogical);
+        if (pointerMoved(pointed, local))
+            g_pSeatManager->sendPointerMotion(timeMs, local);
+    }
     g_pSeatManager->sendPointerButton(
         timeMs,
         button,

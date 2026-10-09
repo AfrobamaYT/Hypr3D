@@ -10437,6 +10437,13 @@ static int luaClose(lua_State*) {
     return 0;
 }
 
+static int luaStatus(lua_State* L) {
+    if (!g_active || !g_monitor)
+        return luaL_error(L,"hypr3d.status: open the room before requesting a snapshot");
+    dumpStatus(true); // bypass the periodic dump's throttle for an explicit query
+    return 0;
+}
+
 static SDispatchResult dispatchToggle(std::string) {
     toggle3D();
     return {};
@@ -10538,6 +10545,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "focus_lock", luaFocusLock))
         throw std::runtime_error("[hypr3d] failed to register Lua focus_lock");
+
+    if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "status", luaStatus))
+        throw std::runtime_error("[hypr3d] failed to register Lua status");
 
     // Every handler is wrapped: an exception must NEVER escape into
     // Hyprland (std::terminate there kills the whole compositor). The

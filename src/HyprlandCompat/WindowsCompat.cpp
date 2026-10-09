@@ -122,7 +122,8 @@ bool decoratedSurfaceBox(
     const PHLMONITOR& monitor,
     CBox&             fullBox,
     Vector2D&         surfOffset,
-    Vector2D&         surfSize
+    Vector2D&         surfSize,
+    bool              includePopups
 ) {
     if (!window || !monitor)
         return false;
@@ -152,7 +153,7 @@ bool decoratedSurfaceBox(
 
     // Real popup surfaces can be larger than decoration margins. Capture
     // their whole tree without letting a dimAround rule expand the window.
-    for (const auto& popup : windowPopupBoxes(window, monitor)) {
+    for (const auto& popup : includePopups ? windowPopupBoxes(window, monitor) : std::vector<CBox>{}) {
         const double right = std::max(fullBox.x + fullBox.w, popup.x + popup.w);
         const double bottom = std::max(fullBox.y + fullBox.h, popup.y + popup.h);
         fullBox.x = std::min(fullBox.x, popup.x);
@@ -379,6 +380,17 @@ static std::pair<SP<CWLSurfaceResource>, Vector2D> pointerSurface(
             if (const auto surface = popup->resource())
                 return {surface, global - popup->coordsGlobal()};
     return {window->resource(), local};
+}
+
+bool pointInWindowOrPopup(const PHLWINDOW& window, const Vector2D& local) {
+    if (!window) return false;
+    const auto monitor = window->m_monitor.lock();
+    CBox box; Vector2D offset, size;
+    if (!decoratedSurfaceBox(window,monitor,box,offset,size,false)) return false;
+    const auto global = window->getWindowMainSurfaceBox().pos() + local;
+    box.x += monitor->m_position.x; box.y += monitor->m_position.y;
+    if (box.containsPoint(global)) return true;
+    return window->m_popupHead && bool(window->m_popupHead->at(global,true));
 }
 
 void deliverMotion(

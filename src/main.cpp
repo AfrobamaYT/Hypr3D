@@ -4254,6 +4254,14 @@ static Vector2D localFromHit(const World3D::SHit& hit) {
 // Whether the pixel a ray hit shows anything: empty pixels of an overlay let
 // the ray through to the surface underneath.
 static bool hitVisible(const World3D::SHit& HIT) {
+    // A popup extends the enclosing quad. Its transparent remainder must
+    // not become a giant invisible close/drag target beside the actual menu.
+    if (const auto window = Compat::findWindowById(HIT.id)) {
+        const auto* E = g_world.find(HIT.id);
+        if (E && !Compat::pointInWindowOrPopup(window,
+            {HIT.u*E->logicalWidth-E->surfaceOffsetX,HIT.v*E->logicalHeight-E->surfaceOffsetY}))
+            return false;
+    }
     const auto* SNAPSHOT = g_capture.get(HIT.id);
 
     if (SNAPSHOT && SNAPSHOT->alphaValid && !SNAPSHOT->alphaMask.empty()) {

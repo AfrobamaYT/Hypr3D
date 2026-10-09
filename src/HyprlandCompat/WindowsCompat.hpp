@@ -36,6 +36,7 @@ bool isWindowEligible(const PHLWINDOW& window, const PHLMONITOR& monitor);
 
 // Mapped native popup surfaces, in monitor-local logical coordinates.
 std::vector<CBox> windowPopupBoxes(const PHLWINDOW& window, const PHLMONITOR& monitor);
+bool pointInWindowOrPopup(const PHLWINDOW& window, const Vector2D& localLogical);
 
 // Full decorated box (client surface + border/titlebar) in monitor-local
 // logical px, plus the client surface's offset inside it and its size. Used
@@ -47,7 +48,8 @@ bool decoratedSurfaceBox(
     const PHLMONITOR& monitor,
     CBox&             fullBox,
     Vector2D&         surfOffset,
-    Vector2D&         surfSize
+    Vector2D&         surfSize,
+    bool              includePopups = true
 );
 
 // --- layout ghosting --------------------------------------------------------

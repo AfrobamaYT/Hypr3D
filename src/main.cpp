@@ -3597,6 +3597,13 @@ static float flightCross() {
 }
 
 static bool useChildWindow(const PHLWINDOW& window);
+static float clientBottomOffset(const World3D::SEntity& entity) {
+    const float k = World3D::toWorld(1.f) * entity.spawnScale;
+    const Mat4 r = Mat4::rotationY(entity.yaw) * Mat4::rotationX(entity.pitch) * Mat4::rotationZ(entity.roll);
+    const float x = entity.surfaceOffsetX + entity.surfaceWidth*.5f - entity.logicalWidth*.5f;
+    const float y = entity.logicalHeight*.5f - entity.surfaceOffsetY - entity.surfaceHeight*.5f;
+    return k * (r.m[1]*x + r.m[5]*y - std::abs(r.m[1])*entity.surfaceWidth*.5f - std::abs(r.m[5])*entity.surfaceHeight*.5f);
+}
 static void syncWorld(const PHLMONITOR& mon, float dt) {
     g_binGlow = 1.0f; // applyTrash raises it this frame
     binCatchTick(dt);
@@ -3946,19 +3953,26 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         entity.width  = World3D::toWorld(BOX.w) * entity.spawnScale;
         entity.height = World3D::toWorld(BOX.h) * entity.spawnScale;
 
+        // A newly mapped app may first draw its 2D tile, then acknowledge
+        // the room's 960x540 request. Keep an already planted lower edge on
+        // the floor when that late size arrives, rather than leaving the
+        // smaller window up at the large tile's old centre.
+        if (const auto* previous = g_world.find(info.id); previous && info.window && !WALL &&
+            (previous->surfaceWidth != entity.surfaceWidth || previous->surfaceHeight != entity.surfaceHeight)) {
+            float floorY = 0.f;
+            if (floorBelow(previous->center.x,std::max(g_scene.camera().position.y,previous->center.y),previous->center.z,floorY) &&
+                std::abs(previous->center.y+clientBottomOffset(*previous)-floorY-0.05f)<0.02f)
+                entity.center.y = floorY+0.05f-clientBottomOffset(entity);
+        }
+
         // Looking down at spawn put the bottom of ordinary desktop windows
         // through the floor: controls were hidden behind the grid. Fresh
         // Lift new windows and remembered windows whose 2D size changed.
         // Unchanged saved/carried poses and the fitted wall keep their places.
         if (fitFloor && info.window && !WALL) {
-            const float k = World3D::toWorld(1.f) * entity.spawnScale;
             // Popup extents can grow below the client. They are overlays;
             // placing them must not lift the parent out of the user's view.
-            const Mat4 rotation = Mat4::rotationY(entity.yaw) * Mat4::rotationX(entity.pitch) * Mat4::rotationZ(entity.roll);
-            const float rootX = entity.surfaceOffsetX + entity.surfaceWidth*.5f - entity.logicalWidth*.5f;
-            const float rootY = entity.logicalHeight*.5f - entity.surfaceOffsetY - entity.surfaceHeight*.5f;
-            const float bottomOffset = k * (rotation.m[1]*rootX + rotation.m[5]*rootY -
-                std::abs(rotation.m[1])*entity.surfaceWidth*.5f - std::abs(rotation.m[5])*entity.surfaceHeight*.5f);
+            const float bottomOffset = clientBottomOffset(entity);
             float floorY = 0.f;
             const float fromY = std::max(g_scene.camera().position.y, entity.center.y);
             if (floorBelow(entity.center.x, fromY, entity.center.z, floorY))

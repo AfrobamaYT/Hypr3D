@@ -2799,11 +2799,21 @@ static constexpr float kMenuMargin = 0.08f; // m the crosshair may stray past it
 static constexpr float kMenuLeash  = 0.3f;  // m off the reading distance (XRI's max distance)
 static constexpr float kMenuSpeed  = 6.0f;  // 1/s, exponential (XRI's movement speed)
 
+static bool usingWindow(std::uintptr_t id);
+
 static void followMenu(const PHLMONITOR& mon, const CBox& BOX) {
     const auto  NOW = std::chrono::steady_clock::now();
     const float DT  = std::clamp(std::chrono::duration<float>(NOW - g_read.tick).count(), 0.0f, 0.1f);
     g_read.tick = NOW;
     const auto& CAM = g_scene.camera();
+    // With an ordinary pointer the menu is a screen at the eye. A new
+    // world's collision can move the body even while movement is stopped;
+    // the crosshair leash allowed it to become enlarged and clipped then.
+    if (usingWindow(g_read.id)) {
+        readingPose(mon, BOX, 0.f, g_read.atCenter, g_read.atYaw, g_read.atPitch, g_read.atScale);
+        g_read.following = false;
+        return;
+    }
     if (!g_read.following) {
         // Where the crosshair's ray meets the menu's plane, in its own axes
         // (last frame's pose, which at rest is this one).
@@ -5151,6 +5161,7 @@ struct SUse {
     bool           centre     = false; // to the middle once the surface has its size
 };
 static SUse g_use;
+static bool usingWindow(std::uintptr_t id) { return id && g_use.id == id; }
 
 static void useEnd() {
     if (!g_use.id)

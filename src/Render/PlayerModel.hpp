@@ -272,7 +272,7 @@ class CPlayerModel {
     unsigned int m_program = 0;
     int          m_uMVP = -1, m_uModel = -1, m_uColor = -1, m_uTex = -1,
         m_uHasTex = -1, m_uCamPos = -1, m_uJoints = -1, m_uSkinned = -1,
-        m_uMeshWorld = -1, m_uFlat = -1;
+        m_uFlat = -1;
 };
 
 } // namespace H3D

@@ -38,7 +38,6 @@ layout(location = 4) in vec4 aWeight;
 #define MAX_JOINTS 128
 uniform mat4 uJoints[MAX_JOINTS];
 uniform bool uSkinned;
-uniform mat4 uMeshWorld;
 
 uniform mat4 uMVP;
 uniform mat4 uModel;
@@ -49,15 +48,13 @@ out vec3 vWorld;
 
 void main() {
     // GPU linear blend skinning: the joint palette (jointWorld * invBind)
-    // arrives as a uniform; vertex data is static. The mesh node's world
-    // takes the vertex into the bind space BEFORE the palette (three.js /
-    // Godot convention) -- exporters put scales/rotations there.
+    // arrives as a uniform; vertices are already in the bind space. glTF
+    // ignores the skinned mesh node's transform: applying it again deforms
+    // models whose mesh node is rotated or scaled (e.g. CesiumMan).
     mat4 skin = mat4(1.0);
     vec3 P = aPos;
     vec3 N = aNrm;
     if (uSkinned) {
-        P = (uMeshWorld * vec4(aPos, 1.0)).xyz;
-        N = mat3(uMeshWorld) * aNrm;
         skin = aWeight.x * uJoints[int(aJoint.x)] +
                aWeight.y * uJoints[int(aJoint.y)] +
                aWeight.z * uJoints[int(aJoint.z)] +
@@ -531,8 +528,8 @@ void CPlayerModel::update(float dt) {
 }
 
 // Builds a primitive's interleaved vertex buffer (pos3/nrm3/uv2) for the
-// CURRENT pose: rigid prims follow their node world, CPU-skinned prims get
-// linear blend skinning on top of the mesh node's world.
+// CURRENT pose: rigid prims follow their node world; skinned prims use the
+// joint palette directly, as the GPU path does.
 std::vector<float> CPlayerModel::buildVerts(const SPrim& P) const {
     const int NV = static_cast<int>(P.basePos.size() / 3);
     const bool SKINNED = P.skin >= 0 &&
@@ -547,9 +544,7 @@ std::vector<float> CPlayerModel::buildVerts(const SPrim& P) const {
 
         if (SKINNED) {
                 // Linear blend skinning: M = sum(w * jointWorld * invBind),
-                // applied to the vertex taken into the bind space by the
-                // mesh node's world FIRST (three.js / Godot convention --
-                // exporters put scales/rotations on the mesh node).
+                // applied directly to the bind-space vertex.
                 Mat4 M{};
                 for (int k = 0; k < 4; ++k) {
                     const float WK = P.weights[v * 4 + k];
@@ -561,12 +556,12 @@ std::vector<float> CPlayerModel::buildVerts(const SPrim& P) const {
                     for (int c = 0; c < 16; ++c)
                         M.m[c] += WK * JM.m[c];
                 }
-                POS = transformPoint(M, transformPoint(W, {
+                POS = transformPoint(M, {
                     P.basePos[v * 3 + 0], P.basePos[v * 3 + 1],
-                    P.basePos[v * 3 + 2]}));
-                NRM = transformDir(M, transformDir(W, {
+                    P.basePos[v * 3 + 2]});
+                NRM = transformDir(M, {
                     P.baseNrm[v * 3 + 0], P.baseNrm[v * 3 + 1],
-                    P.baseNrm[v * 3 + 2]}));
+                    P.baseNrm[v * 3 + 2]});
             } else {
                 POS = transformPoint(W, {P.basePos[v * 3 + 0],
                                          P.basePos[v * 3 + 1],
@@ -1000,7 +995,6 @@ bool CPlayerModel::load(const std::string& path) {
             m_uCamPos  = glGetUniformLocation(P, "uCamPos");
             m_uJoints    = glGetUniformLocation(P, "uJoints");
             m_uSkinned   = glGetUniformLocation(P, "uSkinned");
-            m_uMeshWorld = glGetUniformLocation(P, "uMeshWorld");
             m_uFlat      = glGetUniformLocation(P, "uFlat");
         }
         glDeleteShader(VS);
@@ -1077,8 +1071,6 @@ void CPlayerModel::draw(const Mat4& vp, const Vec3& cameraPos) const {
             const auto& JM = m_skinMats[P.skin];
             const int COUNT = std::min<size_t>(JM.size(), MAX_JOINTS);
             glUniform1i(m_uSkinned, COUNT ? 1 : 0);
-            const Mat4& W = m_world[P.node];
-            glUniformMatrix4fv(m_uMeshWorld, 1, GL_FALSE, W.m.data());
             if (COUNT)
                 glUniformMatrix4fv(m_uJoints, COUNT, GL_FALSE,
                                    JM[0].m.data());

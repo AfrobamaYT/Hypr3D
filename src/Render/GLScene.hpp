@@ -366,6 +366,14 @@ class GLScene {
         int         animIdx[CPlayerModel::kStateCount] = {-1, -1, -1, -1};
         std::string animName[CPlayerModel::kStateCount];
         float       animSpeed[CPlayerModel::kStateCount] = {1.f, 1.f, 1.f, 1.f};
+        // first_person: the model drawn in first person too, so arms, hands
+        // and legs show when looking down. These nodes are left out (the
+        // head), and the body stands this far behind the eye along its
+        // facing -- First-person Model's 0.25 (tr7zw, MIT): directly under
+        // the eye the view looks down into the neck.
+        bool                     firstPerson = false;
+        std::vector<std::string> fpHide;
+        float                    fpBack = 0.25f;
     };
 
     void setPlayerConfig(const SPlayerCfg& cfg) {

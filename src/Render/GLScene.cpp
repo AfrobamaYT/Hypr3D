@@ -1479,6 +1479,7 @@ void GLScene::refreshPlayer() {
                 m_player.setAnim(ST, m_playerCfg.animIdx[s]);
             m_player.setAnimSpeed(ST, m_playerCfg.animSpeed[s]);
         }
+        m_player.setHiddenNodes(m_playerCfg.fpHide);
     }
 }
 
@@ -2267,8 +2268,18 @@ void GLScene::drawRoom(const Mat4& vp, const ViewWindow& view,
     // Arch blue, the default accent of Larch's palette.
     if (m_compOn && !sight)
         drawCapsule(vp, m_compCenter, &m_compYaw, Vec3{0.09f, 0.576f, 0.82f}, true);
-    if ((m_playerVisible || sight) && m_player.loaded()) {
-        m_player.setPose(m_playerFeet, m_playerYaw, m_playerCfg.scale,
+    const bool FIRST_PERSON_BODY =
+        !m_playerVisible && !sight && m_playerCfg.firstPerson;
+    if ((m_playerVisible || sight || FIRST_PERSON_BODY) && m_player.loaded()) {
+        Vec3 feet = m_playerFeet;
+        if (FIRST_PERSON_BODY) {
+            // Column 2 of the facing is the model's front (+Z authored).
+            const Mat4 FACING = Mat4::rotationY(m_playerYaw);
+            feet = feet - Vec3{FACING.m[8], FACING.m[9], FACING.m[10]} *
+                m_playerCfg.fpBack;
+        }
+        m_player.setHiding(FIRST_PERSON_BODY);
+        m_player.setPose(feet, m_playerYaw, m_playerCfg.scale,
                          m_playerCfg.posOffset + m_playerCfg.centerOffset,
                          m_playerCfg.rotDeg);
         m_player.setFlat(m_playerCfg.flat);

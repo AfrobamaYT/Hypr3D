@@ -7204,7 +7204,10 @@ static void dumpStatus(bool force = false) {
             << PP.GetZ() << ") vel=(" << PV.GetX() << "," << PV.GetY()
             << "," << PV.GetZ() << ") moveVel=(" << s_moveVel.x << ","
             << s_moveVel.y << "," << s_moveVel.z << ") grounded="
-            << g_grounded << " flying=" << g_playerFlying << "\n";
+            << g_grounded << " flying=" << g_playerFlying << " model="
+            << (g_scene.player()->loaded() ? 1 : 0) << " firstPerson="
+            << (g_playerCfg.firstPerson ? 1 : 0) << " hiddenPrims="
+            << g_scene.player()->hiddenPrimCount() << "\n";
     }
 }
 
@@ -9774,6 +9777,48 @@ static int luaConfig(lua_State* L) {
             }
             lua_pop(L, 1); // animations
         }
+        // first_person = true | false | { hide = { "head" }, back = 0.25 }:
+        // the character drawn in first person too, the named nodes left
+        // out, the body this far behind the eye.
+        lua_getfield(L, idx, "first_person");
+        if (lua_isboolean(L, -1)) {
+            g_playerCfg.firstPerson = lua_toboolean(L, -1) != 0;
+            lua_pop(L, 1);
+        } else if (lua_istable(L, -1)) {
+            const int FT = lua_gettop(L);
+            g_playerCfg.firstPerson = true;
+            if (!SET_NUM(FT, "back", g_playerCfg.fpBack, "player.first_person.back"))
+                return luaL_error(L, "hypr3d.config: player.first_person.back must be a number");
+            lua_getfield(L, FT, "hide");
+            if (lua_istable(L, -1)) {
+                std::vector<std::string> HIDE;
+                const int HT = lua_gettop(L);
+                for (lua_Integer i = 1;; ++i) {
+                    lua_rawgeti(L, HT, i);
+                    if (lua_isnil(L, -1)) {
+                        lua_pop(L, 1);
+                        break;
+                    }
+                    if (!lua_isstring(L, -1)) {
+                        lua_pop(L, 3);
+                        return luaL_error(L, "hypr3d.config: player.first_person.hide must be a list of node names");
+                    }
+                    HIDE.emplace_back(lua_tostring(L, -1));
+                    lua_pop(L, 1);
+                }
+                g_playerCfg.fpHide = std::move(HIDE);
+            } else if (!lua_isnil(L, -1)) {
+                lua_pop(L, 2);
+                return luaL_error(L, "hypr3d.config: player.first_person.hide must be a list of node names");
+            }
+            lua_pop(L, 2); // hide, first_person
+        } else if (lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+        } else {
+            lua_pop(L, 1);
+            return luaL_error(L, "hypr3d.config: player.first_person must be a boolean or a table");
+        }
+
         if (!SET_VEC3(idx, "spawn", g_playerSpawn, "player.spawn"))
             return luaL_error(L, "hypr3d.config: player.spawn must be a table { x = .., y = .., z = .. }");
         lua_pop(L, 1);

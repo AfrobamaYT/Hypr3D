@@ -374,6 +374,14 @@ Everything is optional -- only set what you want to change.
 | flying           | bool                                | true        | disables falling                                        |
 | walk_bob         | bool                                | true        | simulate the rhythm of walking                          |
 | collision        | bool                                | true        | whether body collides with the world                    |
+| first_person     | bool / [First Person](#first-person) | false      | draw the character in first person too: arms, hands and legs when you look down |
+
+### <a name="first-person"></a> First Person
+
+| Option | Type     | Default | Description                                                                 |
+| --------| ----------| ---------| -----------------------------------------------------------------------------|
+| hide   | string[] | {}      | node names left out in first person, with everything under them -- the head |
+| back   | float    | 0.25    | how far the body stands behind your eye (m), so looking down shows your feet |
 
 ### Scene
 

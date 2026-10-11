@@ -86,6 +86,8 @@ uniform bool uHasTex;
 uniform bool uFlat;
 uniform vec4 uColor;
 uniform vec3 uCamPos;
+uniform int uAlphaMode; // glTF alphaMode: 0 OPAQUE, 1 MASK, 2 BLEND
+uniform float uCutoff;
 
 out vec4 fragColor;
 
@@ -95,7 +97,12 @@ void main() {
     // flat: the texture carries all lighting (baked/toon characters)
     float diff = uFlat ? 1.0 : dot(N, L) * 0.5 + 0.5; // half-lambert
     vec4 base = uHasTex ? texture(uTex, vUv) : vec4(1.0);
-    fragColor = vec4(base.rgb * uColor.rgb * diff, base.a * uColor.a);
+    float a = base.a * uColor.a;
+    // MASK: a Minecraft skin's second layer is mostly transparent pixels
+    // with black colour -- drawn opaque, they hid the whole figure in black.
+    if (uAlphaMode == 1 && a < uCutoff)
+        discard;
+    fragColor = vec4(base.rgb * uColor.rgb * diff, uAlphaMode == 2 ? a : 1.0);
 }
 )GLSL";
 
@@ -150,17 +157,27 @@ Vec3 transformDir(const Mat4& m, const Vec3& p) {
 }
 
 unsigned int uploadGLTex(const std::vector<unsigned char>& pixels, int W,
-                         int H) {
+                         int H, const cgltf_sampler* sampler) {
     if (W <= 0 || H <= 0 || pixels.empty())
         return 0;
 
+    // The glTF sampler where the file names one (its values are the GL
+    // enums): a pixel-art skin asks for NEAREST and would blur under the
+    // smooth default.
+    const auto PICK = [](cgltf_int v, GLint fallback) {
+        return v ? static_cast<GLint>(v) : fallback;
+    };
     unsigned int tex = 0;
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                    PICK(sampler ? sampler->min_filter : 0, GL_LINEAR_MIPMAP_LINEAR));
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
+                    PICK(sampler ? sampler->mag_filter : 0, GL_LINEAR));
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                    PICK(sampler ? sampler->wrap_s : 0, GL_REPEAT));
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                    PICK(sampler ? sampler->wrap_t : 0, GL_REPEAT));
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE,
                  pixels.data());
     glGenerateMipmap(GL_TEXTURE_2D);
@@ -168,7 +185,8 @@ unsigned int uploadGLTex(const std::vector<unsigned char>& pixels, int W,
     return tex;
 }
 
-unsigned int uploadTexture(const std::string& modelDir, const cgltf_image* image) {
+unsigned int uploadTexture(const std::string& modelDir, const cgltf_image* image,
+                           const cgltf_sampler* sampler) {
     // Primary path: stb_image. It decodes JPEG/PNG/BMP/TGA/... straight
     // into RGBA -- glTF models in the wild embed JPEG far more often than
     // PNG, and straight alpha avoids cairo's premultiplied-ARGB traps.
@@ -202,7 +220,7 @@ unsigned int uploadTexture(const std::string& modelDir, const cgltf_image* image
         }
 
         if (!PIX.empty())
-            return uploadGLTex(PIX, W, H);
+            return uploadGLTex(PIX, W, H, sampler);
         // stb failed: fall through to the cairo path (exotic formats).
     }
 
@@ -245,7 +263,7 @@ unsigned int uploadTexture(const std::string& modelDir, const cgltf_image* image
         }
     }
 
-    return uploadGLTex(pixels, W, H);
+    return uploadGLTex(pixels, W, H, sampler);
 }
 
 } // namespace
@@ -652,6 +670,7 @@ bool CPlayerModel::load(const std::string& path) {
         const auto& N  = data->nodes[i];
         auto&       S  = m_nodes[i];
         S.parent       = NODE_IDX(N.parent);
+        S.name         = N.name ? N.name : "";
 
         if (N.has_translation)
             S.t = {N.translation[0], N.translation[1], N.translation[2]};
@@ -892,11 +911,13 @@ bool CPlayerModel::load(const std::string& path) {
                 const auto& M = *PR.material;
                 for (int k = 0; k < 4; ++k)
                     P.color[k] = M.pbr_metallic_roughness.base_color_factor[k];
-                if (M.pbr_metallic_roughness.base_color_texture.texture &&
-                    M.pbr_metallic_roughness.base_color_texture.texture->image)
-                    P.texture = uploadTexture(
-                        MODEL_DIR,
-                        M.pbr_metallic_roughness.base_color_texture.texture->image);
+                P.alphaMode = M.alpha_mode == cgltf_alpha_mode_mask ? 1
+                    : M.alpha_mode == cgltf_alpha_mode_blend        ? 2
+                                                                    : 0;
+                P.alphaCutoff = M.alpha_cutoff;
+                const auto* TEX = M.pbr_metallic_roughness.base_color_texture.texture;
+                if (TEX && TEX->image)
+                    P.texture = uploadTexture(MODEL_DIR, TEX->image, TEX->sampler);
             }
 
             // GPU skinning when the palette fits the shader's uniform
@@ -996,6 +1017,8 @@ bool CPlayerModel::load(const std::string& path) {
             m_uJoints    = glGetUniformLocation(P, "uJoints");
             m_uSkinned   = glGetUniformLocation(P, "uSkinned");
             m_uFlat      = glGetUniformLocation(P, "uFlat");
+            m_uAlphaMode = glGetUniformLocation(P, "uAlphaMode");
+            m_uCutoff    = glGetUniformLocation(P, "uCutoff");
         }
         glDeleteShader(VS);
         glDeleteShader(FS);
@@ -1004,6 +1027,7 @@ bool CPlayerModel::load(const std::string& path) {
     cgltf_free(data);
 
     m_loaded = true;
+    setHiddenNodes(m_hiddenNames);
     evaluateNodes(); // rest pose for the first frame
     return true;
 }
@@ -1064,7 +1088,7 @@ void CPlayerModel::draw(const Mat4& vp, const Vec3& cameraPos) const {
     glEnable(GL_DEPTH_TEST);
 
     for (const auto& P : m_prims) {
-        if (!P.count)
+        if (!P.count || (m_hiding && P.hidden))
             continue;
 
         if (P.gpuSkinned) {
@@ -1082,6 +1106,8 @@ void CPlayerModel::draw(const Mat4& vp, const Vec3& cameraPos) const {
                     P.color[1] * m_emissiveScale,
                     P.color[2] * m_emissiveScale, P.color[3]);
         glUniform1i(m_uHasTex, P.texture != 0);
+        glUniform1i(m_uAlphaMode, P.alphaMode);
+        glUniform1f(m_uCutoff, P.alphaCutoff);
         glBindTexture(GL_TEXTURE_2D, P.texture);
         glBindVertexArray(P.vao);
         if (P.indexed)
@@ -1092,6 +1118,26 @@ void CPlayerModel::draw(const Mat4& vp, const Vec3& cameraPos) const {
 
     glBindVertexArray(0);
     glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+void CPlayerModel::setHiddenNodes(const std::vector<std::string>& names) {
+    m_hiddenNames = names;
+    std::vector<char> HIDDEN(m_nodes.size(), 0);
+    for (size_t i = 0; i < m_nodes.size(); ++i)
+        for (int n = static_cast<int>(i); n >= 0 && !HIDDEN[i];
+             n = m_nodes[n].parent)
+            HIDDEN[i] = !m_nodes[n].name.empty() &&
+                std::find(names.begin(), names.end(), m_nodes[n].name) !=
+                    names.end();
+    for (auto& P : m_prims)
+        P.hidden = P.node >= 0 && P.node < static_cast<int>(HIDDEN.size()) &&
+            HIDDEN[P.node];
+}
+
+int CPlayerModel::hiddenPrimCount() const {
+    return static_cast<int>(std::count_if(
+        m_prims.begin(), m_prims.end(),
+        [](const SPrim& P) { return P.hidden; }));
 }
 
 } // namespace H3D

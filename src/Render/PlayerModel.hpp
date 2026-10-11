@@ -150,6 +150,16 @@ class CPlayerModel {
 
     void draw(const Mat4& vp, const Vec3& cameraPos) const;
 
+    // Nodes left out of draw() while hiding is on, with everything under
+    // them: the first-person body leaves its head out, which would fill the
+    // view from inside. Names that match no node are ignored. Rigid meshes
+    // only: a skinned mesh hangs off one node, all or nothing.
+    void setHiddenNodes(const std::vector<std::string>& names);
+    void setHiding(bool on) {
+        m_hiding = on;
+    }
+    int hiddenPrimCount() const;
+
     // --- test hooks --------------------------------------------------------
     int nodeCount() const {
         return static_cast<int>(m_nodes.size());
@@ -183,6 +193,7 @@ class CPlayerModel {
 
   private:
     struct SNode {
+        std::string name;
         int   parent = -1;
         Vec3  t{};
         float r[4] = {0.f, 0.f, 0.f, 1.f}; // rest local rotation
@@ -207,7 +218,12 @@ class CPlayerModel {
         bool         indexed = false;
         unsigned int texture = 0;
         float        color[4] = {1.f, 1.f, 1.f, 1.f};
+        // glTF alphaMode: 0 OPAQUE (alpha ignored), 1 MASK (cut below
+        // cutoff), 2 BLEND (alpha kept).
+        int          alphaMode = 0;
+        float        alphaCutoff = 0.5f;
         int          node = -1;
+        bool         hidden = false; // under a hidden node
         // Base (node-space) vertices: positions + normals are transformed
         // and re-uploaded every update(); the uvs are static.
         std::vector<float> basePos;
@@ -265,6 +281,8 @@ class CPlayerModel {
     Vec3   m_rotDeg{}; // authored-facing correction, XYZ degrees
     bool   m_flat = false;
     float  m_emissiveScale = 1.0f;
+    bool   m_hiding = false;
+    std::vector<std::string> m_hiddenNames;
 
     bool   m_loaded = false;
     std::string m_path;
@@ -272,7 +290,7 @@ class CPlayerModel {
     unsigned int m_program = 0;
     int          m_uMVP = -1, m_uModel = -1, m_uColor = -1, m_uTex = -1,
         m_uHasTex = -1, m_uCamPos = -1, m_uJoints = -1, m_uSkinned = -1,
-        m_uFlat = -1;
+        m_uFlat = -1, m_uAlphaMode = -1, m_uCutoff = -1;
 };
 
 } // namespace H3D
